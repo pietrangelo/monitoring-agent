@@ -1,2 +1,18 @@
+# Rust build output
 /target
+system-hub/target
+
+# SQLite database (hub)
+system-hub/system-hub.db
+
+# IDE
 .zed/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
