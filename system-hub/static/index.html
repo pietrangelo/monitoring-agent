@@ -1,0 +1,1024 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2026 Pietrangelo Masala -->
+<!-- This program is free software: you can redistribute it and/or modify -->
+<!-- it under the terms of the GNU Affero General Public License as published by -->
+<!-- the Free Software Foundation, either version 3 of the License, or -->
+<!-- (at your option) any later version. -->
+<!-- This program is distributed in the hope that it will be useful, -->
+<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of -->
+<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE. -->
+
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>System Hub — Central Monitoring</title>
+        <style>
+            :root {
+                --bg: #0f1117;
+                --card-bg: #1a1d27;
+                --border: #2a2d3a;
+                --text: #e1e4ed;
+                --text-dim: #8b8fa3;
+                --accent: #6c8cff;
+                --green: #4ade80;
+                --yellow: #facc15;
+                --red: #f87171;
+                --cyan: #22d3ee;
+            }
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family:
+                    "Inter",
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "Segoe UI",
+                    sans-serif;
+                background: var(--bg);
+                color: var(--text);
+                min-height: 100vh;
+            }
+            .header {
+                background: var(--card-bg);
+                border-bottom: 1px solid var(--border);
+                padding: 14px 24px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                position: sticky;
+                top: 0;
+                z-index: 100;
+            }
+            .header h1 {
+                font-size: 20px;
+                font-weight: 600;
+            }
+            .header-stats {
+                display: flex;
+                gap: 20px;
+                font-size: 13px;
+            }
+            .header-stat {
+                text-align: center;
+            }
+            .header-stat .val {
+                font-size: 20px;
+                font-weight: 700;
+            }
+            .header-stat .lbl {
+                font-size: 10px;
+                color: var(--text-dim);
+                text-transform: uppercase;
+            }
+            .header-stat .val.green {
+                color: var(--green);
+            }
+            .header-stat .val.red {
+                color: var(--red);
+            }
+            .header-stat .val.yellow {
+                color: var(--yellow);
+            }
+            .container {
+                max-width: 1500px;
+                margin: 0 auto;
+                padding: 24px;
+            }
+            .section-title {
+                font-size: 16px;
+                font-weight: 600;
+                margin: 24px 0 12px;
+                padding-bottom: 8px;
+                border-bottom: 1px solid var(--border);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .btn {
+                padding: 8px 16px;
+                border-radius: 8px;
+                border: none;
+                font-size: 13px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.15s;
+            }
+            .btn-primary {
+                background: var(--accent);
+                color: #fff;
+            }
+            .btn-primary:hover {
+                background: #7b96ff;
+            }
+            .btn-danger {
+                background: var(--red);
+                color: #fff;
+            }
+            .btn-danger:hover {
+                opacity: 0.8;
+            }
+            .btn-sm {
+                padding: 4px 10px;
+                font-size: 11px;
+            }
+            .btn-ghost {
+                background: transparent;
+                color: var(--text-dim);
+                border: 1px solid var(--border);
+            }
+            .btn-ghost:hover {
+                background: rgba(255, 255, 255, 0.05);
+                color: var(--text);
+            }
+            .sys-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+                gap: 14px;
+            }
+            .sys-card {
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 16px;
+                cursor: pointer;
+                transition: all 0.2s;
+                position: relative;
+            }
+            .sys-card:hover {
+                border-color: #4a4e60;
+                transform: translateY(-1px);
+            }
+            .sys-card.selected {
+                border-color: var(--accent);
+                box-shadow: 0 0 12px rgba(108, 140, 255, 0.15);
+            }
+            .sys-card-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 12px;
+            }
+            .sys-card-name {
+                font-weight: 600;
+                font-size: 15px;
+            }
+            .sys-card-url {
+                font-size: 11px;
+                color: var(--text-dim);
+                margin-top: 2px;
+            }
+            .sys-status-dot {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                flex-shrink: 0;
+            }
+            .sys-status-dot.online {
+                background: var(--green);
+                box-shadow: 0 0 8px var(--green);
+            }
+            .sys-status-dot.offline {
+                background: var(--red);
+            }
+            .sys-status-dot.unknown {
+                background: var(--yellow);
+            }
+            .sys-metrics {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 8px;
+            }
+            .sys-metric {
+                text-align: center;
+                padding: 8px;
+                background: rgba(255, 255, 255, 0.02);
+                border-radius: 8px;
+            }
+            .sys-metric .val {
+                font-size: 20px;
+                font-weight: 700;
+            }
+            .sys-metric .lbl {
+                font-size: 10px;
+                color: var(--text-dim);
+                text-transform: uppercase;
+                margin-top: 2px;
+            }
+            .sys-meta {
+                font-size: 11px;
+                color: var(--text-dim);
+                margin-top: 10px;
+                display: flex;
+                gap: 12px;
+            }
+            .detail-panel {
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 20px;
+                margin-top: 16px;
+                display: none;
+            }
+            .detail-panel.active {
+                display: block;
+            }
+            .detail-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 16px;
+            }
+            .detail-header h2 {
+                font-size: 18px;
+            }
+            .chart-row {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 16px;
+                margin-bottom: 16px;
+            }
+            .chart-canvas {
+                width: 100%;
+                height: 160px;
+                display: block;
+            }
+            .alerts-section {
+                margin-top: 24px;
+            }
+            .alert-card {
+                border-left: 3px solid var(--yellow);
+                padding: 10px 14px;
+                margin-bottom: 6px;
+                border-radius: 6px;
+                background: rgba(250, 204, 21, 0.05);
+                font-size: 13px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .alert-card.critical {
+                border-left-color: var(--red);
+                background: rgba(248, 113, 113, 0.05);
+            }
+            .alert-card.warning {
+                border-left-color: var(--yellow);
+                background: rgba(250, 204, 21, 0.05);
+            }
+            .alert-card.info {
+                border-left-color: var(--cyan);
+                background: rgba(34, 211, 238, 0.05);
+            }
+            .alert-card .alert-body {
+                flex: 1;
+            }
+            .alert-card .alert-system {
+                font-size: 11px;
+                color: var(--text-dim);
+            }
+            .modal-overlay {
+                display: none;
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.6);
+                z-index: 200;
+                align-items: center;
+                justify-content: center;
+            }
+            .modal-overlay.active {
+                display: flex;
+            }
+            .modal {
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 24px;
+                width: 480px;
+                max-width: 90vw;
+            }
+            .modal h3 {
+                margin-bottom: 16px;
+            }
+            .form-group {
+                margin-bottom: 12px;
+            }
+            .form-group label {
+                display: block;
+                font-size: 12px;
+                color: var(--text-dim);
+                margin-bottom: 4px;
+                font-weight: 600;
+                text-transform: uppercase;
+            }
+            .form-group input {
+                width: 100%;
+                padding: 10px;
+                border-radius: 8px;
+                border: 1px solid var(--border);
+                background: var(--bg);
+                color: var(--text);
+                font-size: 14px;
+            }
+            .form-group input:focus {
+                outline: none;
+                border-color: var(--accent);
+            }
+            .form-actions {
+                display: flex;
+                gap: 8px;
+                justify-content: flex-end;
+                margin-top: 16px;
+            }
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: var(--text-dim);
+            }
+            .empty-state .icon {
+                font-size: 48px;
+                margin-bottom: 12px;
+            }
+            .empty-state p {
+                margin-bottom: 16px;
+            }
+            .disk-bar {
+                height: 6px;
+                background: #252836;
+                border-radius: 3px;
+                overflow: hidden;
+                margin-top: 4px;
+            }
+            .disk-bar-fill {
+                height: 100%;
+                border-radius: 3px;
+                transition: width 0.5s;
+            }
+            .disk-item {
+                margin-bottom: 10px;
+                padding: 8px;
+                background: rgba(255, 255, 255, 0.02);
+                border-radius: 8px;
+            }
+            .disk-item .disk-name {
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .disk-item .disk-pct {
+                font-size: 12px;
+                color: var(--text-dim);
+            }
+            @media (max-width: 768px) {
+                .sys-grid {
+                    grid-template-columns: 1fr;
+                }
+                .chart-row {
+                    grid-template-columns: 1fr;
+                }
+                .header-stats {
+                    gap: 10px;
+                }
+                .container {
+                    padding: 12px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>⚙️ System Hub</h1>
+            <div class="header-stats">
+                <div class="header-stat">
+                    <div class="val" id="statTotal">0</div>
+                    <div class="lbl">Systems</div>
+                </div>
+                <div class="header-stat">
+                    <div class="val green" id="statOnline">0</div>
+                    <div class="lbl">Online</div>
+                </div>
+                <div class="header-stat">
+                    <div class="val red" id="statOffline">0</div>
+                    <div class="lbl">Offline</div>
+                </div>
+                <div class="header-stat">
+                    <div class="val yellow" id="statAlerts">0</div>
+                    <div class="lbl">Alerts</div>
+                </div>
+            </div>
+        </div>
+        <div class="container">
+            <div class="section-title">
+                <span>Registered Systems</span>
+                <button class="btn btn-primary" onclick="openAddModal()">
+                    + Add System
+                </button>
+                <button
+                    class="btn btn-danger btn-sm"
+                    onclick="deleteOfflineSystems()"
+                    style="margin-left: 8px"
+                >
+                    🗑 Offline
+                </button>
+            </div>
+            <div class="sys-grid" id="sysGrid"></div>
+            <div class="empty-state" id="emptyState">
+                <div class="icon">🖥️</div>
+                <p>No systems registered yet</p>
+                <button class="btn btn-primary" onclick="openAddModal()">
+                    Add your first system
+                </button>
+            </div>
+            <div class="detail-panel" id="detailPanel">
+                <div class="detail-header">
+                    <h2 id="detailName">System Details</h2>
+                    <div>
+                        <button
+                            class="btn btn-ghost btn-sm"
+                            onclick="closeDetail()"
+                        >
+                            ✕ Close
+                        </button>
+                    </div>
+                </div>
+                <div
+                    id="detailInfo"
+                    style="
+                        display: grid;
+                        grid-template-columns: repeat(4, 1fr);
+                        gap: 10px;
+                        margin-bottom: 16px;
+                    "
+                >
+                    <div class="sys-metric">
+                        <div class="val" style="color: var(--cyan)" id="dOs">
+                            —
+                        </div>
+                        <div class="lbl">OS</div>
+                    </div>
+                    <div class="sys-metric">
+                        <div
+                            class="val"
+                            style="color: var(--text-dim); font-size: 13px"
+                            id="dKernel"
+                        >
+                            —
+                        </div>
+                        <div class="lbl">Kernel</div>
+                    </div>
+                    <div class="sys-metric">
+                        <div class="val" style="color: var(--accent)" id="dCpu">
+                            —
+                        </div>
+                        <div class="lbl">CPU</div>
+                    </div>
+                    <div class="sys-metric">
+                        <div class="val" style="color: var(--green)" id="dMem">
+                            —
+                        </div>
+                        <div class="lbl">Total RAM</div>
+                    </div>
+                </div>
+                <div class="chart-row">
+                    <div>
+                        <canvas id="chartCpu" class="chart-canvas"></canvas>
+                        <div
+                            id="chartCpuMsg"
+                            style="
+                                text-align: center;
+                                color: var(--text-dim);
+                                font-size: 12px;
+                                padding: 20px;
+                            "
+                        >
+                            No data yet
+                        </div>
+                    </div>
+                    <div>
+                        <canvas id="chartMem" class="chart-canvas"></canvas>
+                        <div
+                            id="chartMemMsg"
+                            style="
+                                text-align: center;
+                                color: var(--text-dim);
+                                font-size: 12px;
+                                padding: 20px;
+                            "
+                        >
+                            No data yet
+                        </div>
+                    </div>
+                </div>
+                <div
+                    class="section-title"
+                    style="margin-top: 0; font-size: 13px"
+                >
+                    Disk Usage
+                </div>
+                <div id="detailDisks" style="margin-bottom: 12px">
+                    <div
+                        style="
+                            color: var(--text-dim);
+                            font-size: 12px;
+                            padding: 10px;
+                        "
+                    >
+                        No disk data yet
+                    </div>
+                </div>
+                <div style="display: flex; gap: 8px">
+                    <button
+                        class="btn btn-ghost btn-sm"
+                        onclick="refreshDetailCharts()"
+                    >
+                        Refresh Charts
+                    </button>
+                    <button
+                        class="btn btn-danger btn-sm"
+                        onclick="deleteSystem()"
+                    >
+                        Delete System
+                    </button>
+                </div>
+            </div>
+            <div class="section-title alerts-section">Recent Alerts</div>
+            <div id="alertsList"></div>
+        </div>
+        <div class="modal-overlay" id="modal">
+            <div class="modal">
+                <h3 id="modalTitle">Add System</h3>
+                <div class="form-group">
+                    <label>Name</label
+                    ><input id="fName" placeholder="Production Server 1" />
+                </div>
+                <div class="form-group">
+                    <label>URL</label
+                    ><input id="fUrl" placeholder="http://192.168.1.10:9090" />
+                </div>
+                <div class="form-group">
+                    <label>API Token (optional)</label
+                    ><input id="fToken" placeholder="Leave empty if no auth" />
+                </div>
+                <div class="form-group">
+                    <label>Poll Interval (seconds)</label
+                    ><input id="fInterval" type="number" value="10" min="5" />
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-ghost" onclick="closeModal()">
+                        Cancel
+                    </button>
+                    <button
+                        class="btn btn-primary"
+                        id="modalSubmit"
+                        onclick="submitSystem()"
+                    >
+                        Add System
+                    </button>
+                </div>
+            </div>
+        </div>
+        <script>
+            var API = "";
+            var eventSource = null;
+            var selectedSystemId = null;
+            var liveMetricsCache = {};
+
+            async function deleteOfflineSystems() {
+                if (!confirm("Delete ALL offline systems and their data?"))
+                    return;
+                var systems = await fetchJSON("/api/systems");
+                if (!systems) return;
+                for (var i = 0; i < systems.length; i++) {
+                    if (systems[i].status === "offline") {
+                        await fetch("/api/systems/" + systems[i].id, {
+                            method: "DELETE",
+                        });
+                    }
+                }
+            }
+
+            function connectSSE() {
+                if (eventSource) eventSource.close();
+                eventSource = new EventSource(API + "/api/stream/summary");
+                eventSource.addEventListener("summary", function (e) {
+                    try {
+                        updateFromSSE(JSON.parse(e.data));
+                    } catch (_) {}
+                });
+            }
+
+            function updateFromSSE(data) {
+                document.getElementById("statTotal").textContent =
+                    data.total_systems;
+                document.getElementById("statOnline").textContent =
+                    data.online_count;
+                document.getElementById("statOffline").textContent =
+                    data.offline_count;
+                document.getElementById("statAlerts").textContent =
+                    data.active_alerts;
+
+                var systems = data.systems || [];
+                var liveMetrics = data.live_metrics || {};
+                liveMetricsCache = liveMetrics;
+                if (
+                    selectedSystemId &&
+                    document
+                        .getElementById("detailPanel")
+                        .classList.contains("active")
+                ) {
+                    var lm2 = liveMetrics[selectedSystemId] || {};
+                    var disks2 = lm2.disks || [];
+                    var diskHtml2 = "";
+                    if (disks2.length > 0) {
+                        disks2.forEach(function (d) {
+                            var pct = d[1] || 0;
+                            var color =
+                                pct > 90
+                                    ? "var(--red)"
+                                    : pct > 75
+                                      ? "var(--yellow)"
+                                      : "var(--green)";
+                            diskHtml2 +=
+                                '<div class="disk-item"><div style="display:flex;justify-content:space-between"><span class="disk-name">' +
+                                esc(d[0]) +
+                                '</span><span class="disk-pct">' +
+                                pct.toFixed(1) +
+                                '%</span></div><div class="disk-bar"><div class="disk-bar-fill" style="width:' +
+                                pct +
+                                "%;background:" +
+                                color +
+                                '"></div></div></div>';
+                        });
+                    } else {
+                        diskHtml2 =
+                            '<div style="color:var(--text-dim);font-size:12px;padding:10px">Waiting for disk data...</div>';
+                    }
+                    var dd = document.getElementById("detailDisks");
+                    if (dd) dd.innerHTML = diskHtml2;
+                }
+                var grid = document.getElementById("sysGrid");
+                var empty = document.getElementById("emptyState");
+                if (systems.length === 0) {
+                    grid.innerHTML = "";
+                    empty.style.display = "block";
+                    return;
+                }
+                empty.style.display = "none";
+
+                grid.innerHTML = systems
+                    .map(function (s) {
+                        var sc = s.status || "unknown";
+                        var lm = liveMetrics[s.id] || {};
+                        return (
+                            '<div class="sys-card' +
+                            (s.id === selectedSystemId ? " selected" : "") +
+                            '" onclick="selectSystem(\'' +
+                            s.id +
+                            "')\">" +
+                            '<div class="sys-card-header"><div><div class="sys-card-name">' +
+                            esc(s.name) +
+                            '</div><div class="sys-card-url">' +
+                            esc(s.url) +
+                            "</div></div>" +
+                            '<div class="sys-status-dot ' +
+                            sc +
+                            '" title="' +
+                            sc +
+                            '"></div></div>' +
+                            '<div class="sys-metrics">' +
+                            '<div class="sys-metric"><div class="val" style="color:var(--accent)">' +
+                            (lm.cpu_percent != null
+                                ? lm.cpu_percent.toFixed(1) + "%"
+                                : "—") +
+                            '</div><div class="lbl">CPU</div></div>' +
+                            '<div class="sys-metric"><div class="val" style="color:var(--green)">' +
+                            (lm.memory_percent != null
+                                ? lm.memory_percent.toFixed(1) + "%"
+                                : "—") +
+                            '</div><div class="lbl">MEM</div></div>' +
+                            '<div class="sys-metric"><div class="val" style="color:var(--cyan)">' +
+                            (lm.load_one != null
+                                ? lm.load_one.toFixed(1)
+                                : "—") +
+                            '</div><div class="lbl">Load</div></div>' +
+                            "</div>" +
+                            '<div class="sys-meta">' +
+                            (s.os ? "<span>" + esc(s.os) + "</span>" : "") +
+                            (s.cpu_cores
+                                ? "<span>" + s.cpu_cores + " cores</span>"
+                                : "") +
+                            (s.total_memory_display
+                                ? "<span>" +
+                                  esc(s.total_memory_display) +
+                                  " RAM</span>"
+                                : "") +
+                            (s.last_seen
+                                ? "<span>Seen: " + esc(s.last_seen) + "</span>"
+                                : "") +
+                            "</div>" +
+                            (s.last_error
+                                ? '<div style="font-size:10px;color:var(--red);margin-top:6px">' +
+                                  esc(s.last_error) +
+                                  "</div>"
+                                : "") +
+                            "</div>"
+                        );
+                    })
+                    .join("");
+                loadAlerts();
+            }
+
+            function selectSystem(id) {
+                selectedSystemId = id;
+                document.getElementById("detailPanel").classList.add("active");
+                document.querySelectorAll(".sys-card").forEach(function (c) {
+                    c.classList.toggle(
+                        "selected",
+                        c.querySelector(".sys-card-name") &&
+                            c.getAttribute("onclick") &&
+                            c.getAttribute("onclick").indexOf(id) >= 0,
+                    );
+                });
+                fetchJSON("/api/systems/" + id).then(function (sys) {
+                    if (!sys) return;
+                    document.getElementById("detailName").textContent =
+                        sys.name + " (" + (sys.hostname || sys.url) + ")";
+                    document.getElementById("dOs").textContent = sys.os || "—";
+                    document.getElementById("dKernel").textContent =
+                        sys.kernel || "—";
+                    document.getElementById("dCpu").textContent = sys.cpu_model
+                        ? sys.cpu_model.split("@")[0].trim()
+                        : "—";
+                    document.getElementById("dMem").textContent =
+                        sys.total_memory_display || "—";
+                    var lm = liveMetricsCache[id] || {};
+                    var disks = lm.disks || [];
+                    var diskHtml = "";
+                    if (disks.length > 0) {
+                        disks.forEach(function (d) {
+                            var pct = d[1] || 0;
+                            var color =
+                                pct > 90
+                                    ? "var(--red)"
+                                    : pct > 75
+                                      ? "var(--yellow)"
+                                      : "var(--green)";
+                            diskHtml +=
+                                '<div class="disk-item"><div style="display:flex;justify-content:space-between"><span class="disk-name">' +
+                                esc(d[0]) +
+                                '</span><span class="disk-pct">' +
+                                pct.toFixed(1) +
+                                '%</span></div><div class="disk-bar"><div class="disk-bar-fill" style="width:' +
+                                pct +
+                                "%;background:" +
+                                color +
+                                '"></div></div></div>';
+                        });
+                    } else {
+                        diskHtml =
+                            '<div style="color:var(--text-dim);font-size:12px;padding:10px">No disk data yet</div>';
+                    }
+                    document.getElementById("detailDisks").innerHTML = diskHtml;
+                });
+                refreshDetailCharts();
+            }
+
+            function closeDetail() {
+                selectedSystemId = null;
+                document
+                    .getElementById("detailPanel")
+                    .classList.remove("active");
+                document.querySelectorAll(".sys-card").forEach(function (c) {
+                    c.classList.remove("selected");
+                });
+            }
+
+            async function refreshDetailCharts() {
+                if (!selectedSystemId) return;
+                var hist = await fetchJSON(
+                    "/api/systems/" + selectedSystemId + "/history?limit=300",
+                );
+                var hasCpu = hist && hist.cpu && hist.cpu.length > 0;
+                var hasMem = hist && hist.memory && hist.memory.length > 0;
+                document.getElementById("chartCpuMsg").style.display = hasCpu
+                    ? "none"
+                    : "block";
+                document.getElementById("chartMemMsg").style.display = hasMem
+                    ? "none"
+                    : "block";
+                if (hasCpu)
+                    drawChart(
+                        "chartCpu",
+                        hist.cpu,
+                        "CPU %",
+                        100,
+                        "var(--accent)",
+                    );
+                if (hasMem)
+                    drawChart(
+                        "chartMem",
+                        hist.memory,
+                        "MEM %",
+                        100,
+                        "var(--green)",
+                    );
+            }
+            var lm = liveMetricsCache[selectedSystemId] || {};
+            var disks = lm.disks || [];
+            var diskHtml = "";
+            if (disks.length > 0) {
+                disks.forEach(function (d) {
+                    var pct = d[1] || 0;
+                    var color =
+                        pct > 90
+                            ? "var(--red)"
+                            : pct > 75
+                              ? "var(--yellow)"
+                              : "var(--green)";
+                    diskHtml +=
+                        '<div class="disk-item"><div style="display:flex;justify-content:space-between"><span class="disk-name">' +
+                        esc(d[0]) +
+                        '</span><span class="disk-pct">' +
+                        pct.toFixed(1) +
+                        '%</span></div><div class="disk-bar"><div class="disk-bar-fill" style="width:' +
+                        pct +
+                        "%;background:" +
+                        color +
+                        '"></div></div></div>';
+                });
+            } else {
+                diskHtml =
+                    '<div style="color:var(--text-dim);font-size:12px;padding:10px">No disk data yet</div>';
+            }
+            document.getElementById("detailDisks").innerHTML = diskHtml;
+
+            async function loadAlerts() {
+                var alerts = await fetchJSON(
+                    "/api/alerts?acknowledged=false&limit=50",
+                );
+                if (!alerts || !alerts.length) {
+                    document.getElementById("alertsList").innerHTML =
+                        '<div style="color:var(--text-dim);padding:20px">No active alerts</div>';
+                    return;
+                }
+                document.getElementById("alertsList").innerHTML = alerts
+                    .map(function (a) {
+                        return (
+                            '<div class="alert-card ' +
+                            a.severity +
+                            '"><div class="alert-body"><strong>' +
+                            a.severity.toUpperCase() +
+                            "</strong> — " +
+                            esc(a.message) +
+                            '<div class="alert-system">' +
+                            esc(a.system_name) +
+                            " · " +
+                            esc(a.fired_at) +
+                            "</div></div>" +
+                            '<button class="btn btn-ghost btn-sm" onclick="ackAlert(\'' +
+                            a.id +
+                            "')\">✓ Ack</button></div>"
+                        );
+                    })
+                    .join("");
+            }
+
+            async function ackAlert(id) {
+                await fetch(
+                    API +
+                        "/api/alerts/" +
+                        encodeURIComponent(id) +
+                        "/acknowledge",
+                    { method: "POST" },
+                );
+                loadAlerts();
+            }
+
+            function openAddModal() {
+                document.getElementById("modalTitle").textContent =
+                    "Add System";
+                document.getElementById("fName").value = "";
+                document.getElementById("fUrl").value = "";
+                document.getElementById("fToken").value = "";
+                document.getElementById("fInterval").value = "10";
+                document.getElementById("modalSubmit").textContent =
+                    "Add System";
+                document.getElementById("modal").classList.add("active");
+            }
+
+            function closeModal() {
+                document.getElementById("modal").classList.remove("active");
+            }
+
+            async function submitSystem() {
+                var payload = {
+                    name: document.getElementById("fName").value.trim(),
+                    url: document.getElementById("fUrl").value.trim(),
+                    token: document.getElementById("fToken").value.trim(),
+                    poll_interval_secs:
+                        parseInt(document.getElementById("fInterval").value) ||
+                        10,
+                };
+                if (!payload.name || !payload.url) {
+                    alert("Name and URL are required");
+                    return;
+                }
+                var resp = await fetch(API + "/api/systems", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (resp.ok) {
+                    closeModal();
+                } else {
+                    alert("Failed to add system");
+                }
+            }
+
+            async function deleteSystem() {
+                if (!selectedSystemId) return;
+                if (!confirm("Delete this system and all its data?")) return;
+                await fetch(API + "/api/systems/" + selectedSystemId, {
+                    method: "DELETE",
+                });
+                closeDetail();
+            }
+
+            function drawChart(canvasId, points, label, maxVal, color) {
+                var canvas = document.getElementById(canvasId);
+                if (!canvas || !points || !points.length) return;
+                var ctx = canvas.getContext("2d");
+                var W = (canvas.width = Math.max(
+                    canvas.parentElement.clientWidth - 40,
+                    280,
+                ));
+                var H = (canvas.height = 160);
+                var pad = { top: 15, right: 15, bottom: 25, left: 42 };
+                var pw = W - pad.left - pad.right,
+                    ph = H - pad.top - pad.bottom;
+                ctx.clearRect(0, 0, W, H);
+                ctx.strokeStyle = "#252836";
+                ctx.lineWidth = 1;
+                for (var i = 0; i <= 4; i++) {
+                    var y = pad.top + (ph / 4) * i;
+                    ctx.beginPath();
+                    ctx.moveTo(pad.left, y);
+                    ctx.lineTo(W - pad.right, y);
+                    ctx.stroke();
+                    ctx.fillStyle = "#8b8fa3";
+                    ctx.font = "9px Inter, sans-serif";
+                    ctx.fillText(
+                        Math.round(maxVal - (maxVal / 4) * i),
+                        4,
+                        y + 3,
+                    );
+                }
+                var step = pw / Math.max(points.length - 1, 1);
+                ctx.beginPath();
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.lineJoin = "round";
+                points.forEach(function (p, i) {
+                    var x = pad.left + i * step,
+                        y = pad.top + ph - (p.value / maxVal) * ph;
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+                ctx.lineTo(pad.left + (points.length - 1) * step, pad.top + ph);
+                ctx.lineTo(pad.left, pad.top + ph);
+                ctx.closePath();
+                ctx.fillStyle = color + "15";
+                ctx.fill();
+                ctx.fillStyle = "#8b8fa3";
+                ctx.font = "9px Inter, sans-serif";
+                ctx.fillText(label, W - pad.right - 50, 12);
+            }
+
+            async function fetchJSON(path) {
+                try {
+                    var r = await fetch(API + path);
+                    return await r.json();
+                } catch (_) {
+                    return null;
+                }
+            }
+
+            function esc(s) {
+                if (!s) return "";
+                var d = document.createElement("div");
+                d.textContent = s;
+                return d.innerHTML;
+            }
+
+            connectSSE();
+            loadAlerts();
+            window.addEventListener("resize", refreshDetailCharts);
+        </script>
+    </body>
+</html>
