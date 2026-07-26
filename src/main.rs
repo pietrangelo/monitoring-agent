@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 mod alerts;
 mod auth;
 mod collectors;
@@ -27,7 +26,6 @@ use axum::{Router, middleware};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() {
@@ -36,7 +34,7 @@ async fn main() {
     let app_state = state::AppState::new();
 
     // Load auth token from env (optional)
-    if let Some(_) = auth::configured_token() {
+    if auth::configured_token().is_some() {
         tracing::info!("🔐 API authentication enabled (SYSTEM_AGENT_TOKEN set)");
     } else {
         tracing::info!("🔓 No auth token configured — API is open");

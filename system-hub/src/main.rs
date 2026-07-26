@@ -26,7 +26,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() {

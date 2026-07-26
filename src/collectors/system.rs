@@ -179,6 +179,24 @@ pub fn collect() -> SystemSnapshot {
 
 fn parse_os_release() -> OsInfo {
     let content = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let mut os = parse_os_release_content(&content);
+
+    if os.name.is_empty()
+        && let Ok(out) = Command::new("lsb_release").args(["-ds"]).output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.len() > 1 {
+            os.name = s.trim_matches('"').to_string();
+        }
+    }
+    if os.pretty_name.is_empty() {
+        os.pretty_name = os.name.clone();
+    }
+
+    os
+}
+
+fn parse_os_release_content(content: &str) -> OsInfo {
     let mut name = String::new();
     let mut version = String::new();
     let mut id = String::new();
@@ -201,18 +219,6 @@ fn parse_os_release() -> OsInfo {
         } else if line.starts_with("PRETTY_NAME=") {
             pretty = val(line);
         }
-    }
-
-    if name.is_empty() {
-        if let Ok(out) = Command::new("lsb_release").args(["-ds"]).output() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.len() > 1 {
-                name = s.trim_matches('"').to_string();
-            }
-        }
-    }
-    if pretty.is_empty() {
-        pretty = name.clone();
     }
 
     OsInfo {
@@ -245,4 +251,96 @@ pub fn format_bytes(bytes: u64) -> String {
         unit_idx += 1;
     }
     format!("{:.1} {}", size, UNITS[unit_idx])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0.0 B");
+    }
+
+    #[test]
+    fn format_bytes_sub_kb() {
+        assert_eq!(format_bytes(512), "512.0 B");
+    }
+
+    #[test]
+    fn format_bytes_exact_kb() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+    }
+
+    #[test]
+    fn format_bytes_mb_gb_tb() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_bytes(1024u64.pow(4)), "1.0 TB");
+    }
+
+    #[test]
+    fn format_bytes_caps_at_petabytes() {
+        // Absurdly large value should stay clamped to the largest unit, not panic/index out of range.
+        let huge = u64::MAX;
+        let out = format_bytes(huge);
+        assert!(out.ends_with("PB"));
+    }
+
+    #[test]
+    fn format_uptime_minutes_only() {
+        assert_eq!(format_uptime(90), "1m");
+    }
+
+    #[test]
+    fn format_uptime_hours_and_minutes() {
+        assert_eq!(format_uptime(3 * 3600 + 5 * 60), "3h 5m");
+    }
+
+    #[test]
+    fn format_uptime_days_hours_minutes() {
+        assert_eq!(format_uptime(2 * 86400 + 4 * 3600 + 10 * 60), "2d 4h 10m");
+    }
+
+    #[test]
+    fn format_uptime_zero() {
+        assert_eq!(format_uptime(0), "0m");
+    }
+
+    #[test]
+    fn parse_os_release_content_full_fields() {
+        let content =
+            "NAME=\"Ubuntu\"\nVERSION=\"22.04\"\nID=ubuntu\nPRETTY_NAME=\"Ubuntu 22.04 LTS\"\n";
+        let os = parse_os_release_content(content);
+        assert_eq!(os.name, "Ubuntu");
+        assert_eq!(os.version, "22.04");
+        assert_eq!(os.id, "ubuntu");
+        assert_eq!(os.pretty_name, "Ubuntu 22.04 LTS");
+    }
+
+    #[test]
+    fn parse_os_release_content_empty_input() {
+        let os = parse_os_release_content("");
+        assert_eq!(os.name, "");
+        assert_eq!(os.version, "");
+        assert_eq!(os.id, "");
+        assert_eq!(os.pretty_name, "");
+    }
+
+    #[test]
+    fn parse_os_release_content_ignores_unrelated_lines() {
+        let content = "SOME_OTHER_KEY=value\nID=fedora\n";
+        let os = parse_os_release_content(content);
+        assert_eq!(os.id, "fedora");
+        assert_eq!(os.name, "");
+    }
+
+    #[test]
+    fn parse_os_release_content_name_line_does_not_match_pretty_name() {
+        // NAME= must not be confused with PRETTY_NAME= (both start differently but guard against substring bugs).
+        let content = "PRETTY_NAME=\"Pretty\"\nNAME=\"Plain\"\n";
+        let os = parse_os_release_content(content);
+        assert_eq!(os.name, "Plain");
+        assert_eq!(os.pretty_name, "Pretty");
+    }
 }

@@ -31,7 +31,11 @@ pub fn collect() -> Vec<ContainerInfo> {
         _ => return vec![],
     };
 
-    String::from_utf8_lossy(&output)
+    parse_docker_ps(&String::from_utf8_lossy(&output))
+}
+
+fn parse_docker_ps(output: &str) -> Vec<ContainerInfo> {
+    output
         .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(6, '\t');
@@ -45,4 +49,43 @@ pub fn collect() -> Vec<ContainerInfo> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_lines() {
+        let out = "abc123\tweb\tnginx:latest\tUp 2 hours\trunning\t0.0.0.0:80->80/tcp\n\
+                    def456\tdb\tpostgres:16\tExited (0) 1 day ago\texited\t";
+        let containers = parse_docker_ps(out);
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[0].id, "abc123");
+        assert_eq!(containers[0].name, "web");
+        assert_eq!(containers[0].image, "nginx:latest");
+        assert_eq!(containers[0].status, "Up 2 hours");
+        assert_eq!(containers[0].state, "running");
+        assert_eq!(containers[0].ports, "0.0.0.0:80->80/tcp");
+        assert_eq!(containers[1].ports, "");
+    }
+
+    #[test]
+    fn empty_output_yields_empty_vec() {
+        assert!(parse_docker_ps("").is_empty());
+    }
+
+    #[test]
+    fn short_line_missing_required_fields_is_skipped() {
+        let out = "onlyid\tonlyname";
+        assert!(parse_docker_ps(out).is_empty());
+    }
+
+    #[test]
+    fn missing_ports_field_defaults_to_empty_string() {
+        let out = "abc\tweb\tnginx\tUp\trunning";
+        let containers = parse_docker_ps(out);
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].ports, "");
+    }
 }

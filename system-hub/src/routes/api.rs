@@ -32,20 +32,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Systems CRUD
         .route("/api/systems", get(list_systems))
         .route("/api/systems", post(register_system))
-        .route("/api/systems/{id}", get(get_system))
-        .route("/api/systems/{id}", put(update_system))
-        .route("/api/systems/{id}", delete(delete_system))
+        .route("/api/systems/:id", get(get_system))
+        .route("/api/systems/:id", put(update_system))
+        .route("/api/systems/:id", delete(delete_system))
         // Summary
         .route("/api/summary", get(summary))
         // Metrics
-        .route("/api/systems/{id}/metrics", get(get_metrics))
-        .route("/api/systems/{id}/history", get(get_history))
+        .route("/api/systems/:id/metrics", get(get_metrics))
+        .route("/api/systems/:id/history", get(get_history))
         // Alerts
         .route("/api/alerts", get(get_alerts))
-        .route(
-            "/api/alerts/{alert_id}/acknowledge",
-            post(acknowledge_alert),
-        )
+        .route("/api/alerts/:alert_id/acknowledge", post(acknowledge_alert))
         .with_state(state)
 }
 
@@ -274,4 +271,452 @@ async fn acknowledge_alert(
     s.db.acknowledge_alert(&alert_id)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"status": "acknowledged"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+        (AppState::new(db), dir)
+    }
+
+    async fn body_json(res: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_returns_ok() {
+        let (state, _dir) = temp_state();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn list_systems_empty_then_after_register() {
+        let (state, _dir) = temp_state();
+        let app = router(state);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/systems")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json.as_array().unwrap().len(), 0);
+
+        let body = serde_json::json!({"name": "web-01", "url": "http://agent.local:9090/"});
+        let res = app
+            .clone()
+            .oneshot(json_request("POST", "/api/systems", body))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let created = body_json(res).await;
+        assert_eq!(created["name"], "web-01");
+        // Trailing slash must be stripped so `{url}/api/system` doesn't end up with `//`.
+        assert_eq!(created["url"], "http://agent.local:9090");
+        assert!(
+            created.get("token").is_none(),
+            "token must not be echoed back"
+        );
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/systems")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_system_clamps_poll_interval_to_minimum_five() {
+        let (state, _dir) = temp_state();
+        let body = serde_json::json!({"name": "w", "url": "http://x", "poll_interval_secs": 1});
+        let res = router(state)
+            .oneshot(json_request("POST", "/api/systems", body))
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["poll_interval_secs"], 5);
+    }
+
+    #[tokio::test]
+    async fn get_system_found_and_not_found() {
+        let (state, _dir) = temp_state();
+        let app = router(state);
+        let body = serde_json::json!({"name": "w", "url": "http://x"});
+        let res = app
+            .clone()
+            .oneshot(json_request("POST", "/api/systems", body))
+            .await
+            .unwrap();
+        let created = body_json(res).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/systems/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/systems/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_system_not_found_returns_404() {
+        let (state, _dir) = temp_state();
+        let body = serde_json::json!({"name": "renamed"});
+        let res = router(state)
+            .oneshot(json_request("PUT", "/api/systems/nope", body))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_system_partial_update_succeeds() {
+        let (state, _dir) = temp_state();
+        let app = router(state);
+        let create_body = serde_json::json!({"name": "w", "url": "http://x"});
+        let res = app
+            .clone()
+            .oneshot(json_request("POST", "/api/systems", create_body))
+            .await
+            .unwrap();
+        let created = body_json(res).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let update_body = serde_json::json!({"enabled": false});
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/api/systems/{id}"),
+                update_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/systems/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["name"], "w"); // untouched
+    }
+
+    #[tokio::test]
+    async fn delete_system_removes_it() {
+        let (state, _dir) = temp_state();
+        let app = router(state);
+        let create_body = serde_json::json!({"name": "w", "url": "http://x"});
+        let res = app
+            .clone()
+            .oneshot(json_request("POST", "/api/systems", create_body))
+            .await
+            .unwrap();
+        let created = body_json(res).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/systems/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/systems/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn summary_reports_counts() {
+        let (state, _dir) = temp_state();
+        state
+            .db
+            .insert_system(&SystemInfo {
+                id: "id-1".into(),
+                name: "online-sys".into(),
+                url: "http://x".into(),
+                token: String::new(),
+                status: SystemStatus::Online,
+                last_seen: String::new(),
+                last_error: None,
+                os: None,
+                hostname: None,
+                kernel: None,
+                cpu_model: None,
+                cpu_cores: None,
+                total_memory_display: None,
+                total_memory_bytes: None,
+                poll_interval_secs: 10,
+                enabled: true,
+            })
+            .unwrap();
+
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["total_systems"], 1);
+        assert_eq!(json["online_count"], 1);
+        assert_eq!(json["offline_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_metrics_returns_seeded_points() {
+        let (state, _dir) = temp_state();
+        state
+            .db
+            .insert_system(&SystemInfo {
+                id: "id-1".into(),
+                name: "sys".into(),
+                url: "http://x".into(),
+                token: String::new(),
+                status: SystemStatus::Unknown,
+                last_seen: String::new(),
+                last_error: None,
+                os: None,
+                hostname: None,
+                kernel: None,
+                cpu_model: None,
+                cpu_cores: None,
+                total_memory_display: None,
+                total_memory_bytes: None,
+                poll_interval_secs: 10,
+                enabled: true,
+            })
+            .unwrap();
+        state.db.insert_metric("id-1", "cpu", 42.0, 100).unwrap();
+
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/systems/id-1/metrics?metric=cpu")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["points"][0]["value"], 42.0);
+    }
+
+    #[tokio::test]
+    async fn get_metrics_defaults_to_cpu_metric() {
+        let (state, _dir) = temp_state();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/systems/id-1/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["metric"], "cpu");
+    }
+
+    #[tokio::test]
+    async fn get_history_combines_cpu_and_memory() {
+        let (state, _dir) = temp_state();
+        state
+            .db
+            .insert_system(&SystemInfo {
+                id: "id-1".into(),
+                name: "sys".into(),
+                url: "http://x".into(),
+                token: String::new(),
+                status: SystemStatus::Unknown,
+                last_seen: String::new(),
+                last_error: None,
+                os: None,
+                hostname: None,
+                kernel: None,
+                cpu_model: None,
+                cpu_cores: None,
+                total_memory_display: None,
+                total_memory_bytes: None,
+                poll_interval_secs: 10,
+                enabled: true,
+            })
+            .unwrap();
+        state.db.insert_metric("id-1", "cpu", 10.0, 1).unwrap();
+        state.db.insert_metric("id-1", "memory", 20.0, 1).unwrap();
+
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/systems/id-1/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["system_name"], "sys");
+        assert_eq!(json["cpu"][0]["value"], 10.0);
+        assert_eq!(json["memory"][0]["value"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn alerts_endpoints_filter_and_acknowledge() {
+        let (state, _dir) = temp_state();
+        state
+            .db
+            .insert_system(&SystemInfo {
+                id: "id-1".into(),
+                name: "sys".into(),
+                url: "http://x".into(),
+                token: String::new(),
+                status: SystemStatus::Unknown,
+                last_seen: String::new(),
+                last_error: None,
+                os: None,
+                hostname: None,
+                kernel: None,
+                cpu_model: None,
+                cpu_cores: None,
+                total_memory_display: None,
+                total_memory_bytes: None,
+                poll_interval_secs: 10,
+                enabled: true,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_alert(&AlertRecord {
+                id: "a1".into(),
+                system_id: "id-1".into(),
+                system_name: "sys".into(),
+                severity: "warning".into(),
+                message: "m".into(),
+                current_value: 1.0,
+                fired_at: "t".into(),
+                stored_at: "t1".into(),
+                acknowledged: false,
+            })
+            .unwrap();
+        let app = router(state);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json.as_array().unwrap().len(), 1);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts/a1/acknowledge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts?acknowledged=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["acknowledged"], true);
+    }
 }

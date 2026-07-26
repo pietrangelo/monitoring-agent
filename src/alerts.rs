@@ -188,6 +188,7 @@ impl AlertManager {
     }
 
     /// Evaluate all rules against current data. Returns newly-fired alerts.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &mut self,
         cpu_percent: f32,
@@ -379,4 +380,366 @@ fn unix_to_iso8601(secs: u64) -> String {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disk_map(pairs: &[(&str, f32)]) -> HashMap<String, f32> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn with_defaults_has_seven_rules_and_load5_disabled() {
+        let mgr = AlertManager::with_defaults();
+        assert_eq!(mgr.rules.len(), 7);
+        let load5 = mgr
+            .rules
+            .iter()
+            .find(|r| r.metric == AlertMetric::Load5)
+            .unwrap();
+        assert!(!load5.enabled);
+        assert!(mgr.active_alerts.is_empty());
+        assert!(mgr.states.is_empty());
+    }
+
+    #[test]
+    fn evaluate_no_rules_returns_nothing() {
+        let mut mgr = AlertManager::new(vec![]);
+        let alerts = mgr.evaluate(99.0, 99.0, 99.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 100);
+        assert!(alerts.is_empty());
+        assert!(mgr.active_alerts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_disabled_rule_is_skipped() {
+        let rule = AlertRule {
+            metric: AlertMetric::Cpu,
+            operator: AlertOperator::Gt,
+            threshold: 10.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: false,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let alerts = mgr.evaluate(99.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 100);
+        assert!(alerts.is_empty());
+        assert!(mgr.active_alerts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_fires_immediately_when_duration_and_cooldown_are_zero() {
+        let rule = AlertRule {
+            metric: AlertMetric::Cpu,
+            operator: AlertOperator::Gt,
+            threshold: 90.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(mgr.active_alerts.len(), 1);
+        assert!(alerts[0].message.contains("WARNING"));
+        assert!(alerts[0].message.contains("CPU"));
+        assert!(alerts[0].message.contains("95.0%"));
+    }
+
+    #[test]
+    fn evaluate_does_not_fire_before_duration_elapsed() {
+        let rule = AlertRule {
+            metric: AlertMetric::Cpu,
+            operator: AlertOperator::Gt,
+            threshold: 90.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 60,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        // First breach at t=1000: not enough duration yet.
+        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        assert!(alerts.is_empty());
+        assert!(mgr.active_alerts.is_empty());
+
+        // 30s later: still under duration.
+        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1030);
+        assert!(alerts.is_empty());
+
+        // 60s after the initial breach: duration satisfied, fires.
+        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1060);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(mgr.active_alerts.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_ongoing_alert_present_but_not_renotified_within_cooldown() {
+        let rule = AlertRule {
+            metric: AlertMetric::Cpu,
+            operator: AlertOperator::Gt,
+            threshold: 90.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 300,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let first = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        assert_eq!(first.len(), 1);
+
+        // Still breached 100s later, within cooldown: no new alert, but still "active" (ongoing).
+        let second = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1100);
+        assert!(second.is_empty());
+        assert_eq!(mgr.active_alerts.len(), 1);
+        assert!(mgr.active_alerts[0].id.starts_with("ongoing_"));
+
+        // After the cooldown elapses, it renotifies.
+        let third = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1301);
+        assert_eq!(third.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_clears_state_when_no_longer_breached() {
+        let rule = AlertRule {
+            metric: AlertMetric::Cpu,
+            operator: AlertOperator::Gt,
+            threshold: 90.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 60,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        // Drops below threshold before duration elapses: breach resets.
+        let alerts = mgr.evaluate(10.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1010);
+        assert!(alerts.is_empty());
+        assert!(mgr.active_alerts.is_empty());
+
+        // Breaches again: duration timer restarted, not enough time elapsed yet.
+        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1011);
+        assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_operators_lt_gte_lte() {
+        for (op, value, threshold, expect_breach) in [
+            (AlertOperator::Lt, 5.0, 10.0, true),
+            (AlertOperator::Lt, 15.0, 10.0, false),
+            (AlertOperator::Gte, 10.0, 10.0, true),
+            (AlertOperator::Gte, 9.9, 10.0, false),
+            (AlertOperator::Lte, 10.0, 10.0, true),
+            (AlertOperator::Lte, 10.1, 10.0, false),
+        ] {
+            let rule = AlertRule {
+                metric: AlertMetric::Memory,
+                operator: op,
+                threshold,
+                severity: AlertSeverity::Info,
+                duration_secs: 0,
+                cooldown_secs: 0,
+                mount_point: None,
+                enabled: true,
+            };
+            let mut mgr = AlertManager::new(vec![rule]);
+            let alerts = mgr.evaluate(0.0, value, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1);
+            assert_eq!(
+                !alerts.is_empty(),
+                expect_breach,
+                "value={value} threshold={threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_disk_uses_specific_mount_point() {
+        let rule = AlertRule {
+            metric: AlertMetric::Disk,
+            operator: AlertOperator::Gt,
+            threshold: 80.0,
+            severity: AlertSeverity::Critical,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: Some("/data".to_string()),
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let disks = disk_map(&[("/", 99.0), ("/data", 50.0)]);
+        // /data is under threshold even though / is over: mount-specific check wins.
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 1);
+        assert!(alerts.is_empty());
+
+        let disks = disk_map(&[("/", 10.0), ("/data", 90.0)]);
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 2);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("on /data"));
+    }
+
+    #[test]
+    fn evaluate_disk_without_mount_point_uses_max_usage() {
+        let rule = AlertRule {
+            metric: AlertMetric::Disk,
+            operator: AlertOperator::Gt,
+            threshold: 80.0,
+            severity: AlertSeverity::Critical,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let disks = disk_map(&[("/", 10.0), ("/data", 90.0)]);
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 1);
+        assert_eq!(alerts.len(), 1);
+        assert!(!alerts[0].message.contains(" on "));
+    }
+
+    #[test]
+    fn evaluate_disk_missing_mount_point_defaults_to_zero() {
+        let rule = AlertRule {
+            metric: AlertMetric::Disk,
+            operator: AlertOperator::Gt,
+            threshold: 1.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: Some("/missing".to_string()),
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let disks = disk_map(&[("/", 99.0)]);
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 1);
+        assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_load_auto_threshold_uses_cpu_cores() {
+        let rule = AlertRule {
+            metric: AlertMetric::Load5,
+            operator: AlertOperator::Gt,
+            threshold: 0.0, // 0 = auto
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        // load5 = 3.0, cpu_cores = 4 -> threshold becomes 4.0, not breached.
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &HashMap::new(), 0.0, 3.0, 0.0, 4, 1);
+        assert!(alerts.is_empty());
+
+        // load5 = 5.0 > 4 cores -> breached.
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &HashMap::new(), 0.0, 5.0, 0.0, 4, 2);
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_load_explicit_threshold_is_not_overridden() {
+        let rule = AlertRule {
+            metric: AlertMetric::Load1,
+            operator: AlertOperator::Gt,
+            threshold: 2.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        // load1 = 3.0 > explicit threshold 2.0 (would NOT breach if auto-threshold with 8 cores).
+        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &HashMap::new(), 3.0, 0.0, 0.0, 8, 1);
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_swap_metric() {
+        let rule = AlertRule {
+            metric: AlertMetric::Swap,
+            operator: AlertOperator::Gt,
+            threshold: 50.0,
+            severity: AlertSeverity::Warning,
+            duration_secs: 0,
+            cooldown_secs: 0,
+            mount_point: None,
+            enabled: true,
+        };
+        let mut mgr = AlertManager::new(vec![rule]);
+        let alerts = mgr.evaluate(0.0, 0.0, 60.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("Swap"));
+    }
+
+    #[test]
+    fn severity_name_and_operator_symbol_and_metric_name_cover_all_variants() {
+        assert_eq!(severity_name(&AlertSeverity::Info), "INFO");
+        assert_eq!(severity_name(&AlertSeverity::Warning), "WARNING");
+        assert_eq!(severity_name(&AlertSeverity::Critical), "CRITICAL");
+
+        assert_eq!(operator_symbol(&AlertOperator::Gt), ">");
+        assert_eq!(operator_symbol(&AlertOperator::Gte), ">=");
+        assert_eq!(operator_symbol(&AlertOperator::Lt), "<");
+        assert_eq!(operator_symbol(&AlertOperator::Lte), "<=");
+
+        assert_eq!(metric_name(&AlertMetric::Cpu), "CPU");
+        assert_eq!(metric_name(&AlertMetric::Memory), "Memory");
+        assert_eq!(metric_name(&AlertMetric::Swap), "Swap");
+        assert_eq!(metric_name(&AlertMetric::Disk), "Disk");
+        assert_eq!(metric_name(&AlertMetric::Load1), "Load (1m)");
+        assert_eq!(metric_name(&AlertMetric::Load5), "Load (5m)");
+        assert_eq!(metric_name(&AlertMetric::Load15), "Load (15m)");
+    }
+
+    #[test]
+    fn unix_to_iso8601_epoch_zero() {
+        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn unix_to_iso8601_known_date() {
+        // 2024-03-01T00:00:00Z (2024 is a leap year, so this exercises Feb 29 handling).
+        assert_eq!(unix_to_iso8601(1_709_251_200), "2024-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn unix_to_iso8601_with_time_of_day() {
+        // 1970-01-01T01:02:03Z
+        assert_eq!(unix_to_iso8601(3723), "1970-01-01T01:02:03Z");
+    }
+
+    #[test]
+    fn is_leap_covers_gregorian_rules() {
+        assert!(is_leap(2000)); // divisible by 400
+        assert!(!is_leap(1900)); // divisible by 100 but not 400
+        assert!(is_leap(2024)); // divisible by 4, not by 100
+        assert!(!is_leap(2023));
+    }
+
+    #[test]
+    fn alert_rule_deserializes_with_defaults() {
+        let json = r#"{"metric":"cpu","operator":"gt","threshold":90.0,"severity":"warning"}"#;
+        let rule: AlertRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.duration_secs, 0);
+        assert_eq!(rule.cooldown_secs, 0);
+        assert_eq!(rule.mount_point, None);
+        assert!(rule.enabled);
+    }
+
+    #[test]
+    fn alert_rule_deserializes_explicit_disabled() {
+        let json = r#"{"metric":"disk","operator":"lte","threshold":5.0,"severity":"critical","enabled":false,"mount_point":"/data"}"#;
+        let rule: AlertRule = serde_json::from_str(json).unwrap();
+        assert!(!rule.enabled);
+        assert_eq!(rule.mount_point.as_deref(), Some("/data"));
+        assert_eq!(rule.operator, AlertOperator::Lte);
+    }
 }

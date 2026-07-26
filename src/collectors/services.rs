@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use crate::models::ServiceInfo;
 use std::process::Command;
 
@@ -34,8 +33,10 @@ pub fn collect() -> Vec<ServiceInfo> {
         _ => return vec![],
     };
 
-    let raw = String::from_utf8_lossy(&output);
+    parse_service_lines(&String::from_utf8_lossy(&output))
+}
 
+fn parse_service_lines(raw: &str) -> Vec<ServiceInfo> {
     raw.lines()
         .filter_map(|line| {
             let v: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -48,4 +49,41 @@ pub fn collect() -> Vec<ServiceInfo> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_service_lines() {
+        let raw = r#"{"unit":"sshd.service","load":"loaded","active":"active","sub":"running","description":"OpenSSH server"}
+{"unit":"cron.service","load":"loaded","active":"inactive","sub":"dead","description":"Cron scheduler"}"#;
+        let services = parse_service_lines(raw);
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].name, "sshd.service");
+        assert_eq!(services[0].load_state, "loaded");
+        assert_eq!(services[0].active_state, "active");
+        assert_eq!(services[0].sub_state, "running");
+        assert_eq!(services[0].description, "OpenSSH server");
+    }
+
+    #[test]
+    fn skips_malformed_json_lines() {
+        let raw = "not json\n{\"unit\":\"ok.service\",\"load\":\"loaded\",\"active\":\"active\",\"sub\":\"running\",\"description\":\"\"}";
+        let services = parse_service_lines(raw);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "ok.service");
+    }
+
+    #[test]
+    fn skips_json_missing_required_fields() {
+        let raw = r#"{"unit":"partial.service","load":"loaded"}"#;
+        assert!(parse_service_lines(raw).is_empty());
+    }
+
+    #[test]
+    fn empty_input_yields_empty_vec() {
+        assert!(parse_service_lines("").is_empty());
+    }
 }

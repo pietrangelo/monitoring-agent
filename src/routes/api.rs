@@ -14,11 +14,10 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -318,4 +317,390 @@ fn unix_to_iso8601(secs: u64) -> String {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MetricPoint as ModelMetricPoint;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn body_json(res: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn app() -> (Router, Arc<AppState>) {
+        let state = AppState::new();
+        (router(state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn health_returns_ok_status_and_version() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert!(json["timestamp"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn system_full_returns_snapshot_shape() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert!(json.get("hostname").is_some());
+        assert!(json.get("cpu").is_some());
+        assert!(json.get("memory").is_some());
+    }
+
+    #[tokio::test]
+    async fn system_processes_respects_limit_query_param() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/processes?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert!(json.as_array().unwrap().len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn system_processes_default_limit_is_twenty() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/processes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert!(json.as_array().unwrap().len() <= 20);
+    }
+
+    #[tokio::test]
+    async fn history_cpu_empty_when_no_data_collected() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/history/cpu")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["metric"], "cpu");
+        assert_eq!(json["points"].as_array().unwrap().len(), 0);
+        assert_eq!(json["start_time"], 0);
+        assert_eq!(json["end_time"], 0);
+    }
+
+    #[tokio::test]
+    async fn history_cpu_returns_seeded_points_and_respects_limit() {
+        let (app, state) = app();
+        {
+            let mut hist = state.history.write();
+            for i in 0..5 {
+                hist.push_cpu(i as f32, 1000 + i);
+            }
+        }
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/history/cpu?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        let points = json["points"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        // tail() keeps the most recent points.
+        assert_eq!(points[0]["timestamp"], 1003);
+        assert_eq!(points[1]["timestamp"], 1004);
+        assert_eq!(json["start_time"], 1003);
+        assert_eq!(json["end_time"], 1004);
+    }
+
+    #[tokio::test]
+    async fn history_memory_swap_and_load_and_disk_endpoints_respond_ok() {
+        let (app, state) = app();
+        {
+            let mut hist = state.history.write();
+            hist.push_memory(10.0, 1);
+            hist.push_swap(5.0, 1);
+            hist.push_load1(0.5, 1);
+            hist.push_load5(0.6, 1);
+            hist.push_load15(0.7, 1);
+            hist.push_disk("/", 42.0, 1);
+        }
+        for path in [
+            "/api/history/memory",
+            "/api/history/swap",
+            "/api/history/load",
+            "/api/history/disk",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "path {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn history_disk_keys_response_by_mount_point() {
+        let (app, state) = app();
+        {
+            let mut hist = state.history.write();
+            hist.push_disk("/data", 33.0, 1);
+        }
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/history/disk")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert!(json.get("/data").is_some());
+        assert_eq!(json["/data"]["metric"], "disk:/data");
+    }
+
+    #[tokio::test]
+    async fn history_load_includes_all_three_windows() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/history/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["load1"]["metric"], "load1");
+        assert_eq!(json["load5"]["metric"], "load5");
+        assert_eq!(json["load15"]["metric"], "load15");
+    }
+
+    #[tokio::test]
+    async fn alerts_endpoints_default_state() {
+        let (app, _) = app();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json["active"].as_array().unwrap().len(), 0);
+        assert_eq!(json["rules_count"], 7);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json.as_array().unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn set_alert_config_replaces_rules_and_clears_active_state() {
+        let (app, state) = app();
+        let body = serde_json::json!({
+            "rules": [{
+                "metric": "cpu",
+                "operator": "gt",
+                "threshold": 50.0,
+                "severity": "warning"
+            }]
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["rules_count"], 1);
+        assert_eq!(state.alert_manager.read().rules.len(), 1);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(res).await;
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_alert_config_rejects_malformed_body() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Invalid JSON syntax -> axum's Json extractor rejects with 400 (not 422,
+        // which is reserved for well-formed JSON that doesn't match the target type).
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_alert_config_rejects_well_formed_json_with_wrong_shape() {
+        let (app, _) = app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"not_rules": []}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn application_endpoints_respond_ok_with_arrays() {
+        let (app, _) = app();
+        for path in [
+            "/api/packages",
+            "/api/services",
+            "/api/containers",
+            "/api/ports",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "path {path}");
+            let json = body_json(res).await;
+            assert!(json.is_array(), "path {path} should return a JSON array");
+        }
+    }
+
+    #[test]
+    fn tail_returns_all_when_under_limit() {
+        let mut deque = std::collections::VecDeque::new();
+        deque.push_back(ModelMetricPoint {
+            timestamp: 1,
+            value: 1.0,
+        });
+        deque.push_back(ModelMetricPoint {
+            timestamp: 2,
+            value: 2.0,
+        });
+        let out = tail(&deque, 10);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn tail_truncates_to_most_recent_when_over_limit() {
+        let mut deque = std::collections::VecDeque::new();
+        for i in 0..10 {
+            deque.push_back(ModelMetricPoint {
+                timestamp: i,
+                value: i as f32,
+            });
+        }
+        let out = tail(&deque, 3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].timestamp, 7);
+        assert_eq!(out[2].timestamp, 9);
+    }
+
+    #[test]
+    fn tail_empty_deque() {
+        let deque: std::collections::VecDeque<ModelMetricPoint> = std::collections::VecDeque::new();
+        assert!(tail(&deque, 5).is_empty());
+    }
+
+    #[test]
+    fn unix_to_iso8601_epoch_zero() {
+        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn unix_to_iso8601_leap_day() {
+        assert_eq!(unix_to_iso8601(1_709_251_200), "2024-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn is_leap_rules() {
+        assert!(is_leap(2000));
+        assert!(!is_leap(1900));
+        assert!(is_leap(2024));
+        assert!(!is_leap(2023));
+    }
 }

@@ -14,16 +14,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use axum::response::sse::{Event, KeepAlive};
-use axum::{extract::State, response::Sse, routing::get, Router};
+use axum::{Router, extract::State, response::Sse, routing::get};
 use futures_core::Stream;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
-use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::IntervalStream;
 
 use crate::collectors;
 use crate::state::AppState;
@@ -108,4 +107,49 @@ async fn alerts_stream(
             .interval(Duration::from_secs(10))
             .text("keep-alive"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn all_stream_routes_respond_with_event_stream_content_type() {
+        let state = AppState::new();
+        for path in [
+            "/api/stream/system",
+            "/api/stream/processes",
+            "/api/stream/alerts",
+        ] {
+            let res = router(state.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), axum::http::StatusCode::OK, "path {path}");
+            let content_type = res
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(content_type, "text/event-stream", "path {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_stream_path_is_not_found() {
+        let state = AppState::new();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+    }
 }

@@ -124,10 +124,10 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
     let url = format!("{}/api/system", system.url.trim_end_matches('/'));
 
     let mut headers = reqwest::header::HeaderMap::new();
-    if !system.token.is_empty() {
-        if let Ok(val) = reqwest::header::HeaderValue::from_str(&system.token) {
-            headers.insert("X-API-Key", val);
-        }
+    if !system.token.is_empty()
+        && let Ok(val) = reqwest::header::HeaderValue::from_str(&system.token)
+    {
+        headers.insert("X-API-Key", val);
     }
 
     let client = reqwest::Client::builder()
@@ -284,53 +284,51 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
 
             // Fetch alerts from the remote system
             let alerts_url = format!("{}/api/alerts", system.url.trim_end_matches('/'));
-            if let Ok(resp) = client.get(&alerts_url).send().await {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    if let Some(active) = body.get("active").and_then(|v| v.as_array()) {
-                        let stored_at = now_iso();
-                        for alert_val in active {
-                            let id = alert_val
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(|s| format!("{}_{}", &system.id, s))
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if let Ok(resp) = client.get(&alerts_url).send().await
+                && let Ok(body) = resp.json::<serde_json::Value>().await
+                && let Some(active) = body.get("active").and_then(|v| v.as_array())
+            {
+                let stored_at = now_iso();
+                for alert_val in active {
+                    let id = alert_val
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| format!("{}_{}", &system.id, s))
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                            let severity = alert_val
-                                .get("rule")
-                                .and_then(|v| v.get("severity"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("warning");
+                    let severity = alert_val
+                        .get("rule")
+                        .and_then(|v| v.get("severity"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("warning");
 
-                            let message = alert_val
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                    let message = alert_val
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
-                            let current_value = alert_val
-                                .get("current_value")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0)
-                                as f32;
+                    let current_value = alert_val
+                        .get("current_value")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32;
 
-                            let fired_at = alert_val
-                                .get("fired_at")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                    let fired_at = alert_val
+                        .get("fired_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
-                            let record = AlertRecord {
-                                id,
-                                system_id: system.id.clone(),
-                                system_name: system.name.clone(),
-                                severity: severity.to_string(),
-                                message: message.to_string(),
-                                current_value,
-                                fired_at: fired_at.to_string(),
-                                stored_at: stored_at.clone(),
-                                acknowledged: false,
-                            };
-                            let _ = state.db.insert_alert(&record);
-                        }
-                    }
+                    let record = AlertRecord {
+                        id,
+                        system_id: system.id.clone(),
+                        system_name: system.name.clone(),
+                        severity: severity.to_string(),
+                        message: message.to_string(),
+                        current_value,
+                        fired_at: fired_at.to_string(),
+                        stored_at: stored_at.clone(),
+                        acknowledged: false,
+                    };
+                    let _ = state.db.insert_alert(&record);
                 }
             }
         }
@@ -427,4 +425,289 @@ fn unix_to_iso8601(secs: u64) -> String {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use axum::{Json, Router, routing::get};
+
+    fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+        let state = AppState::new(db);
+        (state, dir)
+    }
+
+    fn sample_system(id: &str, url: String) -> SystemInfo {
+        SystemInfo {
+            id: id.to_string(),
+            name: "test-sys".into(),
+            url,
+            token: String::new(),
+            status: SystemStatus::Unknown,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled: true,
+        }
+    }
+
+    async fn spawn_mock_agent(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn poll_system_success_updates_status_hardware_info_and_metrics() {
+        let (state, _dir) = temp_state();
+        let system_json = serde_json::json!({
+            "hostname": "host1",
+            "os": {"name": "Ubuntu", "pretty_name": "Ubuntu 22.04"},
+            "kernel": "6.6.0",
+            "cpu": {"model": "Generic", "logical_cores": 4, "usage_percent": 12.5},
+            "memory": {"total_bytes": 1000, "total_display": "1KB", "used_display": "500B", "used_bytes": 500, "usage_percent": 50.0},
+            "swap": {"usage_percent": 0.0},
+            "load_average": {"one": 0.1, "five": 0.2, "fifteen": 0.3},
+            "uptime_seconds": 100,
+            "uptime_display": "1m",
+            "disks": [{"mount_point": "/", "usage_percent": 40.0, "total_display": "10G", "used_display": "4G"}],
+            "top_processes": []
+        });
+        let alerts_json = serde_json::json!({"active": []});
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let v = system_json.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(move || {
+                    let v = alerts_json.clone();
+                    async move { Json(v) }
+                }),
+            );
+        let url = spawn_mock_agent(app).await;
+
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Online);
+        assert_eq!(updated.hostname.as_deref(), Some("host1"));
+        assert_eq!(updated.cpu_cores, Some(4));
+
+        let points = state.db.get_metrics("id-1", "cpu", 10, None).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, 12.5);
+
+        let disk_points = state.db.get_metrics("id-1", "disk:/", 10, None).unwrap();
+        assert_eq!(disk_points.len(), 1);
+
+        let live = state.live_metrics.read().unwrap();
+        assert_eq!(live.get("id-1").unwrap().cpu_percent, 12.5);
+    }
+
+    #[tokio::test]
+    async fn poll_system_stores_active_alerts_from_agent() {
+        let (state, _dir) = temp_state();
+        let system_json = serde_json::json!({});
+        let alerts_json = serde_json::json!({
+            "active": [{
+                "id": "rule_0",
+                "rule": {"severity": "critical"},
+                "current_value": 97.5,
+                "fired_at": "2026-01-01T00:00:00Z",
+                "message": "CPU too high"
+            }]
+        });
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let v = system_json.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(move || {
+                    let v = alerts_json.clone();
+                    async move { Json(v) }
+                }),
+            );
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let alerts = state.db.get_alerts(Some("id-1"), None, 10).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "critical");
+        assert_eq!(alerts[0].message, "CPU too high");
+        assert_eq!(alerts[0].id, "id-1_rule_0");
+    }
+
+    #[tokio::test]
+    async fn poll_system_marks_offline_on_json_parse_error() {
+        let (state, _dir) = temp_state();
+        let app = Router::new().route("/api/system", get(|| async { "not json" }));
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Offline);
+        assert!(updated.last_error.unwrap().contains("JSON parse error"));
+    }
+
+    #[tokio::test]
+    async fn poll_system_marks_offline_on_http_error_status() {
+        let (state, _dir) = temp_state();
+        let app = Router::new().route(
+            "/api/system",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Offline);
+        assert!(updated.last_error.unwrap().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn poll_system_marks_offline_on_connection_error() {
+        let (state, _dir) = temp_state();
+        // Nothing is listening on this port: reqwest should fail to connect.
+        let system = sample_system("id-1", "http://127.0.0.1:1".to_string());
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Offline);
+        assert!(updated.last_error.is_some());
+    }
+
+    #[test]
+    fn store_metrics_writes_all_metrics_and_updates_live_cache() {
+        let (state, _dir) = {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+            db.insert_system(&sample_system("id-1", "http://x".to_string()))
+                .unwrap();
+            (AppState::new(db), dir)
+        };
+
+        let snap = MetricSnapshot {
+            system_id: "id-1".to_string(),
+            timestamp: 100,
+            cpu_percent: 10.0,
+            memory_percent: 20.0,
+            swap_percent: 5.0,
+            load_one: 0.1,
+            load_five: 0.2,
+            load_fifteen: 0.3,
+            uptime_seconds: 60,
+            uptime_display: "1m".to_string(),
+            memory_used_display: "1 GB".to_string(),
+            memory_total_display: "4 GB".to_string(),
+            memory_used_bytes: 1_000_000,
+            memory_total_bytes: 4_000_000,
+            cpu_logical_cores: 4,
+            disks: vec![DiskSnapshot {
+                mount_point: "/".to_string(),
+                usage_percent: 33.0,
+                total_display: "10G".to_string(),
+                used_display: "3G".to_string(),
+            }],
+            top_processes: vec![],
+        };
+
+        store_metrics(&state, &snap);
+
+        assert_eq!(
+            state.db.get_metrics("id-1", "cpu", 10, None).unwrap()[0].value,
+            10.0
+        );
+        assert_eq!(
+            state.db.get_metrics("id-1", "memory", 10, None).unwrap()[0].value,
+            20.0
+        );
+        assert_eq!(
+            state.db.get_metrics("id-1", "swap", 10, None).unwrap()[0].value,
+            5.0
+        );
+        assert_eq!(
+            state.db.get_metrics("id-1", "disk:/", 10, None).unwrap()[0].value,
+            33.0
+        );
+
+        let live = state.live_metrics.read().unwrap();
+        let m = live.get("id-1").unwrap();
+        assert_eq!(m.cpu_percent, 10.0);
+        assert_eq!(m.disks, vec![("/".to_string(), 33.0)]);
+        assert_eq!(m.updated_at, 100);
+    }
+
+    #[test]
+    fn agent_response_deserializes_with_all_fields_missing() {
+        let resp: AgentResponse = serde_json::from_str("{}").unwrap();
+        assert!(resp.hostname.is_none());
+        assert!(resp.os.is_none());
+        assert!(resp.cpu.is_none());
+        assert!(resp.disks.is_none());
+        assert!(resp.top_processes.is_none());
+    }
+
+    #[test]
+    fn agent_response_deserializes_partial_nested_fields() {
+        let resp: AgentResponse =
+            serde_json::from_str(r#"{"cpu":{"usage_percent":42.0}}"#).unwrap();
+        assert_eq!(resp.cpu.unwrap().usage_percent, Some(42.0));
+    }
+
+    #[test]
+    fn unix_to_iso8601_epoch_zero() {
+        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn unix_to_iso8601_leap_day_boundary() {
+        assert_eq!(unix_to_iso8601(1_709_251_200), "2024-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn is_leap_rules() {
+        assert!(is_leap(2000));
+        assert!(!is_leap(1900));
+        assert!(is_leap(2024));
+        assert!(!is_leap(2023));
+    }
 }

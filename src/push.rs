@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -98,14 +97,14 @@ pub async fn run_push_client(
         .map_err(|e| e.to_string())?;
 
     // Wait for auth response
-    if let Some(Ok(Message::Text(resp))) = ws.next().await {
-        if let Ok(msg) = serde_json::from_str::<HubMessage>(&resp) {
-            if msg.msg_type == "auth_ok" {
-                tracing::info!("✅ Push authenticated — system_id={system_id}");
-            } else {
-                tracing::error!("❌ Push auth failed: {}", msg.message);
-                return Err(format!("auth failed: {}", msg.message));
-            }
+    if let Some(Ok(Message::Text(resp))) = ws.next().await
+        && let Ok(msg) = serde_json::from_str::<HubMessage>(&resp)
+    {
+        if msg.msg_type == "auth_ok" {
+            tracing::info!("✅ Push authenticated — system_id={system_id}");
+        } else {
+            tracing::error!("❌ Push auth failed: {}", msg.message);
+            return Err(format!("auth failed: {}", msg.message));
         }
     }
 
@@ -157,13 +156,13 @@ pub async fn run_push_client(
                 };
 
                 let buf = rmp_serde::to_vec(&payload).unwrap_or_default();
-                if ws.send(Message::Binary(buf.into())).await.is_err() {
+                if ws.send(Message::Binary(buf)).await.is_err() {
                     tracing::error!("Push connection lost, will retry...");
                     break;
                 }
             }
             _ = ping_tick.tick() => {
-                if ws.send(Message::Ping(vec![].into())).await.is_err() {
+                if ws.send(Message::Ping(vec![])).await.is_err() {
                     break;
                 }
             }
@@ -200,4 +199,80 @@ fn get_persistent_id() -> String {
     }
     // 4. Last resort: random UUID
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_payload_serializes_expected_fields() {
+        let payload = PushPayload {
+            system_id: "sys-1".into(),
+            hostname: "host1".into(),
+            os_name: "Ubuntu".into(),
+            kernel: "6.6.0".into(),
+            cpu_percent: 12.5,
+            cpu_cores: 8,
+            cpu_model: "Generic CPU".into(),
+            memory_percent: 33.3,
+            memory_used_display: "1.0 GB".into(),
+            memory_total_display: "4.0 GB".into(),
+            memory_used_bytes: 1_000_000,
+            memory_total_bytes: 4_000_000,
+            swap_percent: 0.0,
+            load_one: 0.5,
+            load_five: 0.4,
+            load_fifteen: 0.3,
+            uptime_seconds: 3600,
+            uptime_display: "1h 0m".into(),
+            disks: vec![DiskPayload {
+                mount_point: "/".into(),
+                usage_percent: 50.0,
+                total_display: "100 GB".into(),
+                used_display: "50 GB".into(),
+            }],
+            top_processes: vec![ProcessPayload {
+                pid: 1,
+                name: "init".into(),
+                cpu_usage: 0.1,
+                memory_usage_display: "1 MB".into(),
+                memory_percent: 0.01,
+            }],
+            timestamp: 1_700_000_000,
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["system_id"], "sys-1");
+        assert_eq!(json["cpu_cores"], 8);
+        assert_eq!(json["disks"][0]["mount_point"], "/");
+        assert_eq!(json["top_processes"][0]["pid"], 1);
+
+        // Must also round-trip through MessagePack, since that's the wire format used to push to the hub.
+        let packed = rmp_serde::to_vec(&payload).unwrap();
+        assert!(!packed.is_empty());
+    }
+
+    #[test]
+    fn hub_message_deserializes_auth_ok() {
+        let msg: HubMessage = serde_json::from_str(r#"{"type":"auth_ok"}"#).unwrap();
+        assert_eq!(msg.msg_type, "auth_ok");
+        assert_eq!(msg.message, "");
+    }
+
+    #[test]
+    fn hub_message_deserializes_auth_error_with_message() {
+        let msg: HubMessage =
+            serde_json::from_str(r#"{"type":"auth_error","message":"invalid token"}"#).unwrap();
+        assert_eq!(msg.msg_type, "auth_error");
+        assert_eq!(msg.message, "invalid token");
+    }
+
+    #[test]
+    fn get_persistent_id_returns_non_empty_id() {
+        // On any real host this resolves via /etc/machine-id, dbus machine-id, hostname,
+        // or a random UUID fallback -- it should never be empty.
+        let id = get_persistent_id();
+        assert!(!id.is_empty());
+    }
 }

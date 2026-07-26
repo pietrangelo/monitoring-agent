@@ -169,3 +169,86 @@ pub struct SystemHistory {
     pub cpu: Vec<MetricPoint>,
     pub memory: Vec<MetricPoint>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_status_display_matches_serde_rename() {
+        assert_eq!(SystemStatus::Online.to_string(), "online");
+        assert_eq!(SystemStatus::Offline.to_string(), "offline");
+        assert_eq!(SystemStatus::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn system_status_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&SystemStatus::Online).unwrap(),
+            "\"online\""
+        );
+    }
+
+    #[test]
+    fn system_info_serialization_skips_token() {
+        let sys = SystemInfo {
+            id: "id-1".into(),
+            name: "web".into(),
+            url: "http://x".into(),
+            token: "super-secret".into(),
+            status: SystemStatus::Online,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled: true,
+        };
+        let json = serde_json::to_value(&sys).unwrap();
+        assert!(
+            json.get("token").is_none(),
+            "token must never be serialized back to clients"
+        );
+        assert_eq!(json["id"], "id-1");
+    }
+
+    #[test]
+    fn register_system_payload_defaults_poll_interval_and_token() {
+        let payload: RegisterSystemPayload =
+            serde_json::from_str(r#"{"name":"web","url":"http://x"}"#).unwrap();
+        assert_eq!(payload.poll_interval_secs, 10);
+        assert_eq!(payload.token, "");
+    }
+
+    #[test]
+    fn register_system_payload_explicit_values() {
+        let payload: RegisterSystemPayload = serde_json::from_str(
+            r#"{"name":"web","url":"http://x","token":"t","poll_interval_secs":30}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.poll_interval_secs, 30);
+        assert_eq!(payload.token, "t");
+    }
+
+    #[test]
+    fn update_system_payload_all_fields_default_to_none() {
+        let payload: UpdateSystemPayload = serde_json::from_str("{}").unwrap();
+        assert!(payload.name.is_none());
+        assert!(payload.url.is_none());
+        assert!(payload.token.is_none());
+        assert!(payload.poll_interval_secs.is_none());
+        assert!(payload.enabled.is_none());
+    }
+
+    #[test]
+    fn update_system_payload_partial_fields() {
+        let payload: UpdateSystemPayload = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert_eq!(payload.enabled, Some(false));
+        assert!(payload.name.is_none());
+    }
+}

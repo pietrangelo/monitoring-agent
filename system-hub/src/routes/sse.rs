@@ -71,3 +71,55 @@ async fn summary_stream(
             .text("keep-alive"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+        (AppState::new(db), dir)
+    }
+
+    #[tokio::test]
+    async fn summary_stream_responds_with_event_stream_content_type() {
+        let (state, _dir) = temp_state();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let content_type = res
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(content_type, "text/event-stream");
+    }
+
+    #[tokio::test]
+    async fn unknown_stream_path_is_not_found() {
+        let (state, _dir) = temp_state();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+}

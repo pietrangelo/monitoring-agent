@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use crate::models::PackageInfo;
 use std::process::Command;
 
@@ -23,34 +22,32 @@ pub fn collect() -> Vec<PackageInfo> {
     if let Ok(out) = Command::new("dpkg-query")
         .args(["-W", "-f=${Package}\t${Version}\n"])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            return parse_dpkg(&String::from_utf8_lossy(&out.stdout));
-        }
+        return parse_dpkg(&String::from_utf8_lossy(&out.stdout));
     }
 
     // Try rpm (RHEL/Fedora)
     if let Ok(out) = Command::new("rpm")
         .args(["-qa", "--queryformat", "%{NAME}\t%{VERSION}-%{RELEASE}\n"])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            return parse_rpm(&String::from_utf8_lossy(&out.stdout));
-        }
+        return parse_rpm(&String::from_utf8_lossy(&out.stdout));
     }
 
     // Try pacman (Arch)
-    if let Ok(out) = Command::new("pacman").args(["-Q"]).output() {
-        if out.status.success() {
-            return parse_pacman(&String::from_utf8_lossy(&out.stdout));
-        }
+    if let Ok(out) = Command::new("pacman").args(["-Q"]).output()
+        && out.status.success()
+    {
+        return parse_pacman(&String::from_utf8_lossy(&out.stdout));
     }
 
     // Try apk (Alpine)
-    if let Ok(out) = Command::new("apk").args(["info", "-v"]).output() {
-        if out.status.success() {
-            return parse_apk(&String::from_utf8_lossy(&out.stdout));
-        }
+    if let Ok(out) = Command::new("apk").args(["info", "-v"]).output()
+        && out.status.success()
+    {
+        return parse_apk(&String::from_utf8_lossy(&out.stdout));
     }
 
     vec![]
@@ -115,4 +112,77 @@ fn parse_apk(output: &str) -> Vec<PackageInfo> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dpkg_multiple_lines() {
+        let out = "bash\t5.2.15-2\ncurl\t8.4.0-1\n";
+        let pkgs = parse_dpkg(out);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].name, "bash");
+        assert_eq!(pkgs[0].version, "5.2.15-2");
+        assert_eq!(pkgs[0].manager, "dpkg");
+    }
+
+    #[test]
+    fn parse_dpkg_missing_version_defaults_empty() {
+        let pkgs = parse_dpkg("onlyname\n");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].version, "");
+    }
+
+    #[test]
+    fn parse_dpkg_empty_input() {
+        assert!(parse_dpkg("").is_empty());
+    }
+
+    #[test]
+    fn parse_rpm_basic() {
+        let out = "glibc\t2.38-6\n";
+        let pkgs = parse_rpm(out);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "glibc");
+        assert_eq!(pkgs[0].version, "2.38-6");
+        assert_eq!(pkgs[0].manager, "rpm");
+    }
+
+    #[test]
+    fn parse_pacman_space_separated() {
+        let out = "linux 6.6.1.arch1-1\nbash 5.2.021-1\n";
+        let pkgs = parse_pacman(out);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].name, "linux");
+        assert_eq!(pkgs[0].version, "6.6.1.arch1-1");
+        assert_eq!(pkgs[0].manager, "pacman");
+    }
+
+    #[test]
+    fn parse_apk_dash_separated() {
+        let out = "musl-1.2.4-r2\nbusybox-1.36.1-r15\n";
+        let pkgs = parse_apk(out);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].name, "musl");
+        assert_eq!(pkgs[0].version, "1.2.4-r2");
+        assert_eq!(pkgs[0].manager, "apk");
+    }
+
+    #[test]
+    fn parse_apk_skips_lines_with_empty_name() {
+        let out = "-1.0\nvalid-2.0\n";
+        let pkgs = parse_apk(out);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "valid");
+    }
+
+    #[test]
+    fn parse_apk_no_dash_keeps_name_empty_version() {
+        let pkgs = parse_apk("noversionatall\n");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "noversionatall");
+        assert_eq!(pkgs[0].version, "");
+    }
 }

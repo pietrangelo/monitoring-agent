@@ -159,7 +159,7 @@ impl Database {
                 enabled: row.get(15)?,
             })
         })?;
-        Ok(rows.next().transpose()?)
+        rows.next().transpose()
     }
 
     pub fn insert_system(&self, sys: &SystemInfo) -> Result<(), rusqlite::Error> {
@@ -208,6 +208,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_system_info(
         &self,
         id: &str,
@@ -461,5 +462,455 @@ fn parse_status(s: &str) -> SystemStatus {
         "online" => SystemStatus::Online,
         "offline" => SystemStatus::Offline,
         _ => SystemStatus::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        (db, dir)
+    }
+
+    fn sample_system(id: &str, name: &str) -> SystemInfo {
+        SystemInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            url: "http://example.com".to_string(),
+            token: "secret".to_string(),
+            status: SystemStatus::Unknown,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn parse_status_covers_all_variants_and_default() {
+        assert_eq!(parse_status("online"), SystemStatus::Online);
+        assert_eq!(parse_status("offline"), SystemStatus::Offline);
+        assert_eq!(parse_status("unknown"), SystemStatus::Unknown);
+        assert_eq!(parse_status("garbage"), SystemStatus::Unknown);
+    }
+
+    #[test]
+    fn migrate_runs_on_new_and_is_idempotent() {
+        let (db, dir) = temp_db();
+        let path = dir.path().join("test.db");
+        drop(db);
+        // Re-opening the same file must not fail even though tables already exist.
+        let db2 = Database::new(path.to_str().unwrap()).unwrap();
+        assert!(db2.list_systems().unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_and_get_system_round_trip() {
+        let (db, _dir) = temp_db();
+        let sys = sample_system("id-1", "web-01");
+        db.insert_system(&sys).unwrap();
+
+        let fetched = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(fetched.id, "id-1");
+        assert_eq!(fetched.name, "web-01");
+        assert_eq!(fetched.url, "http://example.com");
+        assert_eq!(fetched.token, "secret");
+        assert_eq!(fetched.poll_interval_secs, 10);
+        assert!(fetched.enabled);
+    }
+
+    #[test]
+    fn get_system_returns_none_for_missing_id() {
+        let (db, _dir) = temp_db();
+        assert!(db.get_system("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_system_replaces_existing_row_with_same_id() {
+        let (db, _dir) = temp_db();
+        let mut sys = sample_system("id-1", "original");
+        db.insert_system(&sys).unwrap();
+        sys.name = "renamed".to_string();
+        db.insert_system(&sys).unwrap();
+
+        let all = db.list_systems().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "renamed");
+    }
+
+    #[test]
+    fn list_systems_orders_by_name() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-b", "bravo")).unwrap();
+        db.insert_system(&sample_system("id-a", "alpha")).unwrap();
+        let all = db.list_systems().unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "bravo"]
+        );
+    }
+
+    #[test]
+    fn update_system_status_updates_fields() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.update_system_status("id-1", &SystemStatus::Online, "2026-01-01T00:00:00Z", None)
+            .unwrap();
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Online);
+        assert_eq!(sys.last_seen, "2026-01-01T00:00:00Z");
+        assert_eq!(sys.last_error, None);
+
+        db.update_system_status("id-1", &SystemStatus::Offline, "", Some("timeout"))
+            .unwrap();
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Offline);
+        assert_eq!(sys.last_error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn update_system_info_updates_hardware_fields() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.update_system_info(
+            "id-1",
+            Some("Ubuntu 22.04"),
+            Some("web01"),
+            Some("6.6.0"),
+            Some("Generic CPU"),
+            Some(8),
+            Some("16.0 GB"),
+            Some(16_000_000_000),
+        )
+        .unwrap();
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.os.as_deref(), Some("Ubuntu 22.04"));
+        assert_eq!(sys.hostname.as_deref(), Some("web01"));
+        assert_eq!(sys.cpu_cores, Some(8));
+        assert_eq!(sys.total_memory_bytes, Some(16_000_000_000));
+    }
+
+    #[test]
+    fn update_system_config_partial_update_only_touches_given_fields() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "original"))
+            .unwrap();
+        db.update_system_config("id-1", Some("renamed"), None, None, None, None)
+            .unwrap();
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.name, "renamed");
+        assert_eq!(sys.url, "http://example.com"); // unchanged
+        assert!(sys.enabled); // unchanged
+    }
+
+    #[test]
+    fn update_system_config_all_fields() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "original"))
+            .unwrap();
+        db.update_system_config(
+            "id-1",
+            Some("renamed"),
+            Some("http://new.example.com"),
+            Some("newtoken"),
+            Some(30),
+            Some(false),
+        )
+        .unwrap();
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.name, "renamed");
+        assert_eq!(sys.url, "http://new.example.com");
+        assert_eq!(sys.token, "newtoken");
+        assert_eq!(sys.poll_interval_secs, 30);
+        assert!(!sys.enabled);
+    }
+
+    #[test]
+    fn update_system_config_no_fields_is_a_no_op() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "original"))
+            .unwrap();
+        // All None: the function should return Ok(()) without touching the row.
+        db.update_system_config("id-1", None, None, None, None, None)
+            .unwrap();
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.name, "original");
+    }
+
+    #[test]
+    fn delete_system_cascades_metrics_alerts_and_system_row() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.insert_metric("id-1", "cpu", 50.0, 100).unwrap();
+        db.insert_alert(&AlertRecord {
+            id: "alert-1".to_string(),
+            system_id: "id-1".to_string(),
+            system_name: "web-01".to_string(),
+            severity: "warning".to_string(),
+            message: "high cpu".to_string(),
+            current_value: 95.0,
+            fired_at: "2026-01-01T00:00:00Z".to_string(),
+            stored_at: "2026-01-01T00:00:00Z".to_string(),
+            acknowledged: false,
+        })
+        .unwrap();
+
+        db.delete_system("id-1").unwrap();
+
+        assert!(db.get_system("id-1").unwrap().is_none());
+        assert!(db.get_metrics("id-1", "cpu", 100, None).unwrap().is_empty());
+        assert!(db.get_alerts(Some("id-1"), None, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_metric_and_get_metrics_round_trip() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.insert_metric("id-1", "cpu", 10.0, 100).unwrap();
+        db.insert_metric("id-1", "cpu", 20.0, 200).unwrap();
+        db.insert_metric("id-1", "cpu", 30.0, 300).unwrap();
+
+        let points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
+        assert_eq!(points.len(), 3);
+        // Without `since`, results come back oldest-first.
+        assert_eq!(points[0].timestamp, 100);
+        assert_eq!(points[2].timestamp, 300);
+    }
+
+    #[test]
+    fn get_metrics_respects_limit() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        for i in 0..10 {
+            db.insert_metric("id-1", "cpu", i as f32, 100 + i).unwrap();
+        }
+        let points = db.get_metrics("id-1", "cpu", 3, None).unwrap();
+        assert_eq!(points.len(), 3);
+    }
+
+    #[test]
+    fn get_metrics_with_since_filters_and_stays_ascending() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.insert_metric("id-1", "cpu", 1.0, 100).unwrap();
+        db.insert_metric("id-1", "cpu", 2.0, 200).unwrap();
+        db.insert_metric("id-1", "cpu", 3.0, 300).unwrap();
+
+        let points = db.get_metrics("id-1", "cpu", 100, Some(150)).unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].timestamp, 200);
+        assert_eq!(points[1].timestamp, 300);
+    }
+
+    #[test]
+    fn get_metrics_different_metric_names_are_isolated() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.insert_metric("id-1", "cpu", 1.0, 100).unwrap();
+        db.insert_metric("id-1", "memory", 2.0, 100).unwrap();
+
+        let cpu_points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
+        assert_eq!(cpu_points.len(), 1);
+        assert_eq!(cpu_points[0].value, 1.0);
+    }
+
+    #[test]
+    fn insert_metric_applies_default_retention_cutoff() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        // Default retention is 86400s. First point at ts=0.
+        db.insert_metric("id-1", "cpu", 1.0, 0).unwrap();
+        // Second point far enough ahead that the cutoff (ts - 86400) prunes the first.
+        db.insert_metric("id-1", "cpu", 2.0, 100_000).unwrap();
+
+        let points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].timestamp, 100_000);
+    }
+
+    #[test]
+    fn insert_alert_and_get_alerts_round_trip() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        let alert = AlertRecord {
+            id: "alert-1".to_string(),
+            system_id: "id-1".to_string(),
+            system_name: "web-01".to_string(),
+            severity: "critical".to_string(),
+            message: "disk full".to_string(),
+            current_value: 99.0,
+            fired_at: "2026-01-01T00:00:00Z".to_string(),
+            stored_at: "2026-01-01T00:00:01Z".to_string(),
+            acknowledged: false,
+        };
+        db.insert_alert(&alert).unwrap();
+
+        let alerts = db.get_alerts(None, None, 100).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].id, "alert-1");
+    }
+
+    #[test]
+    fn insert_alert_is_idempotent_on_duplicate_id() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        let alert = AlertRecord {
+            id: "dup".to_string(),
+            system_id: "id-1".to_string(),
+            system_name: "web-01".to_string(),
+            severity: "warning".to_string(),
+            message: "m1".to_string(),
+            current_value: 1.0,
+            fired_at: "t1".to_string(),
+            stored_at: "t1".to_string(),
+            acknowledged: false,
+        };
+        db.insert_alert(&alert).unwrap();
+        let mut second = alert.clone();
+        second.message = "m2".to_string();
+        db.insert_alert(&second).unwrap(); // INSERT OR IGNORE: should not overwrite.
+
+        let alerts = db.get_alerts(None, None, 100).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].message, "m1");
+    }
+
+    #[test]
+    fn get_alerts_filters_by_system_id_and_acknowledged() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "sys-1")).unwrap();
+        db.insert_system(&sample_system("id-2", "sys-2")).unwrap();
+        db.insert_alert(&AlertRecord {
+            id: "a1".into(),
+            system_id: "id-1".into(),
+            system_name: "sys-1".into(),
+            severity: "warning".into(),
+            message: "m".into(),
+            current_value: 1.0,
+            fired_at: "t".into(),
+            stored_at: "t1".into(),
+            acknowledged: false,
+        })
+        .unwrap();
+        db.insert_alert(&AlertRecord {
+            id: "a2".into(),
+            system_id: "id-2".into(),
+            system_name: "sys-2".into(),
+            severity: "warning".into(),
+            message: "m".into(),
+            current_value: 1.0,
+            fired_at: "t".into(),
+            stored_at: "t2".into(),
+            acknowledged: true,
+        })
+        .unwrap();
+
+        let sys1_alerts = db.get_alerts(Some("id-1"), None, 100).unwrap();
+        assert_eq!(sys1_alerts.len(), 1);
+        assert_eq!(sys1_alerts[0].id, "a1");
+
+        let unacked = db.get_alerts(None, Some(false), 100).unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].id, "a1");
+
+        let acked = db.get_alerts(None, Some(true), 100).unwrap();
+        assert_eq!(acked.len(), 1);
+        assert_eq!(acked[0].id, "a2");
+    }
+
+    #[test]
+    fn get_alerts_respects_limit_and_orders_newest_first() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "sys-1")).unwrap();
+        for i in 0..5 {
+            db.insert_alert(&AlertRecord {
+                id: format!("a{i}"),
+                system_id: "id-1".into(),
+                system_name: "sys-1".into(),
+                severity: "warning".into(),
+                message: "m".into(),
+                current_value: 1.0,
+                fired_at: "t".into(),
+                stored_at: format!("t{i}"),
+                acknowledged: false,
+            })
+            .unwrap();
+        }
+        let alerts = db.get_alerts(None, None, 2).unwrap();
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].id, "a4");
+        assert_eq!(alerts[1].id, "a3");
+    }
+
+    #[test]
+    fn acknowledge_alert_flips_flag() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "sys-1")).unwrap();
+        db.insert_alert(&AlertRecord {
+            id: "a1".into(),
+            system_id: "id-1".into(),
+            system_name: "sys-1".into(),
+            severity: "warning".into(),
+            message: "m".into(),
+            current_value: 1.0,
+            fired_at: "t".into(),
+            stored_at: "t1".into(),
+            acknowledged: false,
+        })
+        .unwrap();
+
+        db.acknowledge_alert("a1").unwrap();
+        let alerts = db.get_alerts(None, None, 100).unwrap();
+        assert!(alerts[0].acknowledged);
+    }
+
+    #[test]
+    fn acknowledge_alert_on_missing_id_is_a_no_op() {
+        let (db, _dir) = temp_db();
+        // Should not error even though the alert doesn't exist.
+        db.acknowledge_alert("does-not-exist").unwrap();
+    }
+
+    #[test]
+    fn count_active_alerts_only_counts_unacknowledged() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "sys-1")).unwrap();
+        db.insert_alert(&AlertRecord {
+            id: "a1".into(),
+            system_id: "id-1".into(),
+            system_name: "sys-1".into(),
+            severity: "warning".into(),
+            message: "m".into(),
+            current_value: 1.0,
+            fired_at: "t".into(),
+            stored_at: "t1".into(),
+            acknowledged: false,
+        })
+        .unwrap();
+        db.insert_alert(&AlertRecord {
+            id: "a2".into(),
+            system_id: "id-1".into(),
+            system_name: "sys-1".into(),
+            severity: "warning".into(),
+            message: "m".into(),
+            current_value: 1.0,
+            fired_at: "t".into(),
+            stored_at: "t2".into(),
+            acknowledged: true,
+        })
+        .unwrap();
+
+        assert_eq!(db.count_active_alerts().unwrap(), 1);
     }
 }

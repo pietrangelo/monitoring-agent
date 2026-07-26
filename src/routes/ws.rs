@@ -14,15 +14,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use axum::{
+    Router,
     extract::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,12 +87,12 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                         let _ = socket.send(Message::Pong(data)).await;
                     }
                     Some(Ok(Message::Text(txt))) => {
-                        if let Ok(req) = serde_json::from_str::<serde_json::Value>(&txt) {
-                            if req.get("type").and_then(|v| v.as_str()) == Some("ping") {
-                                let _ = socket.send(Message::Text(
-                                    serde_json::json!({"type":"pong"}).to_string()
-                                )).await;
-                            }
+                        if let Ok(req) = serde_json::from_str::<serde_json::Value>(&txt)
+                            && req.get("type").and_then(|v| v.as_str()) == Some("ping")
+                        {
+                            let _ = socket
+                                .send(Message::Text(serde_json::json!({"type":"pong"}).to_string()))
+                                .await;
                         }
                     }
                     _ => {}
@@ -103,4 +102,99 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     tracing::info!("WebSocket client disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn ws_upgrade_request_without_headers_is_rejected() {
+        let state = AppState::new();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws/system")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Missing Upgrade/Connection/Sec-WebSocket-* headers -> extractor rejection.
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_request_with_headers_but_no_real_connection_is_not_upgradable() {
+        // `oneshot()` doesn't drive a real hyper connection, so there's no `OnUpgrade`
+        // extension available even with a fully valid handshake -- axum reports 426.
+        // The 101 path is covered by `ws_connects_and_streams_system_payloads` below,
+        // which runs a real server.
+        let state = AppState::new();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws/system")
+                    .header("Connection", "Upgrade")
+                    .header("Upgrade", "websocket")
+                    .header("Sec-WebSocket-Version", "13")
+                    .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn ws_connects_and_streams_system_payloads() {
+        use futures_util::StreamExt;
+
+        let state = AppState::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("ws://{addr}/api/ws/system");
+        let (mut ws_stream, resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        // The background tick fires immediately on the first `interval().tick()` call.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws_stream.next())
+            .await
+            .expect("timed out waiting for first message")
+            .expect("stream ended unexpectedly")
+            .unwrap();
+
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Text(txt) => {
+                let json: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                assert_eq!(json["type"], "system");
+                assert!(json.get("cpu_percent").is_some());
+            }
+            other => panic!("expected a text message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_ws_path_is_not_found() {
+        let state = AppState::new();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
 }
