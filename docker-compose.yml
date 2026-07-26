@@ -1,0 +1,51 @@
+# Local test stack: one system-hub + one system-agent pushing metrics to it.
+#
+# Usage (podman):
+#   podman compose up --build
+# or, with the python podman-compose wrapper:
+#   podman-compose up --build
+#
+# Tokens default to dev-only placeholders below; override by copying
+# .env.example to .env and setting your own values. Never reuse these
+# defaults outside a local sandbox.
+#
+# Note on metric fidelity: system-agent collects CPU/memory/disk/process data
+# from *its own* container namespace, not the podman host — fine for
+# exercising the hub<->agent protocol locally, but don't expect host-level
+# numbers. See CLAUDE.md for why /proc or docker.sock bind-mounts aren't
+# wired in by default (expands the container's access to the host).
+
+services:
+  system-hub:
+    build:
+      context: ./system-hub
+    ports:
+      - "9091:9091"
+    environment:
+      HUB_PUSH_TOKEN: ${HUB_PUSH_TOKEN:-dev-hub-token}
+    volumes:
+      - hub-data:/app
+    networks:
+      - monitoring
+
+  system-agent:
+    build:
+      context: .
+    ports:
+      - "9090:9090"
+    environment:
+      SYSTEM_AGENT_TOKEN: ${SYSTEM_AGENT_TOKEN:-dev-agent-token}
+      PUSH_TO: ws://system-hub:9091
+      PUSH_TOKEN: ${HUB_PUSH_TOKEN:-dev-hub-token}
+      PUSH_INTERVAL: ${PUSH_INTERVAL:-2}
+    depends_on:
+      - system-hub
+    networks:
+      - monitoring
+
+volumes:
+  hub-data:
+
+networks:
+  monitoring:
+    driver: bridge

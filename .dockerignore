@@ -1,0 +1,7 @@
+target
+system-hub/target
+system-hub/system-hub.db
+docs
+rfcs
+.git
+*.md

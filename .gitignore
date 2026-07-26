@@ -5,6 +5,9 @@ system-hub/target
 # SQLite database (hub)
 system-hub/system-hub.db
 
+# Local docker-compose/podman-compose secrets
+.env
+
 # IDE
 .zed/
 .vscode/

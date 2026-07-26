@@ -67,6 +67,9 @@ Agents auto-register on the hub on first connection (push mode) or when manually
 ```
 monitoring-agent/
 ├── Cargo.toml                  # System Agent
+├── Dockerfile                  # System Agent container image
+├── docker-compose.yml          # Local test stack (agent + hub)
+├── .env.example                # Template for docker-compose token overrides
 ├── static/index.html           # Single-machine dashboard
 └── src/
     ├── main.rs                 # Server entry, push client spawn
@@ -90,6 +93,7 @@ monitoring-agent/
 
 monitoring-agent/system-hub/
 ├── Cargo.toml                  # System Hub
+├── Dockerfile                  # System Hub container image
 ├── static/index.html           # Multi-system hub dashboard
 ├── system-hub.db               # SQLite (auto-created)
 └── src/
@@ -127,6 +131,28 @@ cd monitoring-agent/system-hub
 cargo build --release
 # → target/release/system-hub
 ```
+
+### Local test stack (docker-compose / podman)
+
+`docker-compose.yml` at the repo root builds both binaries and wires an agent to a hub
+over push, entirely in containers — no host Rust toolchain required. Works with either
+Docker or Podman (`podman compose` or `podman-compose`):
+
+```sh
+podman compose up --build
+# Agent dashboard: http://localhost:9090/
+# Hub dashboard:   http://localhost:9091/
+```
+
+Copy `.env.example` to `.env` to override the default dev-only tokens
+(`HUB_PUSH_TOKEN`, `SYSTEM_AGENT_TOKEN`, `PUSH_INTERVAL`). The hub's SQLite file persists
+in the `hub-data` named volume across restarts.
+
+Caveat: the containerized agent reports metrics from its own container namespace, not
+the podman/docker host — fine for exercising the hub↔agent protocol, but CPU/process/
+package data won't match the host machine unless you bind-mount `/proc`, `/sys`, or the
+container socket in yourself (not done by default, since that widens the container's
+access to the host).
 
 ---
 
