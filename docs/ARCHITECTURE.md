@@ -85,8 +85,12 @@ System Agent (:9090)                         System Hub (:9091)
 
 - **Client → Agent**: optional bearer/API-key/query-token auth (`SYSTEM_AGENT_TOKEN`). Health
   check, static files, and the dashboard HTML are always unauthenticated. Auth middleware
-  (`auth::require_auth`) compares the presented token to the configured one with `==` — not
-  constant-time (tracked as a known risk in `CLAUDE.md`).
+  (`auth::require_auth`) compares the presented token to the configured one in constant time via
+  `subtle::ConstantTimeEq` (`auth::tokens_match`), closing the timing side-channel a `==`
+  comparison would have (see `rfcs/0001-constant-time-token-comparison.md`). Token *length* is
+  still observable via timing (the comparison short-circuits on a length mismatch before the
+  constant-time byte loop) — only token *content* is protected, which matches standard practice
+  for this kind of fixed-secret comparison.
 - **Agent → Hub (push)**: agent presents `system_id` + `token` in a JSON handshake frame before
   any data frame is accepted; hub compares against `HUB_PUSH_TOKEN`.
 - **Hub → Agent (poll)**: hub sends the per-system token stored in `db.rs` (as configured via
@@ -119,11 +123,36 @@ The `system-agent` has no persistent storage — its metric history is an in-mem
 
 ## Testing architecture
 
-There is currently no automated test suite for either crate (see `CLAUDE.md` for the policy
-going forward). As tests are added, this section should note:
+Both crates have test coverage colocated with the code under test — `#[cfg(test)] mod tests`
+blocks at the bottom of each source file, per standard Rust convention (no separate `tests/`
+integration-test directories exist yet; nothing currently needs cross-file fixtures large enough
+to warrant one).
 
-- Where integration tests live per crate (`tests/` directories, once created).
-- Any shared test fixtures/helpers (e.g. a temp-SQLite helper for `system-hub`).
+- **Pure logic** (alert threshold/duration/cooldown evaluation, `ss`/`dpkg`/`rpm`/`pacman`/`apk`
+  output parsing, byte/uptime formatting, ISO-8601 formatting, dynamic-SQL clause building) is
+  tested directly as unit tests. Where parsing logic originally lived inline in a
+  command-shelling `collect()` function or a handler closure, it was extracted into a standalone
+  function first specifically to make it unit-testable without invoking real system commands.
+- **HTTP route handlers** (`routes/api.rs` in both crates) are tested by building the crate's
+  `Router` and driving requests through it with `tower::ServiceExt::oneshot` — no real socket is
+  bound.
+- **SSE and WebSocket endpoints** can't be fully exercised through `oneshot` (a WebSocket upgrade
+  needs a real hyper connection's `OnUpgrade` extension, which `oneshot` doesn't provide — such
+  requests get a `426 Upgrade Required` instead of `101`). Those get real-server integration
+  tests instead: `axum::serve` bound to an ephemeral `127.0.0.1:0` port inside the test, driven
+  from a real client (`tokio_tungstenite::connect_async` for WS, a direct request for SSE
+  headers).
+- **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector.rs`) are
+  tested against real (but temporary) SQLite files via the `tempfile` crate — never against the
+  real `system-hub.db`. `collector.rs`'s `poll_system` is tested against a small mock
+  `system-agent`-shaped `axum::serve` instance covering the success, JSON-parse-error,
+  HTTP-error, and connection-refused branches.
+- `tower` (`features = ["util"]`, for `ServiceExt::oneshot`), `tempfile`, and `futures-util` (hub
+  only, for WS test streams) are the test-only additions beyond what production code already
+  depended on.
+- No coverage-measurement tool (`cargo llvm-cov`/`tarpaulin`) is installed in this environment;
+  `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test` are what currently
+  gate a change per `CLAUDE.md`.
 
 ## Open architectural questions / known gaps
 
