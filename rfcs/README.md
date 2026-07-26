@@ -23,4 +23,4 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 
 | # | Title | Status |
 |---|---|---|
-| _(none yet)_ | | |
+| [0001](0001-constant-time-token-comparison.md) | Constant-Time API Token Comparison | Implemented |
