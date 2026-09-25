@@ -1,6 +1,6 @@
 # RFC 0005: System Ids That Are Always One Path Segment
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-25
 - Affects: `system-hub`

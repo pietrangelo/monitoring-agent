@@ -277,7 +277,8 @@ Hub → Agent:  {"type":"auth_ok"}   or   {"type":"auth_error","message":"..."}
 ```
 
 The system id is the host's `/etc/machine-id`, else the dbus machine id, else its hostname,
-else a random UUID. It must not be empty. The hub registers an unseen id as a new system,
+else a random UUID. It must be one URL path segment: not empty, at most 255 bytes, and not
+`.` or `..`. The hub registers an unseen id as a new system,
 named after the first 8 bytes of the id until the first data frame supplies a hostname.
 When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` messages are:
 
@@ -285,7 +286,7 @@ When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` m
 |---|---|
 | `expected auth message` | the first frame isn't JSON with `"type":"auth"` and a `system_id` |
 | `invalid token` | `HUB_PUSH_TOKEN` is set and `token` doesn't match it |
-| `invalid system_id` | the token is valid (or not required) but `system_id` is empty |
+| `invalid system_id` | the token is valid (or not required) but `system_id` is empty, longer than 255 bytes, or `.` / `..` |
 
 **Data frames (every 2s):**
 

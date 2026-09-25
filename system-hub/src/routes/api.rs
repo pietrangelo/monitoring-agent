@@ -503,6 +503,77 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Rows stored before RFC 0005 may hold a dot-segment id, which no dashboard URL can
+    /// reach; the operator's way out is a percent-encoded delete, whose captured segment the
+    /// router decodes before the handler sees it.
+    #[tokio::test]
+    async fn a_stored_dot_segment_system_is_deleted_through_its_percent_encoded_id() {
+        let cases = [
+            ("single dot", ".", "/api/systems/%2E"),
+            ("single dot, lowercase", ".", "/api/systems/%2e"),
+            ("double dot", "..", "/api/systems/%2E%2E"),
+            ("double dot, mixed case", "..", "/api/systems/%2e%2E"),
+            // The path is decoded exactly once, which is why a `%2e`-style id is safe.
+            ("encoded dot stays one id", "%2e", "/api/systems/%252e"),
+        ];
+        // Bystanders: the other dot ids, and ids a prefix or "delete everything" would hit.
+        let stored = [".", "..", ".hidden", "a.b", "%2e"];
+        for (name, target, uri) in cases {
+            let (state, _dir) = temp_state();
+            for id in stored {
+                state.db.insert_system(&legacy_push_system(id)).unwrap();
+            }
+
+            let res = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), StatusCode::OK, "{name}");
+            // The handler answers 200 whatever it deleted, so the rows are what show that the
+            // decoded id matched exactly the target and nothing else.
+            let remaining: Vec<String> = state
+                .db
+                .list_systems()
+                .unwrap()
+                .into_iter()
+                .map(|system| system.id)
+                .collect();
+            let mut expected: Vec<&str> = stored.into_iter().filter(|id| *id != target).collect();
+            let mut remaining: Vec<&str> = remaining.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            remaining.sort_unstable();
+            assert_eq!(remaining, expected, "{name}");
+        }
+    }
+
+    fn legacy_push_system(id: &str) -> SystemInfo {
+        SystemInfo {
+            id: id.into(),
+            name: "legacy".into(),
+            url: "push://".into(),
+            token: String::new(),
+            status: SystemStatus::Offline,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled: true,
+        }
+    }
+
     #[tokio::test]
     async fn summary_reports_counts() {
         let (state, _dir) = temp_state();

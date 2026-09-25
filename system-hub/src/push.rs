@@ -27,7 +27,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
-use crate::models::{EmptySystemId, SystemId, SystemInfo, SystemStatus};
+use crate::models::{SystemId, SystemIdError, SystemInfo, SystemStatus};
 use crate::state::{AppState, LiveMetrics};
 
 /// Deserialized from MessagePack binary payloads sent by agents.
@@ -128,6 +128,17 @@ impl HandshakeRejection {
     }
 }
 
+impl From<SystemIdError> for HandshakeRejection {
+    /// Every broken system id rule gets the same answer on the wire.
+    fn from(error: SystemIdError) -> Self {
+        match error {
+            SystemIdError::Empty | SystemIdError::TooLong | SystemIdError::DotSegment => {
+                Self::InvalidSystemId
+            }
+        }
+    }
+}
+
 /// Parses the first message of a push connection into the system id it authenticates.
 /// The token is checked before the id, so an unauthenticated client can't probe which ids
 /// the hub accepts.
@@ -143,7 +154,7 @@ fn authenticate(
     if push_token.is_some_and(|token| !token.accepts(&auth.token)) {
         return Err(HandshakeRejection::InvalidToken);
     }
-    SystemId::try_from(auth.system_id).map_err(|EmptySystemId| HandshakeRejection::InvalidSystemId)
+    SystemId::try_from(auth.system_id).map_err(HandshakeRejection::from)
 }
 
 /// What the push handler needs per connection: the shared app state and the configured
@@ -796,6 +807,44 @@ mod tests {
     }
 
     #[test]
+    fn handshake_refuses_a_system_id_that_is_not_one_url_path_segment() {
+        use HandshakeRejection::*;
+        let configured = PushToken::new("expected-token".to_string());
+        let configured = configured.as_ref();
+        let too_long = "a".repeat(256);
+        let cases = [
+            ("single dot", ".", "expected-token", Err(InvalidSystemId)),
+            ("double dot", "..", "expected-token", Err(InvalidSystemId)),
+            (
+                "over-long id",
+                too_long.as_str(),
+                "expected-token",
+                Err(InvalidSystemId),
+            ),
+            // The token is checked first, so a bad id can't be probed without it.
+            (
+                "single dot with a wrong token",
+                ".",
+                "wrong",
+                Err(InvalidToken),
+            ),
+            (
+                "over-long id with a wrong token",
+                too_long.as_str(),
+                "wrong",
+                Err(InvalidToken),
+            ),
+            ("dotted hostname", "a.b", "expected-token", Ok("a.b")),
+        ];
+        for (name, system_id, token, expected) in cases {
+            let frame = serde_json::json!({"type": "auth", "system_id": system_id, "token": token});
+            let parsed =
+                authenticate(&frame.to_string(), configured).map(|id| id.as_str().to_string());
+            assert_eq!(parsed, expected.map(str::to_string), "{name}");
+        }
+    }
+
+    #[test]
     fn handshake_rejections_keep_their_wire_messages() {
         let cases = [
             (
@@ -811,17 +860,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_handshake_with_empty_system_id_is_rejected_and_not_registered() {
-        let (state, _dir) = temp_state();
-        let addr = serve_push(state.clone(), "").await;
+    async fn push_handshake_with_an_invalid_system_id_is_rejected_and_not_registered() {
+        let too_long = "a".repeat(256);
+        let cases = [
+            ("empty id", ""),
+            ("single dot", "."),
+            ("double dot", ".."),
+            ("over-long id", too_long.as_str()),
+        ];
+        for (name, system_id) in cases {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
 
-        let (_ws, answer) = connect_and_auth(addr, "", "").await;
+            let (_ws, answer) = connect_and_auth(addr, system_id, "").await;
 
-        assert_eq!(
-            answer,
-            Some(serde_json::json!({"type": "auth_error", "message": "invalid system_id"}))
-        );
-        assert!(state.db.get_system("").unwrap().is_none());
+            assert_eq!(
+                answer,
+                Some(serde_json::json!({"type": "auth_error", "message": "invalid system_id"})),
+                "{name}"
+            );
+            assert!(state.db.get_system(system_id).unwrap().is_none(), "{name}");
+        }
     }
 
     /// Polls `check` until it holds or 5 seconds pass; the hub processes frames on its
