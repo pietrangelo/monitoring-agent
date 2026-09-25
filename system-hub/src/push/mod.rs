@@ -25,10 +25,12 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
 
 use crate::models::{SystemId, SystemIdError, SystemInfo, SystemStatus};
+
+mod config;
 use crate::state::{AppState, LiveMetrics};
+use config::PushToken;
 
 /// Deserialized from MessagePack binary payloads sent by agents.
 #[allow(dead_code)]
@@ -85,29 +87,6 @@ struct AuthMessage {
     system_id: String,
     #[serde(default)]
     token: String,
-}
-
-/// The configured `HUB_PUSH_TOKEN`. Never empty: an unset or empty value disables push
-/// authentication, which is `Option<PushToken>::None`. No `Debug`, so the secret can't
-/// reach a log line.
-#[derive(Clone)]
-struct PushToken(String);
-
-impl PushToken {
-    fn new(value: String) -> Option<Self> {
-        (!value.is_empty()).then_some(Self(value))
-    }
-
-    /// Unset, empty and non-unicode values all disable push auth, as they did before
-    /// RFC 0003.
-    fn from_env(value: Result<String, std::env::VarError>) -> Option<Self> {
-        value.ok().and_then(Self::new)
-    }
-
-    /// Constant-time, so how long a rejection takes doesn't leak the secret's content.
-    fn accepts(&self, presented: &str) -> bool {
-        presented.as_bytes().ct_eq(self.0.as_bytes()).into()
-    }
 }
 
 /// Why the hub refused a push handshake.
@@ -653,47 +632,6 @@ mod tests {
             Some(serde_json::json!({"type": "auth_error", "message": "invalid token"}))
         );
         assert!(state.db.get_system("test-sys-456").unwrap().is_none());
-    }
-
-    #[test]
-    fn push_token_from_env_is_enabled_only_by_a_non_empty_unicode_value() {
-        use std::env::VarError;
-        let cases = [
-            (
-                "set value is the push token",
-                Ok("s3cret".to_string()),
-                Some("s3cret"),
-            ),
-            (
-                "non-ascii unicode value is the push token",
-                Ok("pässwörd".to_string()),
-                Some("pässwörd"),
-            ),
-            // Taken verbatim, as before RFC 0003: surrounding whitespace is part of the
-            // secret, not trimmed.
-            (
-                "value with surrounding whitespace is the push token verbatim",
-                Ok(" s3cret ".to_string()),
-                Some(" s3cret "),
-            ),
-            ("empty value disables push auth", Ok(String::new()), None),
-            (
-                "unset variable disables push auth",
-                Err(VarError::NotPresent),
-                None,
-            ),
-            // Pins the behaviour kept from before RFC 0003 (fail open), recorded there
-            // as an open question rather than endorsed.
-            (
-                "non-unicode value disables push auth",
-                Err(VarError::NotUnicode("s3cret".into())),
-                None,
-            ),
-        ];
-        for (name, value, expected) in cases {
-            let token = PushToken::from_env(value).map(|token| token.0);
-            assert_eq!(token.as_deref(), expected, "{name}");
-        }
     }
 
     #[test]
