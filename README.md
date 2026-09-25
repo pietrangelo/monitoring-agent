@@ -102,7 +102,9 @@ monitoring-agent/system-hub/
     ├── state.rs                # Shared state + live metrics cache
     ├── db.rs                   # SQLite: migrations, CRUD, queries
     ├── collector.rs            # HTTP poller (pulls agent /api/system)
-    ├── push.rs                 # Push receiver (accepts agent WS connections)
+    ├── push/
+    │   ├── mod.rs              # Push receiver (accepts agent WS connections)
+    │   └── config.rs           # Push token, socket limits, deadlines
     └── routes/
         ├── mod.rs
         ├── api.rs              # REST endpoints

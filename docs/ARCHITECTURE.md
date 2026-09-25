@@ -62,7 +62,7 @@ System Agent (:9090)                         System Hub (:9091)
 │   → state.rs (ring     │◄──── GET ──────────│   pulls /api/system on    │
 │     buffer history)    │      /api/system    │   each system's interval  │
 │   → alerts.rs          │                    │                            │
-│                        │                    │ push.rs (WS receiver)     │
+│                        │                    │ push/ (WS receiver)       │
 │ routes/api.rs  (REST)  │                    │   accepts agent WS conns, │
 │ routes/sse.rs  (SSE)   │                    │   auth via HUB_PUSH_TOKEN,│
 │ routes/ws.rs   (WS)    │                    │   decodes MessagePack     │
@@ -98,7 +98,7 @@ match those rules (listed under Open architectural questions below).
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
-| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`; `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
+| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`; `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables, `state.rs` live cache, `routes/*` | stored time series, alert history, retention |
 
 **Published contracts between contexts** (both sides must change together, and a
@@ -110,7 +110,7 @@ mixed-version fleet must keep working):
   10 s of the upgrade, and after that some message at least every 90 s. Pings count, and the
   hub answers them itself; every shipped agent pings every 30 s.
 - *Push frame*: Telemetry Publishing → Ingestion. A binary MessagePack `PushPayload`,
-  declared independently in `src/push.rs` and `system-hub/src/push.rs`. The agent encodes
+  declared independently in `src/push.rs` and `system-hub/src/push/mod.rs`. The agent encodes
   it with `rmp_serde::to_vec`, which is positional: structs become arrays with no field
   names, so field *order* is the contract. The hub silently drops frames that fail to
   decode. A frame, like any push message, is at most 512 KiB.
@@ -145,9 +145,9 @@ mixed-version fleet must keep working):
 | **alert record** | the hub's stored copy of one alert incident, keyed by `<system id>_<incident id>` and inserted with `INSERT OR IGNORE`, so it keeps the values first seen | `AlertRecord`, `alerts` table |
 | **retention** | how long the hub keeps metric points per system per metric | `metric_retention` table |
 | **poll** | the hub fetching a system's snapshot over HTTP on the system's interval | `collector.rs` |
-| **push** | an agent streaming snapshots to the hub over WebSocket + MessagePack | `push.rs` (both crates) |
+| **push** | an agent streaming snapshots to the hub over WebSocket + MessagePack | `push.rs` (agent), `push/` (hub) |
 | **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured. Unset or empty leaves push open; a value that isn't UTF-8 makes the hub refuse to start | `PushToken`, `PushAuth` (hub) |
-| **push handshake** | the JSON text exchange that authenticates a push connection | `AuthMessage` (hub), `HubMessage` (agent) |
+| **push handshake** | the JSON text exchange that authenticates a push connection. A *rejection* is an auth message the hub refuses by its content (shape, token or system id); a *refusal* is any `auth_error` answer: a rejection, or a handshake timeout | `AuthMessage`, `HandshakeRejection`, `Refusal`, `Handshake` (hub), `HubMessage` (agent) |
 | **push frame** | one binary, positional MessagePack snapshot message on the push connection | `PushPayload` (both crates) |
 
 ## Trust boundaries & auth

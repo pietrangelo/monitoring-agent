@@ -72,7 +72,7 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
     (`dpkg`, `rpm`, `systemctl`, `ss`, `docker`), and **none of them are offloaded today**.
     The hub's `rusqlite` calls hold a `std::sync::Mutex` from async code everywhere except
     the push receiver, which runs its SQLite work through `spawn_blocking`
-    (`system-hub/src/push.rs::on_blocking_pool`, awaited so work stays in order). Don't copy
+    (`system-hub/src/push/mod.rs::on_blocking_pool`, awaited so work stays in order). Don't copy
     the blocking pattern. New shell-outs use `tokio::process::Command` or `spawn_blocking`,
     and fix the existing ones when you touch them.
   - Keep `unsafe` at zero. If a change seems to need it, stop and ask.
@@ -115,7 +115,7 @@ move a module between contexts.
   and returns values. It contains no Axum types, `rusqlite`, `tokio`, `std::process`, `std::fs`,
   env reads or clock reads: pass `now` and config in as arguments. I/O lives in adapters:
   `routes/*` (HTTP/SSE/WS), `db.rs` (SQLite), `collectors/*` (sysinfo and shell-outs),
-  `push.rs` and `collector.rs` (network).
+  `push.rs` / `push/` and `collector.rs` (network).
 - **Keep adapters thin.** A handler or adapter only parses input into domain values, calls
   the domain, and maps the result or error back to the wire. A business decision inside a
   handler closure, an SQL string or a collector's shell-out wrapper is a defect.
@@ -131,7 +131,7 @@ move a module between contexts.
   `docs/ARCHITECTURE.md` § Open architectural questions). Separate them in code you touch,
   and don't add domain behaviour to a serde-derived DTO.
 - **The push frame is a published contract between two contexts,** defined independently on
-  each side (`src/push.rs` and `system-hub/src/push.rs` each declare their own
+  each side (`src/push.rs` and `system-hub/src/push/mod.rs` each declare their own
   `PushPayload`). The agent encodes it with `rmp_serde::to_vec`, which is **positional**:
   structs become MessagePack arrays with no field names, so field *order* is the contract.
   Renaming a field is harmless on the wire. Reordering, removing, or inserting a field
@@ -260,11 +260,11 @@ flag/fix them if a change touches the surrounding code:
   credentialed requests anywhere, this combination becomes actively unsafe (browsers reject
   `Any` + credentials, but don't rely on that as your only control).
 - **Token comparison must stay constant-time**, on both sides: `src/auth.rs::tokens_match`
-  for `SYSTEM_AGENT_TOKEN` (RFC 0001) and `system-hub/src/push.rs::PushToken::accepts` for
+  for `SYSTEM_AGENT_TOKEN` (RFC 0001) and `system-hub/src/push/config.rs::PushToken::accepts` for
   `HUB_PUSH_TOKEN` (RFC 0003) both use `subtle::ConstantTimeEq`. Never replace either with
   `==`/`!=`/`as_deref() ==`, which reopens a timing side-channel on the shared secret. No
   test can catch that regression, so review must. Top-10 A02 / API2.
-- **The push system id is self-asserted** (`system-hub/src/push.rs::authenticate`): the hub
+- **The push system id is self-asserted** (`system-hub/src/push/mod.rs::authenticate`): the hub
   trusts whatever `system_id` the handshake presents, and `GET /api/systems` lists every id.
   Anyone with the shared push token (or anyone, when `HUB_PUSH_TOKEN` is unset) can push as
   any registered system. This is API1 / A01. Don't build anything that relies on the push

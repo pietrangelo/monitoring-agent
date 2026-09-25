@@ -321,6 +321,14 @@ be `Accepted`. It stays `Draft` while RFC 0006 is implemented first.
   - the dependencies on RFC 0006's `PushConfig` and RFC 0008's generic `on_blocking_pool`;
   - Security implications written out category by category.
 
+- **`push/mod.rs` should split before this RFC grows it.** `rosette-auditor`'s review of
+  RFC 0006 put its non-test code at about 373 lines. The split belongs at `on_blocking_pool`,
+  which is already the async/sync seam: the connection protocol stays in `mod.rs`, and
+  everything that runs as `FnOnce(&AppState, &SystemId)` moves to `push/ingest.rs`. That
+  means the DTOs, registration, frame ingestion and offline marking, which is the
+  anti-corruption layer. It was deferred from RFC 0006 because this RFC rewrites exactly that
+  part.
+
 **PLAUSIBLE:**
 - **SSE first-event timing.** Use `WatchStream::new` semantics and publish before serving.
 - **Skipping all disks above 1024 hides `/`.** Consider dropping invalid entries, then keeping
