@@ -1,0 +1,63 @@
+# The gate CLAUDE.md sets for every change: fmt, clippy, tests and a release build in each
+# crate, and the hub dashboard's XSS smoke test.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here writes to the repository or needs a secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two independent crates, not a workspace: each runs the gate in its own directory.
+        include:
+          - crate: system-agent
+            dir: .
+          - crate: system-hub
+            dir: system-hub
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      # Actions are pinned to commit SHAs, so a moved tag can't change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The stable branch installs the latest stable Rust, which CLAUDE.md targets.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ matrix.dir }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+
+  hub-dashboard-xss:
+    name: hub dashboard XSS smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Plain Node, no npm install; the runner's preinstalled Chrome is found on PATH.
+      - run: node system-hub/dashboard-tests/xss.mjs
