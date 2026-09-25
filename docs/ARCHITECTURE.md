@@ -125,7 +125,7 @@ mixed-version fleet must keep working):
 | **agent** | the `system-agent` process running on one monitored host | `system-agent` crate |
 | **hub** | the `system-hub` process aggregating many agents | `system-hub` crate |
 | **system** | a monitored host *as the hub knows it*: registry entry, config, status | `SystemInfo`, `systems` table |
-| **system id** | the non-empty identifier an agent presents in the push handshake; the hub uses it as the system's primary key | `SystemId` (hub) |
+| **system id** | the identifier an agent presents in the push handshake; the hub uses it as the system's primary key. It is one URL path segment: non-empty, at most 255 bytes, and not `.` or `..`. The hub refuses any other id at the push handshake; rows stored before the rule may still hold one (see Open architectural questions) | `SystemId` (hub) |
 | **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
 | **system status** | the hub's view of whether a system is reachable: online / offline / unknown | `SystemStatus` |
 | **snapshot** | one point-in-time reading of a host's CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
@@ -163,8 +163,10 @@ mixed-version fleet must keep working):
   built (`PushToken::from_env`). If it is unset, empty or not valid unicode, push auth is
   disabled and startup logs a warning. `push::authenticate` parses the handshake into a
   `SystemId` or a typed `HandshakeRejection`, checking the shape first, then the token
-  (in constant time via `subtle::ConstantTimeEq`, as on the agent), then that the id is
-  non-empty. So an unauthenticated client can't probe id validation. Each rejection is logged
+  (in constant time via `subtle::ConstantTimeEq`, as on the agent), then the id: it must be
+  one URL path segment, so not empty, not longer than 255 bytes, and not `.` or `..`
+  (`SystemIdError`, all answered `invalid system_id`). So an unauthenticated client can't
+  probe id validation. Each rejection is logged
   at `warn` with its variant, never the token. Neither `PushToken` nor the `AuthMessage` DTO
   implements `Debug`. The id itself is self-asserted: any token holder can push as any
   system id (see Open architectural questions). See
@@ -187,7 +189,10 @@ mixed-version fleet must keep working):
   can register or re-point a system, and any push-token holder controls them. The dashboard
   therefore builds its DOM with `createElement` + `textContent` and never assembles HTML from
   data. Ids reach click handlers through closures and URLs through `encodeURIComponent`,
-  never through inline `onclick` markup. Values used as CSS classes are checked against a
+  never through inline `onclick` markup. `encodeURIComponent` keeps an id in one path segment
+  only because `SystemId` refuses `.`, `..` and ids over 255 bytes, which the URL parser
+  would resolve away or a request line couldn't hold; rows stored before that rule may
+  still break it. Values used as CSS classes are checked against a
   fixed allowlist: an unknown system status renders as `unknown`, and an unknown severity
   gets no severity class. Numbers are type-checked before formatting or use in styles: a
   card metric or disk percentage that isn't a number renders as `—`, and a core count that
@@ -236,6 +241,9 @@ to warrant one).
   real-server tests inject the push token through `router_with_token` instead of setting
   `HUB_PUSH_TOKEN`, so they run in parallel with no `unsafe` env mutation. After closing the
   socket they wait for the offline marking, which is ordered after every frame's ingestion.
+- Route tests drive each module's `router`, not the production app: `main.rs` assembles
+  that inline (merging the routers, `ServeDir` and CORS), so no test reaches a layer added
+  there.
 - **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector.rs`) are
   tested against real (but temporary) SQLite files via the `tempfile` crate — never against the
   real `system-hub.db`. `collector.rs`'s `poll_system` is tested against a small mock
@@ -311,15 +319,27 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   dashboard. The hub dashboard's only XSS control is its rendering rule (see Trust
   boundaries). A `script-src 'self'` policy would first need the inline `<script>` moved to
   a file and the static `onclick` attributes replaced by listeners.
-- A system id of `.` or `..` escapes its path segment in the dashboard's URLs:
-  `encodeURIComponent` leaves dots alone, and the URL parser removes dot segments.
-  `SystemId` only rejects the empty id, and push ids are self-asserted. With id `.`, the
-  history fetch `/api/systems/./history` lands on `GET /api/systems/history`, which returns
-  the record of a system whose id is `history`, and the system's own record and delete go to
-  `/api/systems/`. With id `..`, the requests go to `/api/` and `/api/history`, which no
-  route serves. So such a system can't be opened or deleted from the dashboard, and a `.`
-  system shows another system's data in place of its history. The fix is for `SystemId` to
-  reject dot segments.
+- A hub may still store systems whose ids break the `SystemId` rule (`.`, `..`, or over 255
+  bytes), registered before the rule existed. They can't push again, and the dashboard can't
+  open or delete them. They go offline only because the poller also polls `push://` rows;
+  with no graceful shutdown, the disconnect handler doesn't mark them offline on a restart.
+  To find them without printing hostile bytes, run
+  `SELECT hex(substr(id, 1, 16)), length(CAST(id AS BLOB)) FROM systems WHERE id IN ('.', '..') OR length(CAST(id AS BLOB)) > 255`.
+  Delete a dot id with `DELETE /api/systems/%2E` (or `%2E%2E`): the router decodes the segment
+  exactly once. An over-long id can't be addressed by URL, so delete it in SQLite from
+  `metrics`, `alerts`, `metric_retention` and `systems` (see RFC 0005, Rollout). Anyone who
+  parses DB rows into `SystemId` must skip such a row and log that a row was skipped, never
+  its id, rather than fail `list_systems` (whose callers fall back to an empty list).
+- When a per-system fetch fails (the system was deleted between two refreshes, or its URL
+  can't be served), the dashboard returns early and keeps showing the previously opened
+  system's details and charts.
+- Alert-record ids are unbounded: `collector.rs` appends the agent's alert id to the system
+  id unchecked, so a long enough agent alert id makes its acknowledge URL hit
+  `414 URI Too Long`.
+- The bundled SQLite enforces foreign keys (`SQLITE_DEFAULT_FOREIGN_KEYS=1` in
+  `libsqlite3-sys`), so `Database::insert_system`'s `INSERT OR REPLACE` would cascade-delete a
+  system's metrics, alerts and retention rows if it ever replaced an existing row. Today every
+  caller inserts a new id (`register_if_new` checks first, and `POST` generates a UUID).
 - The hub's `alerts` table has no retention. With one record per alert incident, a flapping
   rule adds a record for each incident a poll sees.
 - An agent alert without an `id` gets a random id on the hub (`collector.rs`), so it becomes a

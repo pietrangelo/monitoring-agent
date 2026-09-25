@@ -60,21 +60,37 @@ impl std::fmt::Display for SystemStatus {
 // ── System identity ────────────────────────────────────
 
 /// The identifier an agent presents in the push handshake, and the system's primary key.
-/// Never empty.
+/// Always exactly one URL path segment: the dashboard builds `/api/systems/<id>` URLs from
+/// it, so it is never empty, never longer than `MAX_SYSTEM_ID_BYTES`, and never `.` or `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemId(String);
 
+/// The longest system id, in bytes. Real ids are machine ids (32 bytes), hostnames (at most
+/// 64 on Linux) or UUIDs (36); encoded into a URL, 255 bytes stays far below any request-line
+/// limit.
+pub const MAX_SYSTEM_ID_BYTES: usize = 255;
+
+/// Why a value isn't a system id.
 #[derive(Debug, PartialEq, Eq)]
-pub struct EmptySystemId;
+pub enum SystemIdError {
+    /// The empty string.
+    Empty,
+    /// Longer than `MAX_SYSTEM_ID_BYTES`, so its URLs could outgrow a request line.
+    TooLong,
+    /// `.` or `..`, which the dashboard's URLs would resolve away.
+    DotSegment,
+}
 
 impl TryFrom<String> for SystemId {
-    type Error = EmptySystemId;
+    type Error = SystemIdError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.is_empty() {
-            return Err(EmptySystemId);
+        match value.as_str() {
+            "" => Err(SystemIdError::Empty),
+            "." | ".." => Err(SystemIdError::DotSegment),
+            id if id.len() > MAX_SYSTEM_ID_BYTES => Err(SystemIdError::TooLong),
+            _ => Ok(Self(value)),
         }
-        Ok(Self(value))
     }
 }
 
@@ -218,11 +234,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_id_rejects_an_empty_id() {
+    fn system_id_is_exactly_one_url_path_segment() {
+        // Literal lengths, not MAX_SYSTEM_ID_BYTES, so the test pins the limit itself.
+        let ascii_255 = "a".repeat(255);
+        let ascii_256 = "a".repeat(256);
+        // 253 + 2 = 255 bytes, accepted; 254 + 2 = 256 bytes but 255 characters, refused.
+        let multi_byte_255 = format!("{}é", "a".repeat(253));
+        let multi_byte_256 = format!("{}é", "a".repeat(254));
+        // About 22 KB, the size that makes a dashboard URL hit 414.
+        let far_over = "é".repeat(11_000);
+        let ascii_65536 = "a".repeat(65_536);
+        let padded_256 = format!("{} ", "a".repeat(255));
         let cases = [
-            ("empty id", "", Err(EmptySystemId)),
+            ("empty id", "", Err(SystemIdError::Empty)),
             ("one-byte id", "x", Ok("x")),
-            ("machine id", "0123456789abcdef", Ok("0123456789abcdef")),
+            (
+                "machine id",
+                "0123456789abcdef0123456789abcdef",
+                Ok("0123456789abcdef0123456789abcdef"),
+            ),
+            (
+                "uuid",
+                "123e4567-e89b-12d3-a456-426614174000",
+                Ok("123e4567-e89b-12d3-a456-426614174000"),
+            ),
+            ("single dot", ".", Err(SystemIdError::DotSegment)),
+            ("double dot", "..", Err(SystemIdError::DotSegment)),
+            ("three dots are one segment", "...", Ok("...")),
+            ("dotted hostname", "a.b", Ok("a.b")),
+            ("leading dot", ".hidden", Ok(".hidden")),
+            ("dot then letter", ".a", Ok(".a")),
+            ("letter then dot", "a.", Ok("a.")),
+            ("space before a dot", " .", Ok(" .")),
+            ("encoded dot stays encoded in the url", "%2e", Ok("%2e")),
+            (
+                "255 ascii bytes",
+                ascii_255.as_str(),
+                Ok(ascii_255.as_str()),
+            ),
+            (
+                "255 bytes with a multi-byte character",
+                multi_byte_255.as_str(),
+                Ok(multi_byte_255.as_str()),
+            ),
+            (
+                "256 ascii bytes",
+                ascii_256.as_str(),
+                Err(SystemIdError::TooLong),
+            ),
+            (
+                "256 bytes in 255 characters",
+                multi_byte_256.as_str(),
+                Err(SystemIdError::TooLong),
+            ),
+            (
+                "far over the limit",
+                far_over.as_str(),
+                Err(SystemIdError::TooLong),
+            ),
+            (
+                "past a 16-bit length",
+                ascii_65536.as_str(),
+                Err(SystemIdError::TooLong),
+            ),
+            (
+                "255 bytes plus a trailing space",
+                padded_256.as_str(),
+                Err(SystemIdError::TooLong),
+            ),
+            // Only the literal "." and ".." are refused; "/" stays inside one encoded segment.
+            ("dots after a slash", "a/..", Ok("a/..")),
+            ("dot then space", ". ", Ok(". ")),
         ];
         for (name, input, expected) in cases {
             let parsed = SystemId::try_from(input.to_string()).map(|id| id.as_str().to_string());
