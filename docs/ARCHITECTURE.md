@@ -192,7 +192,8 @@ mixed-version fleet must keep working):
   gets no severity class. Numbers are type-checked before formatting or use in styles: a
   card metric or disk percentage that isn't a number renders as `—`, and a core count that
   isn't one is left out. The hub serves no Content-Security-Policy yet, so this rendering
-  rule is the only XSS control.
+  rule is the only XSS control. `system-hub/dashboard-tests/xss.mjs` checks it (see Testing
+  architecture).
 
 ## Storage
 
@@ -240,6 +241,29 @@ to warrant one).
   real `system-hub.db`. `collector.rs`'s `poll_system` is tested against a small mock
   `system-agent`-shaped `axum::serve` instance covering the success, JSON-parse-error,
   HTTP-error, and connection-refused branches.
+- **The hub dashboard** (`static/index.html`) has no JS unit-test harness. Its rendering rule
+  is checked by an XSS smoke test, `system-hub/dashboard-tests/xss.mjs`: plain Node with no
+  npm dependencies, driving headless Chromium (`CHROME_BIN`, else the first found on `PATH`,
+  else in the Linux Playwright cache, `chrome-headless-shell` first). It stubs `fetch` with a
+  route table and `EventSource` with a hostile hub. Every free-text field of an unknown, an
+  offline and an online system, and of every alert record, breaks out of text, quoted
+  attributes and raw-text elements (statuses and severities are hostile only where they test
+  the allowlists' fallback); ids also break out of inline JS; system urls are hostile
+  both as markup and as `javascript:` URLs; the opened system has no hostname yet; and
+  numbers arrive as strings or out of range. On a desktop-sized, hover-capable page it opens
+  a system, takes a live refresh, acknowledges an alert record, and declines then accepts
+  each delete. It then opens an offline system and takes a changed summary, in which that
+  system has no live metrics and changes status, and a system and an alert record arrive.
+  Last, it fires pointer, mouse (with each button and with modifiers), focus, key and form
+  events at every element (shadow roots included), plus window and document events, and lets
+  two minutes of virtual time pass for timers. It checks that no
+  script ran, no element outside the dashboard's own tags was added, no handler attribute was
+  added or changed against the page's own markup, no `javascript:` URL appeared or was
+  opened, and the class allowlists held. Opening a system, acknowledging an alert record and
+  each delete must make exactly their expected requests, and every request must go to a
+  known route, whose keys carry ids percent-encoded. It exits 0 on pass, 1 on a failed check or a
+  Chromium failure, and 2 when no Chromium is found. It is run by hand; `cargo test` does not
+  run it. The agent dashboard has no equivalent.
 - `tower` (`features = ["util"]`, for `ServiceExt::oneshot`), `tempfile`, and `futures-util` (hub
   only, for WS test streams) are the test-only additions beyond what production code already
   depended on.
