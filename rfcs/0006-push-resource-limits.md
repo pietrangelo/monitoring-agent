@@ -452,3 +452,49 @@ reads the same rows.
   disks. The hub logs a `warn` once per connection that names the system.
 - **Status after upgrade:** push systems start offline, and turn online with their first
   frame, within one push interval.
+
+## Review status
+
+Three `rfc-adversary` passes so far. The third pass left these findings open. They must be
+addressed before this RFC can be `Accepted`:
+
+- **CONFIRMED: the write-buffer settings would panic.** tungstenite asserts
+  `max_write_buffer_size > write_buffer_size`, and the default `write_buffer_size` is 128 KiB.
+  With `max_write_buffer_size = 64 KiB`, every upgrade would panic before `handle_push` runs.
+  Fix: set both values, in a value object whose constructor enforces the order, and add a
+  real-server test that uses the production defaults.
+- **CONFIRMED: a full write buffer never ends a connection.** tungstenite parks an overflowing
+  pong and replaces it with the next one, so `recv` never errors. The hub also sends one pong
+  per ping today, not two. Fix: state the guarantee as "buffered pongs are capped per
+  connection", drop the self-healing paragraph, and replace the "closed once the buffer fills"
+  test.
+- **CONFIRMED: the limits disagree about disk-heavy hosts.** 1024 disks with 256-byte mount
+  points make a frame of about 290 KB, over the 256 KiB message limit. A host with more than
+  about 2,100 overlay mounts loses its connection, not just its disks. Fix: raise the message
+  limit to 512 KiB, and put the byte threshold in Rollout.
+- **CONFIRMED: the cost figures miss per-frame work.** Each frame also runs an autocommit
+  status update and `refresh_cache`, a full `systems` scan whose result only the poller reads.
+  Fix: fold the status update into `store_snapshot`, drop the per-frame refresh, and restate
+  the figures end to end, with the storage they were measured on.
+- **CONFIRMED: SSE multiplies live state.** It clones the map and serialises it once per
+  subscriber, making about four copies (about 1.3–1.6 GiB per subscriber per tick at the worst
+  case), and subscribers are unbounded. Fix: serialise once per tick into a shared `Arc<str>`,
+  or state the real worst case.
+- **CONFIRMED: the README's deployments break the limit's precondition.** Its patterns expose
+  REST and push together. Fix: document an nginx block that exposes only `/api/push` to agent
+  networks, or call the limit advisory where REST is reachable.
+- **CONFIRMED: the disk rule is in the push adapter only.** The poll path still stores every
+  disk. Fix: make it a Fleet History domain function that both paths call.
+- **PLAUSIBLE: a local FUSE mount can hide every disk.** A mount point with a tab, or longer
+  than 256 bytes, drops the whole list. Fix: drop only the invalid entries.
+- **PLAUSIBLE: some exits leave a push system online.** Exits after registration (`auth_ok`
+  failing to send, a `JoinError`) skip the offline marking. Fix: every exit after registration
+  marks the system offline and evicts its live entry, and `JoinError` becomes
+  `RegistryUnavailable`.
+- **PLAUSIBLE: a racing delete can leave a ghost entry.** It stays until the next frame. Fix:
+  write the live entry inside `store_snapshot`'s critical section.
+
+The design now spans three contexts: Ingestion (the connection limits), Fleet History (per-frame
+cost and live state) and Fleet Registry (the registry limit and push system lifecycle). A
+proposed split into three RFCs that can be accepted and implemented separately is waiting on
+the owner's decision.
