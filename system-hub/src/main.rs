@@ -28,26 +28,44 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
+/// Why the hub couldn't start, or stopped serving. Logged once by `main`, never with a
+/// configuration value.
+enum StartupError {
+    Config(push::PushAuthError),
+    Database(rusqlite::Error),
+    Bind(SocketAddr, std::io::Error),
+    Serve(std::io::Error),
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(err) => write!(f, "{err}; refusing to start"),
+            Self::Database(err) => write!(f, "Failed to open database system-hub.db: {err}"),
+            Self::Bind(addr, err) => write!(f, "Failed to bind {addr}: {err}"),
+            Self::Serve(err) => write!(f, "Server failed: {err}"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run() -> Result<(), StartupError> {
     // Configuration first, so a refused start leaves nothing behind.
-    let push_auth = match push::PushAuth::from_env(std::env::var("HUB_PUSH_TOKEN")) {
-        Ok(auth) => auth,
-        Err(err) => {
-            tracing::error!("{err}; refusing to start");
-            return ExitCode::FAILURE;
-        }
-    };
+    let push_auth =
+        push::PushAuth::from_env(std::env::var("HUB_PUSH_TOKEN")).map_err(StartupError::Config)?;
 
-    let db = match db::Database::new("system-hub.db") {
-        Ok(db) => Arc::new(db),
-        Err(err) => {
-            tracing::error!("Failed to open database system-hub.db: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let db = Arc::new(db::Database::new("system-hub.db").map_err(StartupError::Database)?);
     tracing::info!("📁 Database initialized: system-hub.db");
 
     let app_state = state::AppState::new(db);
@@ -68,22 +86,14 @@ async fn main() -> ExitCode {
         .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9091));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            tracing::error!("Failed to bind {addr}: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|err| StartupError::Bind(addr, err))?;
     tracing::info!("🚀 System Hub listening on http://{}", addr);
     tracing::info!("📊 Hub Dashboard: http://localhost:9091/");
     tracing::info!("📡 Push endpoint: ws://localhost:9091/api/push");
 
-    match axum::serve(listener, app).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            tracing::error!("Server failed: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    axum::serve(listener, app)
+        .await
+        .map_err(StartupError::Serve)
 }

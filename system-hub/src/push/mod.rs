@@ -25,13 +25,13 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::models::{SystemId, SystemIdError, SystemInfo, SystemStatus};
 
 mod config;
 use crate::state::{AppState, LiveMetrics};
-use config::PushToken;
-pub use config::{PushAuth, PushConfig};
+pub use config::{PushAuth, PushAuthError, PushConfig};
 
 /// Deserialized from MessagePack binary payloads sent by agents.
 #[allow(dead_code)]
@@ -115,19 +115,16 @@ impl HandshakeRejection {
 /// Parses the first message of a push connection into the system id it authenticates.
 /// The token is checked before the id, so an unauthenticated client can't probe which ids
 /// the hub accepts.
-fn authenticate(
-    frame: &str,
-    push_token: Option<&PushToken>,
-) -> Result<SystemId, HandshakeRejection> {
-    let auth: AuthMessage =
+fn authenticate(frame: &str, push_auth: &PushAuth) -> Result<SystemId, HandshakeRejection> {
+    let message: AuthMessage =
         serde_json::from_str(frame).map_err(|_| HandshakeRejection::NotAnAuthMessage)?;
-    if auth.msg_type != "auth" {
+    if message.msg_type != "auth" {
         return Err(HandshakeRejection::NotAnAuthMessage);
     }
-    if push_token.is_some_and(|token| !token.accepts(&auth.token)) {
+    if !push_auth.admits(&message.token) {
         return Err(HandshakeRejection::InvalidToken);
     }
-    SystemId::try_from(auth.system_id).map_err(HandshakeRejection::InvalidSystemId)
+    SystemId::try_from(message.system_id).map_err(HandshakeRejection::InvalidSystemId)
 }
 
 /// What the push handler needs per connection: the shared app state and the push
@@ -140,8 +137,11 @@ struct PushContext {
 
 /// The push router with the production deadlines and limits.
 pub fn router(state: Arc<AppState>, auth: PushAuth) -> Router {
-    if matches!(auth, PushAuth::Open) {
-        tracing::warn!("HUB_PUSH_TOKEN is not set: any client may push to /api/push");
+    match &auth {
+        PushAuth::Open => {
+            tracing::warn!("HUB_PUSH_TOKEN is not set: any client may push to /api/push");
+        }
+        PushAuth::Required(_) => {}
     }
     router_with_config(state, PushConfig::production(auth))
 }
@@ -184,7 +184,8 @@ enum Handshake {
     /// Answered with an `auth_error`; nothing was registered.
     Refused(Refusal),
     /// The socket ended, errored, sent an oversize message, or sent a first message that
-    /// isn't text: no answer, nothing registered.
+    /// isn't text; or registration's blocking task failed (a `JoinError`, which RFC 0008
+    /// answers as `registry unavailable`). No answer.
     Closed,
 }
 
@@ -208,32 +209,52 @@ async fn handle_push(mut socket: WebSocket, ctx: PushContext) {
     match answer {
         Answer::Delivered => receive_frames(&mut socket, &ctx, &system_id).await,
         // The client never learned it was accepted; its connection ends here.
-        Answer::Failed => {}
+        Answer::Failed => tracing::warn!(
+            "Push handshake answer to {:?} could not be sent; ending the connection",
+            system_id.as_str()
+        ),
     }
 
     let _ = on_blocking_pool(&ctx.app, &system_id, mark_offline).await;
     tracing::info!("Push client disconnected: {:?}", system_id.as_str());
 }
 
+/// What one receive under a deadline produced.
+enum Received {
+    Message(Message),
+    /// The peer closed, the socket errored, or the stream ended.
+    Ended,
+    /// tungstenite refused a message over the size limit.
+    Oversize,
+    TimedOut,
+}
+
+async fn recv_within(socket: &mut WebSocket, deadline: Duration) -> Received {
+    match tokio::time::timeout(deadline, socket.recv()).await {
+        Err(_elapsed) => Received::TimedOut,
+        Ok(Some(Ok(Message::Close(_))) | None) => Received::Ended,
+        Ok(Some(Ok(message))) => Received::Message(message),
+        Ok(Some(Err(err))) if is_oversize(&err) => Received::Oversize,
+        Ok(Some(Err(_))) => Received::Ended,
+    }
+}
+
 /// Reads the auth message within the handshake deadline, registers the system, and answers.
 async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
-    let first = tokio::time::timeout(ctx.config.handshake_timeout, socket.recv()).await;
-    let frame = match first {
-        Err(_elapsed) => return refuse(socket, Refusal::Timeout).await,
-        Ok(Some(Ok(Message::Text(frame)))) => frame,
-        Ok(Some(Err(err))) => {
+    let frame = match recv_within(socket, ctx.config.handshake_timeout).await {
+        Received::Message(Message::Text(frame)) => frame,
+        Received::TimedOut => return refuse(socket, Refusal::Timeout).await,
+        Received::Oversize => {
             // Dropped at once, with no linger: there is no agent here to protect.
-            if is_oversize(&err) {
-                tracing::warn!("Push auth message over the size limit; dropping the connection");
-            }
+            tracing::warn!("Push auth message over the size limit; dropping the connection");
             return Handshake::Closed;
         }
-        Ok(
-            None
-            | Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_))),
+        Received::Ended
+        | Received::Message(
+            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_),
         ) => return Handshake::Closed,
     };
-    let system_id = match authenticate(&frame, ctx.config.auth.token()) {
+    let system_id = match authenticate(&frame, &ctx.config.auth) {
         Ok(system_id) => system_id,
         Err(rejection) => return refuse(socket, Refusal::Rejected(rejection)).await,
     };
@@ -252,7 +273,8 @@ async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
 
 async fn refuse(socket: &mut WebSocket, refusal: Refusal) -> Handshake {
     let answer = serde_json::json!({"type": "auth_error", "message": refusal.message()});
-    send_answer(socket, answer.to_string()).await;
+    // Whether the answer arrives changes nothing: the connection ends either way.
+    let _ = send_answer(socket, answer.to_string()).await;
     Handshake::Refused(refusal)
 }
 
@@ -264,49 +286,54 @@ async fn send_answer(socket: &mut WebSocket, answer: String) -> Answer {
     }
 }
 
-/// Ingests push frames in arrival order until the connection closes, goes idle past its
+/// Ingests push frames in arrival order until the connection ends, goes idle past its
 /// deadline, sends an oversize message, or ingestion fails. tungstenite answers pings on its
 /// own, so the hub never awaits a send here.
 async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &SystemId) {
     loop {
-        let msg = match tokio::time::timeout(ctx.config.idle_timeout, socket.recv()).await {
-            Err(_elapsed) => {
+        match recv_within(socket, ctx.config.idle_timeout).await {
+            Received::Message(Message::Binary(data)) => {
+                if ingest(ctx, system_id, &data).await.is_err() {
+                    return;
+                }
+            }
+            Received::Message(
+                Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_),
+            ) => {}
+            Received::Ended => return,
+            Received::TimedOut => {
                 tracing::info!(
                     "Push client idle past its deadline: {:?}",
                     system_id.as_str()
                 );
                 return;
             }
-            Ok(None) => return,
-            Ok(Some(Err(err))) => {
-                if is_oversize(&err) {
-                    tracing::warn!(
-                        "Push message over the size limit from {:?}; dropping the connection \
-                         after the linger",
-                        system_id.as_str()
-                    );
-                    // Held unread, so an agent that reconnects with no backoff waits too.
-                    tokio::time::sleep(ctx.config.oversize_linger).await;
-                }
+            Received::Oversize => {
+                tracing::warn!(
+                    "Push message over the size limit from {:?}; dropping the connection \
+                     after the linger",
+                    system_id.as_str()
+                );
+                // Held unread, so an agent that reconnects with no backoff waits too.
+                tokio::time::sleep(ctx.config.oversize_linger).await;
                 return;
             }
-            Ok(Some(Ok(msg))) => msg,
-        };
-        match msg {
-            Message::Binary(data) => {
-                // Frames that don't decode are dropped, as documented in ARCHITECTURE.md.
-                let Ok(payload) = rmp_serde::from_slice::<PushPayload>(&data) else {
-                    continue;
-                };
-                let ingest = move |app: &AppState, id: &SystemId| ingest_frame(app, id, &payload);
-                if on_blocking_pool(&ctx.app, system_id, ingest).await.is_err() {
-                    return;
-                }
-            }
-            Message::Close(_) => return,
-            Message::Text(_) | Message::Ping(_) | Message::Pong(_) => {}
         }
     }
+}
+
+/// Decodes and stores one data frame. Frames that don't decode are dropped, as documented in
+/// ARCHITECTURE.md; only a failed unit of storage work is an error.
+async fn ingest(
+    ctx: &PushContext,
+    system_id: &SystemId,
+    data: &[u8],
+) -> Result<(), tokio::task::JoinError> {
+    let Ok(payload) = rmp_serde::from_slice::<PushPayload>(data) else {
+        return Ok(());
+    };
+    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, &payload);
+    on_blocking_pool(&ctx.app, system_id, work).await
 }
 
 /// Whether a receive error is tungstenite refusing a message over the size limit.
@@ -757,8 +784,9 @@ mod tests {
     #[test]
     fn handshake_parses_into_a_system_id_or_a_typed_rejection() {
         use HandshakeRejection::*;
-        let configured = PushToken::new("expected-token".to_string());
-        let configured = configured.as_ref();
+        let configured = auth_for("expected-token");
+        let configured = &configured;
+        let open = &PushAuth::Open;
         let cases = [
             (
                 "matching token",
@@ -769,13 +797,13 @@ mod tests {
             (
                 "no token configured accepts any token",
                 r#"{"type":"auth","system_id":"sys-1","token":"whatever"}"#,
-                None,
+                open,
                 Ok("sys-1"),
             ),
             (
                 "no token configured accepts a missing token",
                 r#"{"type":"auth","system_id":"sys-1"}"#,
-                None,
+                open,
                 Ok("sys-1"),
             ),
             (
@@ -860,8 +888,8 @@ mod tests {
     #[test]
     fn handshake_refuses_a_system_id_that_is_not_one_url_path_segment() {
         use HandshakeRejection::*;
-        let configured = PushToken::new("expected-token".to_string());
-        let configured = configured.as_ref();
+        let configured = auth_for("expected-token");
+        let configured = &configured;
         let too_long = "a".repeat(256);
         let cases = [
             (
@@ -992,7 +1020,7 @@ mod tests {
 
     // ── RFC 0006: connection deadlines, bounded sends, size limits ──────────────────────
 
-    use config::PushSocketLimits;
+    use config::{PushSocketLimits, PushToken};
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 

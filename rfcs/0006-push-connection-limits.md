@@ -1,6 +1,6 @@
 # RFC 0006: Push Connection Limits and Fail-Closed Token
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-25
 - Affects: `system-hub`

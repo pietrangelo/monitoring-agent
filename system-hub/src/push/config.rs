@@ -85,6 +85,15 @@ impl PushAuth {
         }
     }
 
+    /// Whether a client presenting `presented` may push.
+    pub(super) fn admits(&self, presented: &str) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Required(token) => token.accepts(presented),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn token(&self) -> Option<&PushToken> {
         match self {
             Self::Open => None,
@@ -243,6 +252,39 @@ mod tests {
         assert!(message.contains("HUB_PUSH_TOKEN"), "{message}");
     }
 
+    /// The deadlines are a published contract (README, push protocol), and the idle deadline
+    /// must leave room for the pings every shipped agent sends every 30 s.
+    #[test]
+    fn production_push_config_uses_the_published_deadlines() {
+        const AGENT_PING_INTERVAL: Duration = Duration::from_secs(30);
+        let config = PushConfig::production(PushAuth::Open);
+        let cases = [
+            (
+                "handshake deadline",
+                config.handshake_timeout,
+                Duration::from_secs(10),
+            ),
+            (
+                "idle deadline",
+                config.idle_timeout,
+                Duration::from_secs(90),
+            ),
+            (
+                "oversize linger",
+                config.oversize_linger,
+                Duration::from_secs(30),
+            ),
+        ];
+        for (name, actual, expected) in cases {
+            assert_eq!(actual, expected, "{name}");
+        }
+        assert!(
+            config.idle_timeout >= 3 * AGENT_PING_INTERVAL,
+            "three missed pings"
+        );
+        assert_eq!(config.limits, PushSocketLimits::PRODUCTION);
+    }
+
     #[test]
     fn production_push_socket_limits_are_512_kib_messages_and_an_8_kib_buffer_capped_at_64() {
         const KIB: usize = 1024;
@@ -256,7 +298,7 @@ mod tests {
         const KIB: usize = 1024;
         let cases = [
             ("production values", (512 * KIB, 8 * KIB, 64 * KIB), Ok(())),
-            ("smallest usable set", (1, 0, 1), Ok(())),
+            ("smallest accepted set", (1, 0, 1), Ok(())),
             (
                 "write buffer one below its cap",
                 (512 * KIB, 8 * KIB - 1, 8 * KIB),
