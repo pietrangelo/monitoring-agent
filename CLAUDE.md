@@ -33,6 +33,18 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
   ```
   A change is not done until these pass in every crate it touched. If `system-hub` and the
   root crate are both affected, run the full sequence in both directories (`cd system-hub`).
+- A change that touches the hub dashboard (`system-hub/static/index.html`) or its XSS smoke
+  test (`system-hub/dashboard-tests/`) also runs, from the repo root:
+  ```sh
+  node system-hub/dashboard-tests/xss.mjs
+  ```
+  It must exit 0, and this applies to trivial changes too. `cargo test` doesn't run it, so
+  this step is the only thing that does. Exit 1 (a failed check, or Chromium failed) is a red
+  gate, just like a failing `cargo test`. Exit 2 means no Chromium was found: point
+  `CHROME_BIN` at a Chromium or headless-shell binary (Playwright keeps them under
+  `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`) and run it again. Exit 2 is never
+  a pass. If there is no Chromium to point at, stop and ask the user rather than reporting
+  the change done.
 - Prefer idiomatic, modern std/Axum 0.7/Tokio patterns over hand-rolled alternatives:
   - Use `?` and typed errors (`thiserror` for library-style errors, `anyhow` only at the
     edges/`main`) instead of `.unwrap()`/`.expect()`/`panic!` outside of tests and true
@@ -69,9 +81,15 @@ Scope, so it isn't decided anew in each session:
 - **Trivial** means no behaviour change: comments, docs, formatting, the wording of a log
   message, or a dependency bump with no API change. A trivial change skips the TDD loop and
   the adversaries, but still runs the toolchain gate.
-- **Dashboards** (`static/index.html` in both crates) have no JS test harness. A dashboard
-  change gets the XSS review from the Security section plus `rosette-auditor`, but no
-  red-test requirement. The Rust code that serves the dashboard's data follows the full loop.
+- **Dashboards** (`static/index.html` in both crates) have no JS unit-test harness, so a
+  dashboard change has no red-test requirement. It gets the XSS review from the Security
+  section plus `rosette-auditor`, and a hub dashboard change must also pass the XSS smoke
+  test, `system-hub/dashboard-tests/xss.mjs` (see the toolchain gate). A change that opens a
+  new path from hub data to the hub dashboard's DOM or requests (a newly rendered field, a
+  route the page calls, an interaction that sends a request) extends the test's hostile hub
+  and its checks in the same change, so the new path is attacked too. `red-test-adversary`
+  then attacks the extension in mutation mode. The agent dashboard has no such test yet. The
+  Rust code that serves the dashboard's data follows the full loop.
 
 ### Domain-Driven Design
 
@@ -201,7 +219,7 @@ directory, and must never edit the repository. Running them is required:
 
 | Adversary | When | Blocks the change on |
 |---|---|---|
-| `red-test-adversary` | after every new red test, before implementing (TDD phase 2), and on characterisation tests (mutation mode) | `DECORATION` |
+| `red-test-adversary` | after every new red test, before implementing (TDD phase 2), and on characterisation tests and `xss.mjs` extensions (mutation mode) | `DECORATION` |
 | `rfc-adversary` | after drafting or materially amending an RFC, before it becomes `Accepted` | any unaddressed `CONFIRMED` |
 | `rosette-auditor` | before reporting any non-trivial change done (TDD phase 5) | any `VIOLATED` |
 
@@ -263,7 +281,8 @@ flag/fix them if a change touches the surrounding code:
 - The dashboards (`static/index.html`) render server-provided strings (hostnames, process
   names, package names) into the DOM — check any change there for XSS (Top-10 A03) if it
   changes how data is inserted (prefer `textContent`/escaping over `innerHTML` with
-  interpolated values).
+  interpolated values). On the hub dashboard a review alone doesn't settle A03: every change
+  there must pass `system-hub/dashboard-tests/xss.mjs`, and the summary states its result.
 
 Checklist to actually run through (skip categories that are genuinely not touched, but say
 so):
@@ -312,11 +331,16 @@ suite must cover.
   - Prefer pure, testable functions over logic buried in handler closures — e.g. alert
     threshold evaluation, MessagePack frame construction/parsing, and SQL clause building
     should be extractable and tested without spinning up a server.
+  - Dashboard tests: `system-hub/dashboard-tests/xss.mjs` is the hub dashboard's XSS smoke
+    test, plain Node with no npm dependencies driving headless Chromium. It is mandatory for
+    hub dashboard changes (see the toolchain gate).
 - **What "covered" means here:** every public function with non-trivial logic (branches, error
   paths, parsing, threshold/comparison logic) has at least one test for the happy path and one
   for each realistic failure/edge case (empty input, malformed data, boundary values like
   exactly-90%-CPU, auth token present-but-wrong, DB row missing, etc).
-- Run `cargo test` (and `cargo test` inside `system-hub/`) before considering any change done.
+- Run `cargo test` (and `cargo test` inside `system-hub/`) before considering any change done,
+  plus `node system-hub/dashboard-tests/xss.mjs` when the change touches the hub dashboard or
+  that test.
   If `cargo llvm-cov` or `cargo tarpaulin` is installed, use it to sanity-check coverage isn't
   regressing; don't install new tooling without asking first.
 
@@ -367,11 +391,13 @@ For any non-trivial change, before reporting it as done:
 4. Implement minimally, then refactor against the Rosette and the DDD rules, following the
    Rust conventions above (TDD phases 3–4).
 5. Run `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`,
-   `cargo test`, `cargo build --release` in every crate touched, then run `rosette-auditor`
-   on the diff (TDD phase 5).
+   `cargo test`, `cargo build --release` in every crate touched, plus
+   `node system-hub/dashboard-tests/xss.mjs` if the change touches the hub dashboard or that
+   test, then run `rosette-auditor` on the diff (TDD phase 5).
 6. Run the OWASP checklist above and state findings, even if "no relevant category touched."
 7. Update `docs/ARCHITECTURE.md` if the change affects architecture (including § Domain
    model when contexts or glossary terms change); otherwise note explicitly that it doesn't.
 8. Update `README.md`'s endpoint/config tables if you added, removed, or changed an
    externally-visible endpoint or environment variable.
-9. In the summary, report each adversary's verdict next to the OWASP findings.
+9. In the summary, report each adversary's verdict next to the OWASP findings, and the
+   `xss.mjs` result for a hub dashboard change.
