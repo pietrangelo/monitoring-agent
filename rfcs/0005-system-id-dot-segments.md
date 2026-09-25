@@ -1,6 +1,6 @@
 # RFC 0005: System Ids That Are Always One Path Segment
 
-- Status: Draft
+- Status: Accepted
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-25
 - Affects: `system-hub`
@@ -79,8 +79,8 @@ so they always contain `_` or `-` and are never a dot segment. Their length is a
 parameters, the SSE summary and the poller) still carries ids as a bare `String`. So after
 this RFC the hub **accepts no new** id that breaks the rule. It doesn't guarantee that no
 stored id breaks it: rows created before the upgrade keep their ids (see Rollout). Anyone who
-later parses DB rows into `SystemId` must skip and log a row that fails, not fail the whole
-list. `Database::list_systems` collects into one `Result`, and its callers fall back to an
+later parses DB rows into `SystemId` must skip a row that fails and log that a row was
+skipped, never its id, rather than fail the whole list. `Database::list_systems` collects into one `Result`, and its callers fall back to an
 empty list, so one bad row would empty the dashboard.
 
 ## Domain impact
@@ -153,8 +153,9 @@ TDD, per `CLAUDE.md`:
 2. **Stub, then all the red tests at once.** Add the `TooLong` and `DotSegment` variants and
    map them in `authenticate`, but leave the constructor accepting everything but `""`. Then
    write every new test before the constructor changes, so each one fails on an assertion:
-   - the `SystemId` table: `.`, `..`, 255 bytes (accepted), 256 bytes, a multi-byte character
-     crossing byte 255, and `...`, `a.b`, `.hidden` (accepted);
+   - the `SystemId` table: `.` and `..` (→ `DotSegment`); 255 bytes (accepted); 256 bytes and
+     a multi-byte character straddling byte 255, such as 254 × `a` + `é`, which is 255
+     characters but 256 bytes (→ `TooLong`); and `...`, `a.b`, `.hidden` (accepted);
    - the `authenticate` table: a `.` id with a valid token gives `InvalidSystemId`, and a
      `.` id with a wrong token gives `InvalidToken`, so the check order holds; also a 256-byte
      id with a valid token;
@@ -162,20 +163,23 @@ TDD, per `CLAUDE.md`:
      256-byte id: each is answered `invalid system_id`, and no system is registered.
 
    `red-test-adversary` attacks these tests.
-3. **Characterisation test for the cleanup path.** Seed a system with id `.` through
-   `insert_system`. Then `DELETE /api/systems/%2E` through the `Router` returns success, and
-   `get_system(".")` is `None` afterwards. It passes on first run by design, so
+3. **Characterisation test for the cleanup path.** A table over `.` (`/api/systems/%2E`) and
+   `..` (`/api/systems/%2E%2E`): seed the system through `insert_system`, send the delete
+   through the `Router`, and check that `get_system` finds nothing afterwards. The handler
+   answers 200 whatever it deletes, so that last check is what proves the path's id was
+   decoded. It passes on first run by design, so
    `red-test-adversary` attacks it in mutation mode.
 4. **Minimal green, refactor,** then the gate in `system-hub`, then `rosette-auditor`.
 
 ## Impact on `docs/ARCHITECTURE.md`
 
-- § Domain model, glossary: **system id** becomes "one path segment: non-empty, at most 255
-  bytes, not `.` or `..`, for ids accepted since RFC 0005".
+- § Domain model, glossary: **system id** becomes "one URL path segment: non-empty, at most
+  255 bytes, and not `.` or `..`. The hub refuses any other id at the push handshake; rows
+  stored before the rule may still hold one (see Open architectural questions)".
 - § Trust boundaries:
   - Agent → Hub (push): the id check rejects empty, over-long and dot-segment ids.
   - Hub API → hub dashboard: `encodeURIComponent` keeps ids in one path segment only because
-    of the `SystemId` rule, and only for ids accepted since RFC 0005.
+    of the `SystemId` rule, which stored rows from before it may break.
 - § Open architectural questions:
   - Replace the dot-segment entry with one on stored ids that may break the rule. It covers
     finding and deleting them, why they don't go stale on their own (the `push://` polling
@@ -197,20 +201,25 @@ the disconnect handler doesn't run on the upgrade restart. Once that polling bug
 a row would stay `online` until deleted, so the operator should delete it:
 
 ```sh
-# Find them
-sqlite3 system-hub.db "SELECT id FROM systems WHERE id IN ('.', '..') OR length(CAST(id AS BLOB)) > 255;"
+# Find them. The ids are hostile by definition, so print a hex prefix and the byte length,
+# never the raw id, which could carry terminal escape sequences or megabytes of text.
+sqlite3 system-hub.db "SELECT hex(substr(id, 1, 16)), length(CAST(id AS BLOB)) FROM systems
+  WHERE id IN ('.', '..') OR length(CAST(id AS BLOB)) > 255;"
 # A dot-segment id: the hub decodes %2E into the path's id
 curl -X DELETE "http://<hub>/api/systems/%2E"     # the system "."
 curl -X DELETE "http://<hub>/api/systems/%2E%2E"  # the system ".."
 # An over-long id can't be addressed by URL. With the hub stopped, delete it in SQLite from
-# the same four tables `Database::delete_system` clears (SQLite doesn't enforce the foreign
-# keys' ON DELETE CASCADE unless foreign_keys is on, and the hub doesn't turn it on).
+# the same four tables `Database::delete_system` clears, children first. The hub's bundled
+# SQLite enforces foreign keys, but the sqlite3 CLI usually runs with them off, so don't rely
+# on ON DELETE CASCADE here.
 sqlite3 system-hub.db <<'SQL'
+BEGIN;
 CREATE TEMP TABLE doomed AS SELECT id FROM systems WHERE length(CAST(id AS BLOB)) > 255;
 DELETE FROM metrics          WHERE system_id IN (SELECT id FROM doomed);
 DELETE FROM alerts           WHERE system_id IN (SELECT id FROM doomed);
 DELETE FROM metric_retention WHERE system_id IN (SELECT id FROM doomed);
 DELETE FROM systems          WHERE id        IN (SELECT id FROM doomed);
+COMMIT;
 SQL
 ```
 
