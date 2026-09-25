@@ -57,6 +57,49 @@ impl std::fmt::Display for SystemStatus {
     }
 }
 
+// ── System identity ────────────────────────────────────
+
+/// The identifier an agent presents in the push handshake, and the system's primary key.
+/// Never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemId(String);
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EmptySystemId;
+
+impl TryFrom<String> for SystemId {
+    type Error = EmptySystemId;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(EmptySystemId);
+        }
+        Ok(Self(value))
+    }
+}
+
+const DEFAULT_NAME_MAX_BYTES: usize = 8;
+
+impl SystemId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The name a newly pushed system gets until its first snapshot supplies a hostname:
+    /// the longest prefix of at most 8 bytes that ends on a character boundary. Counted in
+    /// bytes, not characters, so it equals the `id[..8]` names already stored by hubs
+    /// before RFC 0003.
+    pub fn default_name(&self) -> String {
+        let end = self.0.floor_char_boundary(DEFAULT_NAME_MAX_BYTES);
+        self.0[..end].to_string()
+    }
+
+    /// Whether `name` is still this system's default name.
+    pub fn is_default_name(&self, name: &str) -> bool {
+        name == self.default_name()
+    }
+}
+
 // ── Register / update payloads ─────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +216,83 @@ pub struct SystemHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_id_rejects_an_empty_id() {
+        let cases = [
+            ("empty id", "", Err(EmptySystemId)),
+            ("one-byte id", "x", Ok("x")),
+            ("machine id", "0123456789abcdef", Ok("0123456789abcdef")),
+        ];
+        for (name, input, expected) in cases {
+            let parsed = SystemId::try_from(input.to_string()).map(|id| id.as_str().to_string());
+            assert_eq!(parsed, expected.map(str::to_string), "{name}");
+        }
+    }
+
+    #[test]
+    fn system_still_carries_its_default_name_only_when_it_equals_it() {
+        let cases = [
+            (
+                "default name of a long id",
+                "0123456789abcdef",
+                "01234567",
+                true,
+            ),
+            ("whole id of a short id", "pi", "pi", true),
+            (
+                "char-aligned default of a multi-byte id",
+                "aéééé",
+                "aééé",
+                true,
+            ),
+            (
+                "hostname set after the first snapshot",
+                "0123456789abcdef",
+                "host1",
+                false,
+            ),
+            (
+                "full long id is not its default name",
+                "0123456789abcdef",
+                "0123456789abcdef",
+                false,
+            ),
+            (
+                "shorter prefix of the default name",
+                "0123456789abcdef",
+                "0123",
+                false,
+            ),
+            (
+                "byte-sliced prefix that splits a character",
+                "aéééé",
+                "aéééé",
+                false,
+            ),
+        ];
+        for (name, id, candidate, expected) in cases {
+            let id = SystemId::try_from(id.to_string()).unwrap();
+            assert_eq!(id.is_default_name(candidate), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn default_system_name_is_the_longest_char_aligned_prefix_of_at_most_8_bytes() {
+        let cases = [
+            ("id longer than 8 bytes", "0123456789abcdef", "01234567"),
+            ("id exactly 8 bytes", "01234567", "01234567"),
+            ("id shorter than 8 bytes", "pi", "pi"),
+            ("one-byte id", "x", "x"),
+            ("2-byte char ending exactly at byte 8", "éééééé", "éééé"),
+            ("2-byte char across byte 8", "aéééé", "aééé"),
+            ("3-byte char across byte 8", "日本語テキスト", "日本"),
+        ];
+        for (name, id, expected) in cases {
+            let id = SystemId::try_from(id.to_string()).unwrap();
+            assert_eq!(id.default_name(), expected, "{name}");
+        }
+    }
 
     #[test]
     fn system_status_display_matches_serde_rename() {
