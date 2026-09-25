@@ -39,12 +39,17 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
   node system-hub/dashboard-tests/xss.mjs
   ```
   It must exit 0, and this applies to trivial changes too. `cargo test` doesn't run it, so
-  this step is the only thing that does. Exit 1 (a failed check, or Chromium failed) is a red
+  this step has to. Exit 1 (a failed check, or Chromium failed) is a red
   gate, just like a failing `cargo test`. Exit 2 means no Chromium was found on `PATH` or in
   Playwright's browser folders (`$PLAYWRIGHT_BROWSERS_PATH`, `~/.cache/ms-playwright`): point
   `CHROME_BIN` at a Chromium or headless-shell binary and run it again. Exit 2 is never
   a pass. If there is no Chromium to point at, stop and ask the user rather than reporting
   the change done.
+- CI (`.github/workflows/ci.yml`) runs this whole gate, both crates and `xss.mjs`, on every
+  pull request and every push to `main`. It backs up the local run and doesn't replace it:
+  run the gate before pushing, and treat a red CI run as a red gate. Keep the workflow in
+  step with this section when the gate changes, and keep its actions pinned to commit SHAs
+  with read-only `permissions`.
 - Prefer idiomatic, modern std/Axum 0.7/Tokio patterns over hand-rolled alternatives:
   - Use `?` and typed errors (`thiserror` for library-style errors, `anyhow` only at the
     edges/`main`) instead of `.unwrap()`/`.expect()`/`panic!` outside of tests and true

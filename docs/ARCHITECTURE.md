@@ -264,7 +264,8 @@ to warrant one).
   each delete must make exactly their expected requests, and every request must go to a
   known route, whose keys carry ids percent-encoded. It exits 0 on pass, 1 on a failed check or a
   Chromium failure, and 2 when no Chromium is found. `cargo test` does not run it; `CLAUDE.md`
-  makes a passing run part of the gate for every change to the hub dashboard or to the test.
+  makes a passing run part of the gate for every change to the hub dashboard or to the test,
+  and CI runs it on every pull request.
   The agent dashboard has no equivalent.
 - `tower` (`features = ["util"]`, for `ServiceExt::oneshot`), `tempfile`, and `futures-util` (hub
   only, for WS test streams) are the test-only additions beyond what production code already
@@ -272,6 +273,12 @@ to warrant one).
 - No coverage-measurement tool (`cargo llvm-cov`/`tarpaulin`) is installed in this environment;
   `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` and, for the hub
   dashboard, `xss.mjs` are what currently gate a change per `CLAUDE.md`.
+- CI (`.github/workflows/ci.yml`, GitHub Actions) runs that gate on every pull request and
+  every push to `main`: one job per crate (`cargo fmt --check`, clippy, `cargo test`,
+  `cargo build --release`, in the crate's own directory, since the two crates are not a
+  workspace) and one job for `xss.mjs`, which finds the runner's preinstalled Chrome on
+  `PATH`. The workflow has read-only `permissions`, needs no secrets, runs fork pull requests
+  under `pull_request` (never `pull_request_target`), and pins every action to a commit SHA.
 
 ## Open architectural questions / known gaps
 
