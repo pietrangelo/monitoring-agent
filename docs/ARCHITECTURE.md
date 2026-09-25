@@ -21,7 +21,9 @@ Runs on every monitored Linux host. Responsibilities:
   (`containers.rs`), and listening TCP ports (`ports.rs`).
 - Keeps a ring-buffer history of key metrics in memory (`state.rs`, 3600 points).
 - Evaluates alert rules against live metrics (`alerts.rs`) — threshold + duration + cooldown
-  model, default rules for CPU/memory/disk warning and critical.
+  model, default rules for CPU/memory/disk warning and critical. Each uninterrupted breach is
+  one alert incident with a stable incident id (agent run + sequence), so the hub can store
+  one record per incident.
 - Exposes a REST API, SSE streams, and a WebSocket endpoint (`routes/`) for local/direct
   consumption, plus serves a static single-file dashboard (`static/index.html`).
 - Optionally authenticates inbound API requests via a shared bearer/API-key/query-param token
@@ -43,8 +45,8 @@ Aggregates data from many `system-agent` instances. Responsibilities:
     authenticate with a shared token (`HUB_PUSH_TOKEN`), then stream MessagePack-encoded
     snapshots every `PUSH_INTERVAL` seconds. Agents auto-register on first successful push
     handshake — no prior entry in `systems` is required.
-- Persists time-series metrics (`metrics` table) and deduplicated alert history (`alerts`
-  table) to SQLite, with per-system per-metric retention (`metric_retention` table, default
+- Persists time-series metrics (`metrics` table) and alert history, one record per alert
+  incident (`alerts` table) to SQLite, with per-system per-metric retention (`metric_retention` table, default
   24h; old rows pruned automatically).
 - Maintains an in-memory live-metrics cache (`state.rs`) for low-latency dashboard updates
   between DB writes.
@@ -91,8 +93,8 @@ match those rules (listed under Open architectural questions below).
 
 | Context | Crate | Domain core | Adapters (I/O) | Owns |
 |---|---|---|---|---|
-| **Host Telemetry** | agent | `models.rs`, `state.rs` (`MetricsHistory` ring buffer) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs) | the snapshot of one host and its recent history |
-| **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `ActiveAlert`, `AlertManager::evaluate`) | `routes/api.rs` alert endpoints | deciding when a metric breaches a rule, for how long, and cooldown |
+| **Host Telemetry** | agent | `models.rs`, `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs) | the snapshot of one host and its recent history |
+| **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `AgentRun`, `IncidentId`, the per-rule `Breach` state, `AlertManager::evaluate` and `replace_rules`) | `routes/api.rs` alert endpoints, `routes/sse.rs` and `routes/ws.rs` alert streams | deciding when a metric breaches a rule, for how long, and cooldown; the identity of each alert incident |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
@@ -112,6 +114,9 @@ mixed-version fleet must keep working):
   decode.
 - *Poll responses*: the agent's `/api/system` and `/api/alerts` JSON → Ingestion
   (`collector.rs`). `/api/alerts` is read field by field from untyped `serde_json::Value`.
+  Each active alert's `id` is its incident id, the same on every tick of the incident, and
+  `fired_at` is the tick the incident became active. The hub treats the id as an opaque
+  string.
 
 ### Glossary (ubiquitous language)
 
@@ -127,9 +132,15 @@ mixed-version fleet must keep working):
 | **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
 | **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
 | **alert rule** | a metric, an operator, a threshold, a duration and a cooldown | `AlertRule` |
-| **active alert** | a rule currently breached for at least its duration | `ActiveAlert` |
+| **agent run** | one lifetime of the agent process, identified by a random UUID minted at startup | `AgentRun` |
+| **tick** | one evaluation of every enabled alert rule against one snapshot, every 2 s | `AlertManager::evaluate` |
+| **metric readings** | the values of one snapshot that alert rules read on a tick (CPU, memory, swap, disks, load, core count) | `Readings` |
+| **alert incident** | one uninterrupted breach of one alert rule. It becomes active on the first tick the breach has lasted the rule's duration, and ends on the first tick the rule no longer breaches, when the rule set is replaced, or when the agent restarts | `Incident`, held by `Breach::Active` |
+| **incident id** | identifies one alert incident: `<agent run>-<sequence>`, where the sequence counts the run's incidents from 1 and never rewinds. Every active alert of the incident carries it | `IncidentId` |
+| **active alert** | the report, on one tick, of an alert incident that is active | `ActiveAlert` |
+| **notification** | an active alert's announcement (the agent's `🚨 ALERT` log line), made when the incident is active and the rule's cooldown since its last notification has elapsed. The cooldown spans incidents | `Report::Notify`, the return value of `evaluate` |
 | **severity** | how serious an alert is (info / warning / critical). The hub stores it as a free `String`, defaulting to `"warning"` | `AlertSeverity` (agent), `AlertRecord.severity` (hub) |
-| **alert record** | the hub's stored copy of an agent's active alert, keyed by `<system id>_<agent alert id>` and inserted with `INSERT OR IGNORE` (see Open architectural questions for the id collision) | `AlertRecord`, `alerts` table |
+| **alert record** | the hub's stored copy of one alert incident, keyed by `<system id>_<incident id>` and inserted with `INSERT OR IGNORE`, so it keeps the values first seen | `AlertRecord`, `alerts` table |
 | **retention** | how long the hub keeps metric points per system per metric | `metric_retention` table |
 | **poll** | the hub fetching a system's snapshot over HTTP on the system's interval | `collector.rs` |
 | **push** | an agent streaming snapshots to the hub over WebSocket + MessagePack | `push.rs` (both crates) |
@@ -180,7 +191,7 @@ startup (`db.rs`).
 |---|---|
 | `systems` | Registered agents: id, name, URL, token, status, OS info, poll interval |
 | `metrics` | Time-series rows: system_id, metric name (`cpu`, `memory`, `swap`, `load1`, `load5`, `disk:{mount}`), value, timestamp |
-| `alerts` | Deduplicated alert history with acknowledge support |
+| `alerts` | Alert history, one record per alert incident, with acknowledge support |
 | `metric_retention` | Per-system, per-metric retention window (default 24h); enforced by periodic pruning |
 
 The `system-agent` has no persistent storage — its metric history is an in-memory ring buffer
@@ -239,14 +250,30 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   the types the rest of the code treats as the domain model, so there is no anti-corruption
   layer between the API/push/SQLite shapes and domain logic.
 - `AlertManager::evaluate` takes nine positional arguments (seven metrics, `cpu_cores`,
-  `now_secs`) under `#[allow(clippy::too_many_arguments)]`, instead of a snapshot value
-  object.
-- Alert ids collide across incidents. The agent gives an alert a fresh UUID only on the
-  tick where it fires; after that its id is `ongoing_rule_<index>`, which is the same string
-  for every incident of that rule. The hub inserts with `INSERT OR IGNORE` on
-  `<system id>_<agent alert id>`, so once `ongoing_rule_N` is stored, later incidents of that
-  rule are ignored (and inherit the old row's `acknowledged` flag). A later incident is only
-  recorded if a poll happens to land on its firing tick.
+  `now_secs`) under `#[allow(clippy::too_many_arguments)]`. It packs them into a private
+  `Readings` value object at once; retiring the exception only needs `Readings` made public
+  and the one production caller (`collectors/mod.rs::background_collector`) changed. It was
+  kept because touching that caller obliges fixing its blocking `sysinfo` collection on the
+  runtime (RFC 0004).
+- Agents older than RFC 0004 still report `ongoing_rule_<index>` ids, which collide across
+  incidents, so the hub drops their later incidents until they are upgraded. Hub databases
+  may still hold stale `<system>_ongoing_rule_N` rows.
+- The hub dashboard (`system-hub/static/index.html`, `loadAlerts`) interpolates `a.id`
+  unescaped into an inline `onclick` handler, and `a.severity` unescaped into a class
+  attribute (A03). `a.severity` and the agent half of `a.id` come from agent JSON; the system
+  half of `a.id` is the system id, self-asserted in the push handshake for push-registered
+  systems. So any agent, anyone who can register or re-point a system, and any push-token
+  holder can plant stored XSS.
+- The hub's `alerts` table has no retention. With one record per alert incident, a flapping
+  rule adds a record for each incident a poll sees.
+- An agent alert without an `id` gets a random id on the hub (`collector.rs`), so it becomes a
+  new record on every poll.
+- An alert rule with no disk reading (a named mount point missing from the snapshot, or no
+  disks reported at all) reads `0.0`. A mount that briefly disappears ends a `Gt` incident,
+  which returns as a new record; for `Lt`/`Lte` it opens a phantom incident.
+- Replacing the alert rule set ends every incident, including those of rules the new set leaves
+  unchanged: they come back one duration later under new ids. Per-rule state is keyed by
+  position because rules have no ids.
 - Most blocking work is not offloaded. The collectors' and push client's
   `std::process::Command` shell-outs (`dpkg-query`, `rpm`, `pacman`, `apk`, `systemctl`,
   `docker`, `ss`, `lsb_release`, `hostname`) run on the async runtime. The hub's synchronous

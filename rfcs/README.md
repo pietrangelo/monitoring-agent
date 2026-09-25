@@ -28,3 +28,5 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 |---|---|---|
 | [0001](0001-constant-time-token-comparison.md) | Constant-Time API Token Comparison | Implemented |
 | [0002](0002-tdd-ddd-adversarial-development.md) | TDD, DDD, Adversarial Review and the Rosette | Implemented |
+| [0003](0003-hub-push-handshake-hardening.md) | Hub Push Handshake Hardening | Implemented |
+| [0004](0004-alert-incident-identity.md) | Alert Incident Identity | Implemented |

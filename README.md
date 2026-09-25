@@ -407,7 +407,7 @@ The hub stores everything in **SQLite** (`system-hub.db`, created automatically)
 |---|---|
 | `systems` | Registered agents, URLs, tokens, status, OS info |
 | `metrics` | Time-series: cpu, memory, swap, load1, load5, disk:{mount} |
-| `alerts` | Deduplicated alert history with acknowledge support |
+| `alerts` | Alert history, one record per alert incident, with acknowledge support |
 | `metric_retention` | Per-system per-metric retention (default 24h) |
 
 Metrics are automatically pruned after their retention period. Run `sqlite3 system-hub.db` for direct queries.
