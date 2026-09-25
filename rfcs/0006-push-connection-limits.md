@@ -97,35 +97,40 @@ impl PushSocketLimits {
         Err(_) => panic!("invalid PushSocketLimits::PRODUCTION"),
     };
 
-    /// The tungstenite settings these limits stand for: all four fields.
-    pub fn config(&self) -> WebSocketConfig;
+    /// Sets all four limits on the upgrade: max message, max frame, write buffer, max write
+    /// buffer. axum offers only scalar setters, so this is the one place they are called.
+    pub fn apply(&self, upgrade: WebSocketUpgrade) -> WebSocketUpgrade;
 }
 
 // Forces evaluation at `cargo check` / clippy time, not only at codegen.
 const _: PushSocketLimits = PushSocketLimits::PRODUCTION;
 ```
 
-- `config()` is a pure mapping onto `tokio_tungstenite::tungstenite::protocol::WebSocketConfig`,
-  which the hub already depends on. The upgrade applies it through axum's four setters. A
-  table test pins all four fields, so a mapping that forgets `max_write_buffer_size` (and
-  leaves `usize::MAX`) goes red.
+- `apply` is the only code that calls axum's four setters. axum keeps the resulting config
+  private, so the buffered-pong test (below) proves the write-buffer cap end to end. That test
+  goes red if `apply` forgets `max_write_buffer_size`, which would leave it at `usize::MAX`.
+- `new` checks only what would panic or refuse everything: a zero message size, and a write
+  buffer not below its cap. Limits a test injects must still fit an auth message and a
+  handshake answer. That is the test's responsibility, and it's noted where they're built.
 - **Message and frame size:** both 512 KiB. The frame limit is checked on the frame header,
   before any payload is buffered. The message limit is checked on the reassembled message, so
   a fragmented oversize message is refused too. 512 KiB fits the largest frame RFC 0007's disk
   rule accepts (1024 disks with 256-byte mount points, about 290 KB). A push host above about
   4,000 typical Docker overlay mounts would still exceed it (see Rollout).
 - **Write buffer:** 8 KiB, capped at 64 KiB. The hub writes only handshake answers and pongs.
-- **An oversize message:**
-  - tungstenite returns an error, not a close frame;
-  - the hub logs it at `warn` (naming the system id in `Debug` form, once the handshake has
-    authenticated it);
-  - it then **lingers for `OVERSIZE_LINGER = 30 s` without reading** before dropping the
-    socket.
-
-  Shipped agents reconnect with no backoff after a dropped connection (their push loop
-  returns `Ok` on a failed send, and `main` sleeps only on `Err`). Without the linger, a host
-  whose frames are too big would reconnect as fast as the round trip allows. With it, the
-  agent's own send blocks, so it reconnects about every 30 s.
+- **An oversize message:** tungstenite returns an error, not a close frame. Then:
+  - **Before authentication:** the hub drops the socket at once and logs at `warn`. A
+    shipped agent's auth message is about 100 bytes, so only a misbehaving client gets
+    here, and it gets no answer.
+  - **After `auth_ok`:** the hub logs at `warn` with the system id in `Debug` form, then
+    **lingers for `OVERSIZE_LINGER = 30 s` without reading**, and then drops the socket.
+    Shipped agents reconnect with no backoff after a dropped connection: their push loop
+    returns `Ok` on a failed send, and `main` sleeps only on `Err`. Such an agent never reads
+    after the handshake, so it finds out about the drop only through a send that fails after
+    it. Holding the connection for the linger therefore spaces its reconnects to 30 s or more,
+    where an immediate drop would let it loop as fast as the round trip allows.
+  - **Cost:** one linger holds, per authenticated connection, a task, a socket, and up to
+    `max_message` bytes of tungstenite buffers plus the kernel receive queue, for 30 s.
 
 ### 4. Fail-closed token, and a `main` without panics
 
@@ -179,6 +184,20 @@ enum Refusal {
     Rejected(HandshakeRejection), // shape, token, system id (wire messages unchanged)
     Timeout,                      // "handshake timeout"
 }
+
+/// How a handshake ended, so `handle_push` has one exit per case.
+enum Handshake {
+    /// Registered; `answer` says whether `auth_ok` was delivered. `Failed` skips
+    /// `receive_frames` and goes straight to the one `mark_offline`.
+    Authenticated { id: SystemId, answer: Answer },
+    /// Answered with an `auth_error`; nothing was registered.
+    Refused(Refusal),
+    /// The socket ended, errored or sent an oversize message before any auth message; no
+    /// answer, nothing registered.
+    Closed,
+}
+
+enum Answer { Delivered, Failed }
 ```
 
 `router_with_config(state, PushConfig)` replaces `router_with_token`, and `router(state,
@@ -193,7 +212,8 @@ auth)` uses the production values.
   - **push token**: a set token is `PushAuth::Required`, and a non-UTF-8 value refuses
     startup;
   - **system status**: a push system is marked offline when its connection ends, and a
-    connection ends at the latest 90 s after its last message.
+    connection ends at the latest 90 s after its last message, or 30 s after an oversize
+    one.
 
   `PushSocketLimits` is adapter configuration, not domain vocabulary.
 - **Published contracts:** the push frame's shape is untouched. The handshake gains
@@ -225,7 +245,8 @@ auth)` uses the production values.
   - handshake time and idle time;
   - sends and buffered writes;
   - message and frame size;
-  - the reconnect rate of a host whose frames are too big.
+  - the reconnect rate of an authenticated host whose frames are too big, at the stated cost
+    of one linger per such connection.
 
   Still unbounded:
   - the number of connections (the rate-limiting gap);
@@ -258,11 +279,16 @@ on the diff.
     - `WriteBufferNotBelowMax`, with equal and with greater write buffers;
     - `config()` maps all four fields, for `PRODUCTION` and a custom set.
 - **Binary** (a new `system-hub/tests/` integration test running
-  `env!("CARGO_BIN_EXE_system-hub")` in a temp dir). With `HUB_PUSH_TOKEN` set to a
-  non-UTF-8 value, the hub:
-  - exits non-zero;
-  - writes to stderr the variable's name but not its value;
-  - creates no `system-hub.db`.
+  `env!("CARGO_BIN_EXE_system-hub")` in a temp dir, `#[cfg(unix)]`):
+  - The hub is spawned with `tokio::process::Command` and `kill_on_drop(true)`, under a 10 s
+    timeout, with `RUST_LOG` removed from its environment. The first assertion is that it
+    **exited**. On today's code it serves forever, so the red run fails on that assertion
+    instead of hanging.
+  - `HUB_PUSH_TOKEN` is `b"leak-marker-\xff"`, set through `OsStrExt::from_bytes`. The hub:
+    - exits non-zero;
+    - names `HUB_PUSH_TOKEN` in its output (tracing writes to **stdout**);
+    - never shows `leak-marker` in stdout or stderr;
+    - creates no `system-hub.db`.
 - **Real server** (`axum::serve` on an ephemeral port), through `router_with_config`:
   - **Production limits:** a client on `PushSocketLimits::PRODUCTION` authenticates and has a
     frame stored. If the upgrade panicked, this goes red.
@@ -272,16 +298,21 @@ on the diff.
       open for three deadlines;
     - the same client going quiet is closed and marked offline.
   - **Buffered pongs:** the client's receive buffer and the listener's send buffer are
-    shrunk (`TcpSocket::set_recv_buffer_size` and `set_send_buffer_size`), and the ping
-    flood is sized from them. The client pings without reading, then sends a frame, which
-    must still be stored. `red-test-adversary` runs this in mutation mode against today's
-    explicit-pong loop. It must go red there.
+    shrunk (`TcpSocket::set_recv_buffer_size` and `set_send_buffer_size`). The ping flood is
+    sized from them, and each ping carries a sequence number. The client pings without
+    reading, then sends a frame, which must still be stored. It then reads the pongs, which
+    must show a **gap**: at least one ping's pong is missing while a later one arrives. Only a
+    capped buffer does that, because tungstenite parks one pong and replaces it with each
+    newer one. An uncapped buffer returns every pong in order. `red-test-adversary` runs the
+    test in mutation mode against today's explicit-pong loop and against an `apply` that
+    forgets the cap. Both must go red.
   - **Size limits**, with **long** deadlines, asserting the close arrives well before them:
     - a frame header declaring limit + 1 bytes, with no payload;
     - a message fragmented into frames within the limit but over it in total;
-    - a **valid auth message padded** past the limit, after which nothing is registered.
-  - **Linger:** after an oversize frame, the socket stays open without reading for the
-    injected linger, then closes.
+    - a **valid auth message padded** past the limit: dropped at once (no linger), and
+      nothing is registered.
+  - **Linger:** after `auth_ok` and an oversize frame, the socket stays open without reading
+    for the injected linger, then closes.
   - **Answer send failure** (characterisation, in mutation mode): a client that sends auth
     and resets without reading leaves its system marked offline.
 - Existing push tests move to `router_with_config` with production-length deadlines, and
@@ -292,7 +323,8 @@ on the diff.
 - § Domain model:
   - the Ingestion context-map row;
   - the **push token** and **system status** glossary entries;
-  - the published-contracts entry for the push handshake (the two deadlines).
+  - the published-contracts entries for the push handshake (the two deadlines) and the push
+    frame (at most 512 KiB).
 - § Trust boundaries, Agent → Hub (push): the deadlines, bounded sends, the single exit,
   size limits, the linger, the fail-closed token and Debug-form ids.
 - § Testing architecture: `router_with_config` replaces `router_with_token`, and
@@ -302,13 +334,15 @@ on the diff.
   - Rewritten: the frame-size entry (message size is bounded; per-frame work is RFC 0007).
   - Added:
     - no hyper timer under `axum::serve` (requests that never finish);
-    - the agent never reads after the handshake (harmless now that pongs are capped);
-    - agents reconnect with no backoff after a dropped connection (mitigated here by the
-      linger).
+    - the agent never reads after the handshake (harmless now that pongs are capped).
+  - Edited: the existing entry "main reconnects without backoff" notes that the linger spaces
+    reconnects after an oversize drop.
 - `README.md`:
   - the `HUB_PUSH_TOKEN` row (non-UTF-8 refuses to start);
-  - in the push protocol section, `handshake timeout` in the `auth_error` table, the two
-    deadlines (pings count), and the 512 KiB limit.
+  - in the push protocol section: `handshake timeout` in the `auth_error` table; the two
+    deadlines (pings count); the 512 KiB limit; and what an oversize client sees. That is no
+    answer and no Close frame: before auth an immediate drop, after auth 30 s of silence, then
+    a reset.
 
 ## Rollout / migration notes
 
