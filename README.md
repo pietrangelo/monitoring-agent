@@ -222,7 +222,7 @@ For push-mode agents, they appear automatically — no manual registration neede
 
 | Variable | Default | Description |
 |---|---|---|
-| `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning) |
+| `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning); a value that isn't valid UTF-8 makes the hub refuse to start |
 
 ---
 
@@ -284,9 +284,17 @@ When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` m
 
 | `message` | Cause |
 |---|---|
-| `expected auth message` | the first frame isn't JSON with `"type":"auth"` and a `system_id` |
+| `expected auth message` | the first message is text but isn't JSON with `"type":"auth"` and a `system_id` (a first message that isn't text gets no answer) |
 | `invalid token` | `HUB_PUSH_TOKEN` is set and `token` doesn't match it |
 | `invalid system_id` | the token is valid (or not required) but `system_id` is empty, longer than 255 bytes, or `.` / `..` |
+| `handshake timeout` | no first message arrived within 10 s of the upgrade |
+
+**Deadlines and limits:** after `auth_ok`, the client must send some message at least every
+90 s, or the hub closes the connection and marks the system offline. Pings count, and the hub
+answers them itself; the agent pings every 30 s. Every message is at most 512 KiB. An
+oversize message gets no answer and no Close frame: before `auth_ok` the hub drops the
+connection at once, and after it the hub stops reading for 30 s, then closes the connection
+(with a TCP reset if unsent data is still queued).
 
 **Data frames (every 2s):**
 
