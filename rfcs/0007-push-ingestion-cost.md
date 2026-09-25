@@ -278,3 +278,54 @@ for tx in (False, True):
 
 The implementation re-measures end to end, with the status update, and records the figure here
 before this RFC is marked `Implemented`.
+
+## Review status
+
+The first `rfc-adversary` pass left these findings. They must be addressed before this RFC can
+be `Accepted`. It stays `Draft` while RFC 0006 is implemented first.
+
+**CONFIRMED:**
+- **The cost figures aren't an upper bound.** rusqlite re-prepares statements on every
+  `execute`, and the appendix inserts into an empty table. Without a statement cache and with
+  a table filled to the retention window, a 1024-disk snapshot costs 38–51 ms. So 1000 agents
+  at 2 s still saturate the mutex. Fix: `prepare_cached` for the per-point statements and the
+  status update, and bounds re-measured against a full table.
+- **One non-finite value would discard the whole snapshot.** SQLite stores NaN as NULL, which
+  breaks `NOT NULL`, and a timestamp above `i64::MAX` fails the same way. Fix:
+  `history_points` drops non-finite values point by point and counts them.
+- **Axum still copies SSE data once per subscriber** (`Event::data`). Fix: build the complete
+  `event: summary` frame once per tick as `Bytes` and serve refcounted clones, or restate the
+  claim.
+- **The live entry's disks and bound are unstated for the poll path.** Fix: build the live
+  entry from the kept disks on both paths, bound it by `MAX_DISKS × MAX_MOUNT_POINT_BYTES`,
+  and bound the warn-once set.
+- **The new database work runs on the async runtime.** This covers the poll store, the
+  publisher's reads, and decoding before pacing. Fix: `spawn_blocking` for both, and a pacing
+  check before `rmp_serde` decodes.
+- **RFC 0006 can't be helped by this disk rule** (oversize frames never decode). RFC 0006 now
+  says so, and this RFC's Rollout must name that frame ceiling.
+- **Several planned tests pass without the behaviour.** Fix:
+  - a barrier test showing `on_stored` runs before the guard drops;
+  - evicting in the same blocking unit as `mark_offline`;
+  - a serialisation counter;
+  - rows for NaN/±inf, an empty mount point, and 1025 reported disks with ≤1024 valid.
+- **The `refresh_cache` rule contradicts itself** (status changes every frame). Fix: make the
+  systems cache private to the poller, and remove every refresh outside `start_collectors`.
+- **Domain impact leaves out Fleet Registry,** since `store_snapshot` writes status. "History
+  points" duplicates **metric point**, and the fate of `MetricSnapshot` is unstated. Fix: name
+  Fleet Registry and rename the term. Remove `MetricSnapshot`, and decide whether an absent
+  scalar skips its point.
+- **Inventory gaps:**
+  - the README (push protocol, the DELETE and SSE rows);
+  - ARCHITECTURE § Storage, the Testing sync point, and three open questions;
+  - the dependencies on RFC 0006's `PushConfig` and RFC 0008's generic `on_blocking_pool`;
+  - Security implications written out category by category.
+
+**PLAUSIBLE:**
+- **SSE first-event timing.** Use `WatchStream::new` semantics and publish before serving.
+- **Skipping all disks above 1024 hides `/`.** Consider dropping invalid entries, then keeping
+  the first 1024 in reported order.
+- **`StatusUpdate` "with uptime" doesn't fit the poll path.** Carry each adapter's `last_seen`
+  unchanged.
+- **Eviction triggered by a self-asserted id (A01).** Evict only the entry this connection
+  wrote, using RFC 0008's connection generation.
