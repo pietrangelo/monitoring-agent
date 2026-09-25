@@ -46,10 +46,13 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
   a pass. If there is no Chromium to point at, stop and ask the user rather than reporting
   the change done.
 - CI (`.github/workflows/ci.yml`) runs this whole gate, both crates and `xss.mjs`, on every
-  pull request and every push to `main`. It backs up the local run and doesn't replace it:
-  run the gate before pushing, and treat a red CI run as a red gate. Keep the workflow in
-  step with this section when the gate changes, and keep its actions pinned to commit SHAs
-  with read-only `permissions`.
+  pull request, every push to `main`, and weekly. It backs up the local run and doesn't
+  replace it: run the gate before pushing, and treat a red CI run as a red gate. CI adds
+  `--locked` to clippy, test and build, so a manifest change must commit its updated
+  `Cargo.lock`. CI installs the latest stable toolchain, so a new release's lints can turn
+  an untouched tree red: the weekly run exists to catch that, and the fix goes in a commit of
+  its own. Keep the workflow in step with this section when the gate changes, and keep its
+  actions pinned to commit SHAs with read-only `permissions`.
 - Prefer idiomatic, modern std/Axum 0.7/Tokio patterns over hand-rolled alternatives:
   - Use `?` and typed errors (`thiserror` for library-style errors, `anyhow` only at the
     edges/`main`) instead of `.unwrap()`/`.expect()`/`panic!` outside of tests and true

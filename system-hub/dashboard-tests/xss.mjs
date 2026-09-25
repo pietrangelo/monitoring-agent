@@ -427,17 +427,29 @@ function harnessScript() {
     return `<script>\n${PAGE_SIDE.join("\n")}\nrunPage(${fixtures});\n</script>\n`;
 }
 
-// Playwright's browser folders: PLAYWRIGHT_BROWSERS_PATH, then its default cache. "0" is
-// Playwright's value for "inside node_modules", not a folder.
-function playwrightBuilds() {
+// Playwright's browser folders, in search order: PLAYWRIGHT_BROWSERS_PATH, then the default
+// cache. "0" is Playwright's value for "inside node_modules", not a folder.
+function playwrightRoots() {
     const custom = process.env.PLAYWRIGHT_BROWSERS_PATH;
-    const roots = [custom !== "0" && custom, join(homedir(), ".cache", "ms-playwright")].filter(
-        (root) => root && existsSync(root),
-    );
-    const build = (dir) => Number(dir.match(/-(\d+)$/)?.[1] ?? -1);
-    return roots
-        .flatMap((root) => readdirSync(root).map((entry) => join(root, entry)))
-        .sort((a, b) => build(b) - build(a));
+    const cache = join(homedir(), ".cache", "ms-playwright");
+    return custom && custom !== "0" ? [custom, cache] : [cache];
+}
+
+// A folder's builds, newest first. Something that isn't a readable folder has none, so a
+// mistyped PLAYWRIGHT_BROWSERS_PATH ends in "no Chromium found", not a crash.
+function buildsIn(root) {
+    const build = (name) => Number(name.match(/-(\d+)$/)?.[1] ?? -1);
+    try {
+        return readdirSync(root)
+            .sort((a, b) => build(b) - build(a))
+            .map((entry) => join(root, entry));
+    } catch {
+        return [];
+    }
+}
+
+function playwrightBuilds() {
+    return playwrightRoots().flatMap(buildsIn);
 }
 
 function findChrome() {
@@ -447,8 +459,8 @@ function findChrome() {
         .split(delimiter)
         .filter(Boolean)
         .flatMap((dir) => names.map((n) => join(dir, n)));
-    // Linux Playwright layouts only, current and older; the headless shell first, as it
-    // starts fastest.
+    // Linux Playwright layouts only, current and older. Every headless shell comes before any
+    // full Chromium, as it starts fastest; within each, folders keep their search order.
     const builds = playwrightBuilds();
     const inPlaywright = [
         ...builds.flatMap((dir) => [

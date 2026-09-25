@@ -244,8 +244,9 @@ to warrant one).
 - **The hub dashboard** (`static/index.html`) has no JS unit-test harness. Its rendering rule
   is checked by an XSS smoke test, `system-hub/dashboard-tests/xss.mjs`: plain Node with no
   npm dependencies, driving headless Chromium (`CHROME_BIN`, else the first found on `PATH`,
-  else in Playwright's Linux browser folders, `$PLAYWRIGHT_BROWSERS_PATH` then
-  `~/.cache/ms-playwright`, newest build and headless shell first). It stubs `fetch` with a
+  else in Playwright's Linux browser folders: every headless shell before any full Chromium,
+  and within each `$PLAYWRIGHT_BROWSERS_PATH` before `~/.cache/ms-playwright`, newest build
+  first; a folder that can't be read is skipped). It stubs `fetch` with a
   route table and `EventSource` with a hostile hub. Every free-text field of an unknown, an
   offline and an online system, and of every alert record, breaks out of text, quoted
   attributes and raw-text elements (statuses and severities are hostile only where they test
@@ -265,7 +266,7 @@ to warrant one).
   known route, whose keys carry ids percent-encoded. It exits 0 on pass, 1 on a failed check or a
   Chromium failure, and 2 when no Chromium is found. `cargo test` does not run it; `CLAUDE.md`
   makes a passing run part of the gate for every change to the hub dashboard or to the test,
-  and CI runs it on every pull request.
+  and CI runs it on every pull request, every push to `main` and weekly.
   The agent dashboard has no equivalent.
 - `tower` (`features = ["util"]`, for `ServiceExt::oneshot`), `tempfile`, and `futures-util` (hub
   only, for WS test streams) are the test-only additions beyond what production code already
@@ -273,12 +274,15 @@ to warrant one).
 - No coverage-measurement tool (`cargo llvm-cov`/`tarpaulin`) is installed in this environment;
   `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` and, for the hub
   dashboard, `xss.mjs` are what currently gate a change per `CLAUDE.md`.
-- CI (`.github/workflows/ci.yml`, GitHub Actions) runs that gate on every pull request and
-  every push to `main`: one job per crate (`cargo fmt --check`, clippy, `cargo test`,
-  `cargo build --release`, in the crate's own directory, since the two crates are not a
-  workspace) and one job for `xss.mjs`, which finds the runner's preinstalled Chrome on
-  `PATH`. The workflow has read-only `permissions`, needs no secrets, runs fork pull requests
-  under `pull_request` (never `pull_request_target`), and pins every action to a commit SHA.
+- CI (`.github/workflows/ci.yml`, GitHub Actions) runs that gate on every pull request,
+  every push to `main`, and weekly, so a new stable toolchain's lints surface in a run of
+  their own. It has one job per crate (`cargo fmt --check`, then clippy, `cargo test` and
+  `cargo build --release` with `--locked`, in the crate's own directory, since the two crates
+  are not a workspace) and one job for `xss.mjs`, pointed at the runner's preinstalled Chrome
+  through `CHROME_BIN`. A newer push cancels a pull request's run, but never a run on `main`.
+  The jobs have timeouts (30 and 10 minutes). The workflow has read-only `permissions`, needs
+  no secrets, runs fork pull requests under `pull_request` (never `pull_request_target`), and
+  pins every action to a commit SHA.
 
 ## Open architectural questions / known gaps
 
