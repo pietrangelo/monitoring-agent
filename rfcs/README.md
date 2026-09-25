@@ -31,6 +31,6 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0003](0003-hub-push-handshake-hardening.md) | Hub Push Handshake Hardening | Implemented |
 | [0004](0004-alert-incident-identity.md) | Alert Incident Identity | Implemented |
 | [0005](0005-system-id-dot-segments.md) | System Ids That Are Always One Path Segment | Implemented |
-| [0006](0006-push-connection-limits.md) | Push Connection Limits and Fail-Closed Token | Draft |
+| [0006](0006-push-connection-limits.md) | Push Connection Limits and Fail-Closed Token | Accepted |
 | [0007](0007-push-ingestion-cost.md) | One Snapshot Rule, One Transaction, One Serialisation | Draft |
 | [0008](0008-push-registry-limit.md) | Push Registry Limit and Push System Lifecycle | Draft |
