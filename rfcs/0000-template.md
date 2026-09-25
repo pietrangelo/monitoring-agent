@@ -15,6 +15,13 @@ The actual design: new/changed endpoints, message shapes, schema changes, module
 Be concrete — include request/response shapes, function signatures, or schema DDL where
 relevant, not just prose.
 
+## Domain impact
+
+Which bounded contexts from `../docs/ARCHITECTURE.md` § Domain model this touches, which
+glossary terms it adds or changes, and whether it changes a published contract between
+contexts (the push frame, or the poll responses the hub consumes). Say how a mixed-version
+fleet (new agent + old hub, old agent + new hub) behaves.
+
 ## Alternatives considered
 
 What else was considered and why it was rejected (including "do nothing").

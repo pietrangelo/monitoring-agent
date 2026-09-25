@@ -81,6 +81,59 @@ System Agent (:9090)                         System Hub (:9091)
 | HTTP Poll | Hub → Agent | REST + JSON | Agent reachable from hub; hub controls cadence |
 | Push | Agent → Hub | WebSocket + MessagePack | Agent behind NAT/firewall from hub's side; lower latency, smaller payload (~50-70% smaller than equivalent JSON) |
 
+## Domain model
+
+This section is the context map and glossary that `CLAUDE.md`'s Domain-Driven Design rules
+refer to. It describes where each module sits today, including where the code doesn't yet
+match those rules (listed under Open architectural questions below).
+
+### Bounded contexts
+
+| Context | Crate | Domain core | Adapters (I/O) | Owns |
+|---|---|---|---|---|
+| **Host Telemetry** | agent | `models.rs`, `state.rs` (`MetricsHistory` ring buffer) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs) | the snapshot of one host and its recent history |
+| **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `ActiveAlert`, `AlertManager::evaluate`) | `routes/api.rs` alert endpoints | deciding when a metric breaches a rule, for how long, and cooldown |
+| **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
+| **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
+| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
+| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push.rs` (WS receiver, hub-side `PushPayload`) | turning agent output into hub metrics, alerts and status |
+| **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables, `state.rs` live cache, `routes/*` | stored time series, alert history, retention |
+
+**Published contracts between contexts** (both sides must change together, and a
+mixed-version fleet must keep working):
+
+- *Push handshake*: Telemetry Publishing → Ingestion. JSON text messages: the agent sends
+  `{"type":"auth",…}` (hub-side `AuthMessage`), and the hub answers `auth_ok`/`auth_error`
+  (agent-side `HubMessage`).
+- *Push frame*: Telemetry Publishing → Ingestion. A binary MessagePack `PushPayload`,
+  declared independently in `src/push.rs` and `system-hub/src/push.rs`. The agent encodes
+  it with `rmp_serde::to_vec`, which is positional: structs become arrays with no field
+  names, so field *order* is the contract. The hub silently drops frames that fail to
+  decode.
+- *Poll responses*: the agent's `/api/system` and `/api/alerts` JSON → Ingestion
+  (`collector.rs`). `/api/alerts` is read field by field from untyped `serde_json::Value`.
+
+### Glossary (ubiquitous language)
+
+| Term | Meaning | In code |
+|---|---|---|
+| **agent** | the `system-agent` process running on one monitored host | `system-agent` crate |
+| **hub** | the `system-hub` process aggregating many agents | `system-hub` crate |
+| **system** | a monitored host *as the hub knows it*: registry entry, config, status | `SystemInfo`, `systems` table |
+| **system status** | the hub's view of whether a system is reachable: online / offline / unknown | `SystemStatus` |
+| **snapshot** | one point-in-time reading of a host's CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
+| **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
+| **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
+| **alert rule** | a metric, an operator, a threshold, a duration and a cooldown | `AlertRule` |
+| **active alert** | a rule currently breached for at least its duration | `ActiveAlert` |
+| **severity** | how serious an alert is (info / warning / critical). The hub stores it as a free `String`, defaulting to `"warning"` | `AlertSeverity` (agent), `AlertRecord.severity` (hub) |
+| **alert record** | the hub's stored copy of an agent's active alert, keyed by `<system id>_<agent alert id>` and inserted with `INSERT OR IGNORE` (see Open architectural questions for the id collision) | `AlertRecord`, `alerts` table |
+| **retention** | how long the hub keeps metric points per system per metric | `metric_retention` table |
+| **poll** | the hub fetching a system's snapshot over HTTP on the system's interval | `collector.rs` |
+| **push** | an agent streaming snapshots to the hub over WebSocket + MessagePack | `push.rs` (both crates) |
+| **push handshake** | the JSON text exchange that authenticates a push connection | `AuthMessage` (hub), `HubMessage` (agent) |
+| **push frame** | one binary, positional MessagePack snapshot message on the push connection | `PushPayload` (both crates) |
+
 ## Trust boundaries & auth
 
 - **Client → Agent**: optional bearer/API-key/query-token auth (`SYSTEM_AGENT_TOKEN`). Health
@@ -165,3 +218,29 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - No hub-side client authentication (see Trust boundaries above).
 - CORS is unconditionally permissive in both crates.
 - No URL validation on hub-side system registration (SSRF surface).
+- Domain and wire shapes are the same structs: `models.rs` in both crates derives serde on
+  the types the rest of the code treats as the domain model, so there is no anti-corruption
+  layer between the API/push/SQLite shapes and domain logic.
+- `AlertManager::evaluate` takes nine positional arguments (seven metrics, `cpu_cores`,
+  `now_secs`) under `#[allow(clippy::too_many_arguments)]`, instead of a snapshot value
+  object.
+- Alert ids collide across incidents. The agent gives an alert a fresh UUID only on the
+  tick where it fires; after that its id is `ongoing_rule_<index>`, which is the same string
+  for every incident of that rule. The hub inserts with `INSERT OR IGNORE` on
+  `<system id>_<agent alert id>`, so once `ongoing_rule_N` is stored, later incidents of that
+  rule are ignored (and inherit the old row's `acknowledged` flag). A later incident is only
+  recorded if a poll happens to land on its firing tick.
+- No blocking work is offloaded: there is no `spawn_blocking` in either crate. The
+  collectors' and push client's `std::process::Command` shell-outs (`dpkg-query`, `rpm`,
+  `pacman`, `apk`, `systemctl`, `docker`, `ss`, `lsb_release`, `hostname`) run on the async
+  runtime, and the hub's synchronous `rusqlite` calls hold a `std::sync::Mutex` from async
+  code.
+- Retention policy (look up `retention_secs`, fall back to 86400, delete older rows) is
+  decided inside `Database::insert_metric`, in the SQL adapter, rather than in the domain.
+- The push handshake compares `HUB_PUSH_TOKEN` with `!=`, which is not constant-time
+  (RFC 0001 covered only the agent). The same handler derives a new system's name with
+  `auth.system_id[..8]`, which panics on a `system_id` shorter than 8 bytes or without a
+  character boundary at byte 8.
+- Ingestion reads agent alerts from untyped `serde_json::Value` inside `collector.rs` and
+  discards `insert_alert` errors (`let _ =`). Parsing, domain mapping and storage are
+  interleaved in one poll function.

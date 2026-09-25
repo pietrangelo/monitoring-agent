@@ -49,9 +49,172 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
     extending the hand-rolled version.
   - Async: no blocking calls (`std::fs`, `std::process::Command`, blocking locks) inside async
     fns on the Tokio runtime without `spawn_blocking` — several collectors already shell out
-    (`dpkg`, `rpm`, `systemctl`, `ss`, `docker`); keep new ones consistent with how the existing
-    ones are wrapped, and flag it if an existing one isn't actually offloaded correctly.
+    (`dpkg`, `rpm`, `systemctl`, `ss`, `docker`), and **none of them are offloaded today**:
+    there is no `spawn_blocking` in either crate, and the hub's `rusqlite` calls hold a
+    `std::sync::Mutex` from async code. Don't copy that pattern. New shell-outs use
+    `tokio::process::Command` or `spawn_blocking`, and fix the existing ones when you touch
+    them.
   - Keep `unsafe` at zero. If a change seems to need it, stop and ask.
+
+## Development discipline: TDD + DDD + adversaries + the Rosette
+
+These four are mandatory for every non-trivial change to the Rust crates, not only "big"
+ones. They build on the sections below: TDD replaces "write tests alongside the code" with
+"write the test first", DDD sets where code lives, the Rosette sets how it reads, and the
+adversaries make sure the author isn't the one grading the work.
+
+Scope, so it isn't decided anew in each session:
+
+- **Trivial** means no behaviour change: comments, docs, formatting, the wording of a log
+  message, or a dependency bump with no API change. A trivial change skips the TDD loop and
+  the adversaries, but still runs the toolchain gate.
+- **Dashboards** (`static/index.html` in both crates) have no JS test harness. A dashboard
+  change gets the XSS review from the Security section plus `rosette-auditor`, but no
+  red-test requirement. The Rust code that serves the dashboard's data follows the full loop.
+
+### Domain-Driven Design
+
+The context map — which module belongs to which bounded context — and the glossary of
+domain terms (the ubiquitous language) live in `docs/ARCHITECTURE.md` § Domain model. Read it
+before adding a type, and update it in the same change when you add a context or a term, or
+move a module between contexts.
+
+- **Use the ubiquitous language.** Types, functions, test names and API fields use the
+  glossary's terms. A new concept gets a glossary entry before it gets a type. Never coin a
+  synonym for an existing term (e.g. `node`/`machine`/`target` for *system*, `sample` for
+  *metric point*).
+- **Keep the domain core pure.** Domain logic (alert evaluation and threshold/duration/cooldown
+  rules, system status derivation, retention policy, snapshot → metric mapping) takes values
+  and returns values. It contains no Axum types, `rusqlite`, `tokio`, `std::process`, `std::fs`,
+  env reads or clock reads: pass `now` and config in as arguments. I/O lives in adapters:
+  `routes/*` (HTTP/SSE/WS), `db.rs` (SQLite), `collectors/*` (sysinfo and shell-outs),
+  `push.rs` and `collector.rs` (network).
+- **Keep adapters thin.** A handler or adapter only parses input into domain values, calls
+  the domain, and maps the result or error back to the wire. A business decision inside a
+  handler closure, an SQL string or a collector's shell-out wrapper is a defect.
+- **Parse, don't validate, at the boundary.** Untrusted input (request bodies, query params,
+  headers, env vars, push frames, DB rows, agent JSON consumed by the hub) is converted into
+  domain types once, at the edge, via `TryFrom` or constructors that reject invalid values.
+  Use newtypes with private fields for constrained values (a percentage, a poll interval, a
+  system URL) so an invalid one can't be constructed. Security validation (e.g. the SSRF URL
+  check below) belongs in these constructors.
+- **Wire and storage shapes are not the domain model.** Serde DTOs, SQLite rows and
+  MessagePack push frames form an anti-corruption layer: convert explicitly to and from
+  domain types at the edge. Today `models.rs` in both crates mixes the two (see
+  `docs/ARCHITECTURE.md` § Open architectural questions). Separate them in code you touch,
+  and don't add domain behaviour to a serde-derived DTO.
+- **The push frame is a published contract between two contexts,** defined independently on
+  each side (`src/push.rs` and `system-hub/src/push.rs` each declare their own
+  `PushPayload`). The agent encodes it with `rmp_serde::to_vec`, which is **positional**:
+  structs become MessagePack arrays with no field names, so field *order* is the contract.
+  Renaming a field is harmless on the wire. Reordering, removing, or inserting a field
+  anywhere but the end shifts every later value. `#[serde(default)]` only rescues a field
+  that is missing at the very end, and an old hub may reject a frame with extra trailing
+  elements. The hub silently drops frames that fail to decode. Change both sides in the same
+  change, and add a round-trip test across the two declarations. Treat any frame change as
+  mixed-version-breaking unless tested otherwise, and give it an RFC. Switching to
+  `to_vec_named` (map encoding) is itself an RFC-level change.
+- **Retrofit what you touch,** with the same ratchet as tests: you don't have to remodel the
+  codebase in one pass, but every file you touch must end with a cleaner domain boundary than
+  it started with, never a muddier one.
+
+### The Rosette of Beautiful Code
+
+Judge every diff on these eight dimensions: yourself during TDD phase 4 (refactor), and
+the `rosette-auditor` before the change is called done.
+
+1. **Storytelling** — A handler reads top to bottom as the request's story: extract →
+   authorize → parse into domain → decide → respond. A collector reads as gather → parse →
+   snapshot. A domain module reads as the rules it enforces.
+2. **Simplicity** — Low cognitive load matters more than compact syntax. One function, one
+   responsibility, within 30–50 lines of code (comments, blank lines and `#[cfg(test)]`
+   modules don't count). Past that, extract the helper hiding inside the function rather than
+   nesting another `match` or loop. A file nearing 500 lines of non-test code is a smell to
+   investigate, not a quota to fill: never split into `db_part1.rs`/`db_part2.rs`, split only
+   along a boundary that would exist anyway, and leave a cohesive file alone. An
+   `#[allow(clippy::…)]` that silences a complexity lint (`too_many_arguments`,
+   `type_complexity`, `cognitive_complexity`) is a finding, not a fix: introduce the value
+   object it's asking for. Nothing enforces this mechanically yet; you and the auditor do.
+3. **Clarity of Intent** — Model state and absence explicitly: enums instead of boolean flags
+   or combinations of `Option`s, newtypes instead of bare `String`/`f32`/`u64`, and no
+   sentinel values (`""`, `0`, `-1`, `"unknown"`). Make invalid states unrepresentable. Errors
+   are typed enums, not strings.
+4. **Expressiveness** — Idiomatic Rust: iterators where they read better than loops, `?`,
+   `From`/`TryFrom` at boundaries, and exhaustive `match` over domain enums with no `_ =>`
+   catch-all, so a new variant forces every site to decide. Comments explain *why*, never
+   *what*.
+5. **Purity** — Side effects (I/O, clock, env, shell-outs, DB, network, randomness) stay at
+   the edges. Domain functions are deterministic given their arguments, so plain values are
+   enough to test them.
+6. **Sustainability** — Tests are table-driven: a `cases` array of `(name, input, expected)`,
+   iterated, with the case name in the assertion message. Include rows for boundaries
+   (exactly at the threshold), empty and malformed input, and each error variant. Test names
+   state behaviour in the ubiquitous language.
+7. **Durability** — A new capability (collector, alert metric, route, stored metric) attaches
+   by adding a module or an enum variant, not by restructuring core modules. Agents and hub
+   are deployed independently, so assume a mixed-version fleet on the push/poll contract.
+8. **Creativity** — An elegant synthesis within the hard constraints (zero `unsafe`, no
+   blocking on the runtime, OWASP, two independent crates), not the first thing that
+   compiled.
+
+### Test-Driven Development
+
+All production code is written test-first, in a closed loop per behaviour:
+
+1. **Contract and red test.** State the behaviour in the ubiquitous language, then write the
+   test before any production code. Test the domain function directly where you can; use the
+   `Router` (`oneshot`) or a real ephemeral server only when the behaviour lives in the
+   adapter.
+2. **Prove it red, then prove the red means something.** Run the targeted test
+   (`cargo test <name>`); it must fail **on an assertion**, not on compilation. If the
+   behaviour needs a new function or type, add its signature first with a stub body that
+   compiles and returns a wrong value (`Default::default()`, an empty `Vec`, the wrong
+   variant) — not `todo!()`, whose panic proves nothing about behaviour. Then launch the
+   `red-test-adversary` subagent on the test. `DECORATION` (a cheat implementation passed) →
+   rewrite the test and run the adversary again. `WEAK-RED` (fails on compilation or a panic
+   rather than an assertion) → add the stub and re-run.
+3. **Minimal green.** Write the least code that satisfies the test: no tidying nearby code,
+   no speculative generality.
+4. **Refactor under green.** Improve the code you just wrote against the Rosette and the DDD
+   rules. The tests stay green throughout.
+5. **Gate.** Run the toolchain sequence above in every touched crate, then run the
+   `rosette-auditor` on the diff. Fix whatever the compiler, clippy or tests report; never
+   report a change done while the gate is red.
+
+Cases where red-first works differently:
+
+- **Bug fixes** start with a test that reproduces the bug and fails *because of* the bug.
+- **Characterisation tests** (backfilling tests for existing untested behaviour) pass on the
+  first run by design: they pin current behaviour, so red-first doesn't apply. Instead,
+  `red-test-adversary` attacks them in mutation mode: it breaks the behaviour in a temp copy
+  and checks the test goes red. If you find surprising behaviour, report it; don't "fix" it
+  inside the characterisation test, and don't describe it as intended in the docs.
+- **Pure refactors** need no new red test. The existing tests are the contract and must be
+  green before and after.
+
+### Adversarial review
+
+The author doesn't grade their own work. Three adversary subagents live in `.claude/agents/`.
+They are read-only: they may run read-only commands and throwaway experiments in a temp
+directory, and must never edit the repository. Running them is required:
+
+| Adversary | When | Blocks the change on |
+|---|---|---|
+| `red-test-adversary` | after every new red test, before implementing (TDD phase 2), and on characterisation tests (mutation mode) | `DECORATION` |
+| `rfc-adversary` | after drafting or materially amending an RFC, before it becomes `Accepted` | any unaddressed `CONFIRMED` |
+| `rosette-auditor` | before reporting any non-trivial change done (TDD phase 5) | any `VIOLATED` |
+
+- `CONFIRMED` / `VIOLATED`: fix it, by amending the RFC or changing the code.
+- `PLAUSIBLE` / `AT-RISK`: decide, and write the decision down (in the RFC, or in your
+  summary). A settled question that's recorded is worth more than one settled silently.
+- Clean pass: say so in one line and name the attack that came closest.
+- Don't re-run `rfc-adversary` on wording or factual corrections you just made to satisfy
+  it; a second pass on your own fixes is theatre. Do re-run it if an amendment changes the
+  design itself. `red-test-adversary` *is* re-run after a `DECORATION` or `WEAK-RED` rewrite.
+- If a subagent can't be launched in the current environment, say so in your summary. Never
+  substitute your own self-review and present it as the adversary's verdict.
+
+Report each adversary's verdict in the change summary, next to the OWASP findings.
 
 ## Security: OWASP review on every change
 
@@ -69,10 +232,15 @@ flag/fix them if a change touches the surrounding code:
   it) and Top-10 A05 (Security Misconfiguration). Don't widen it further; if you add
   credentialed requests anywhere, this combination becomes actively unsafe (browsers reject
   `Any` + credentials, but don't rely on that as your only control).
-- **Token comparison is not constant-time** (`src/auth.rs::require_auth`, `token.as_deref() ==
-  Some(&expected)`) — a timing side-channel on the shared secret. Top-10 A02 (Cryptographic
-  Failures) / API2 (Broken Authentication). Use a constant-time comparison
-  (`subtle::ConstantTimeEq` or equivalent) if you touch this function.
+- **Token comparison must stay constant-time** (`src/auth.rs::require_auth` uses
+  `subtle::ConstantTimeEq`, see RFC 0001) — never replace it with `==`/`as_deref() ==`, which
+  reopens a timing side-channel on the shared secret. Top-10 A02 / API2.
+- **Hub push-token comparison is not constant-time** (`system-hub/src/push.rs`, the auth
+  handshake's `auth.token != expected_token` on `HUB_PUSH_TOKEN`). RFC 0001 fixed only the
+  agent side. Use `subtle::ConstantTimeEq`, as in `src/auth.rs`, if you touch the handshake.
+  In the same handler, `auth.system_id[..8]` panics on a `system_id` shorter than 8 bytes or
+  with a multi-byte character boundary before byte 8. That is reachable by any client when
+  `HUB_PUSH_TOKEN` is unset.
 - **Hub-side SSRF surface**: `POST /api/systems` on `system-hub` accepts an arbitrary `url`
   that the hub's poller (`collector.rs`) will then fetch on a schedule. This is API7 (SSRF) /
   Top-10 A10. Any change to system registration or the poller must consider whether the URL
@@ -119,11 +287,11 @@ cargo audit
 
 ## Testing: full coverage, including retrofitting existing code
 
-There are currently **no tests anywhere in this repository**. Treat that as the backlog, not
-the baseline to maintain.
+The order of work is set by the TDD loop above. This section sets what the finished test
+suite must cover.
 
-- **New or modified code must ship with tests in the same change.** No exceptions for "just a
-  small fix."
+- **New or modified code must ship with tests in the same change,** written first (see TDD).
+  No exceptions for "just a small fix."
 - **When you touch a file that has no tests, add tests for the existing untested behavior in
   that file first (or in the same commit), not just for your new lines.** The goal is
   monotonically increasing coverage — every file you touch should leave the repo with *more*
@@ -137,7 +305,7 @@ the baseline to maintain.
   - Integration tests: `tests/` directory at each crate root (create it — it doesn't exist
     yet) for anything that needs a running `Router`/`axum::serve` or a temp SQLite file. Use
     `axum::body::Body` + `tower::ServiceExt::oneshot` to test routes without binding a real
-    socket; use `tempfile` (add as a dev-dependency) for `db.rs` tests instead of touching the
+    socket; use `tempfile` (already a dev-dependency) for `db.rs` tests instead of touching the
     real `system-hub.db`.
   - Prefer pure, testable functions over logic buried in handler closures — e.g. alert
     threshold evaluation, MessagePack frame construction/parsing, and SQL clause building
@@ -174,12 +342,12 @@ test-additions do not need one.
 
 - File naming: `rfcs/NNNN-short-kebab-title.md`, zero-padded 4-digit sequential number. Check
   the highest existing number in `rfcs/` before assigning the next one.
-- Use `rfcs/0000-template.md` as the starting structure (create the directory/template if
-  missing — as of this writing it has just been scaffolded, so it should already exist; if not,
-  recreate it from the structure below).
-- An RFC covers: problem/motivation, proposed design, alternatives considered, security
-  implications (explicitly run through the OWASP categories above), testing plan, and impact
-  on `docs/ARCHITECTURE.md` (which sections will change).
+- Use `rfcs/0000-template.md` as the starting structure.
+- An RFC covers: problem/motivation, proposed design, domain impact (bounded contexts
+  touched, glossary terms added or changed), alternatives considered, security implications
+  (explicitly run through the OWASP categories above), testing plan, and impact on
+  `docs/ARCHITECTURE.md` (which sections will change).
+- Run `rfc-adversary` on the draft before moving it to `Accepted` (see Adversarial review).
 - Mark RFC status at the top: `Draft` → `Accepted` → `Implemented` (or `Rejected`/`Superseded`).
   Update the status as the corresponding work lands; don't leave an implemented change with a
   stale `Draft` RFC.
@@ -188,14 +356,20 @@ test-additions do not need one.
 
 For any non-trivial change, before reporting it as done:
 
-1. Implement the change following the Rust conventions above.
-2. Add/extend tests, including backfilling untested existing behavior in touched files.
-3. Run `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`,
-   `cargo test`, `cargo build --release` in every crate touched.
-4. Run the OWASP checklist above and state findings, even if "no relevant category touched."
-5. Update `docs/ARCHITECTURE.md` if the change affects architecture; otherwise note explicitly
-   that it doesn't.
-6. If the change is a new feature/protocol/schema/breaking change, write or update the
-   corresponding `rfcs/NNNN-*.md` and set its status.
-7. Update `README.md`'s endpoint/config tables if you added, removed, or changed an
+1. If the change is a new feature/protocol/schema/breaking change, write or update the
+   corresponding `rfcs/NNNN-*.md`, run `rfc-adversary` on it, act on the findings, and set its
+   status.
+2. Backfill characterisation tests for untested existing behaviour in the files you'll touch.
+3. For each behaviour: write the red test, prove it red, and have `red-test-adversary` attack
+   it (TDD phases 1–2).
+4. Implement minimally, then refactor against the Rosette and the DDD rules, following the
+   Rust conventions above (TDD phases 3–4).
+5. Run `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`,
+   `cargo test`, `cargo build --release` in every crate touched, then run `rosette-auditor`
+   on the diff (TDD phase 5).
+6. Run the OWASP checklist above and state findings, even if "no relevant category touched."
+7. Update `docs/ARCHITECTURE.md` if the change affects architecture (including § Domain
+   model when contexts or glossary terms change); otherwise note explicitly that it doesn't.
+8. Update `README.md`'s endpoint/config tables if you added, removed, or changed an
    externally-visible endpoint or environment variable.
+9. In the summary, report each adversary's verdict next to the OWASP findings.

@@ -278,7 +278,9 @@ Hub → Agent:  {"type":"auth_ok"}   or   {"type":"auth_error","message":"..."}
 
 **Data frames (every 2s):**
 
-Agent sends binary MessagePack-encoded frames:
+Agent sends binary MessagePack-encoded frames. The encoding is **positional**
+(`rmp_serde::to_vec`): each frame is a MessagePack *array* of the values below, in this exact
+order, with no field names on the wire. Field order is therefore part of the protocol.
 
 ```
 MessagePack({
