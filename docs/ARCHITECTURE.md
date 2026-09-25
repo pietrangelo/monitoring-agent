@@ -292,7 +292,8 @@ to warrant one).
   through `CHROME_BIN`. A newer push cancels a pull request's run, but never a run on `main`.
   The jobs have timeouts (30 and 10 minutes). The workflow has read-only `permissions`, needs
   no secrets, runs fork pull requests under `pull_request` (never `pull_request_target`), and
-  pins every action to a commit SHA.
+  pins every action to a commit SHA. The pins are updated by hand; the owner chose not to run
+  Dependabot.
 
 ## Open architectural questions / known gaps
 
