@@ -49,11 +49,12 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
     extending the hand-rolled version.
   - Async: no blocking calls (`std::fs`, `std::process::Command`, blocking locks) inside async
     fns on the Tokio runtime without `spawn_blocking` — several collectors already shell out
-    (`dpkg`, `rpm`, `systemctl`, `ss`, `docker`), and **none of them are offloaded today**:
-    there is no `spawn_blocking` in either crate, and the hub's `rusqlite` calls hold a
-    `std::sync::Mutex` from async code. Don't copy that pattern. New shell-outs use
-    `tokio::process::Command` or `spawn_blocking`, and fix the existing ones when you touch
-    them.
+    (`dpkg`, `rpm`, `systemctl`, `ss`, `docker`), and **none of them are offloaded today**.
+    The hub's `rusqlite` calls hold a `std::sync::Mutex` from async code everywhere except
+    the push receiver, which runs its SQLite work through `spawn_blocking`
+    (`system-hub/src/push.rs::on_blocking_pool`, awaited so work stays in order). Don't copy
+    the blocking pattern. New shell-outs use `tokio::process::Command` or `spawn_blocking`,
+    and fix the existing ones when you touch them.
   - Keep `unsafe` at zero. If a change seems to need it, stop and ask.
 
 ## Development discipline: TDD + DDD + adversaries + the Rosette
@@ -232,15 +233,16 @@ flag/fix them if a change touches the surrounding code:
   it) and Top-10 A05 (Security Misconfiguration). Don't widen it further; if you add
   credentialed requests anywhere, this combination becomes actively unsafe (browsers reject
   `Any` + credentials, but don't rely on that as your only control).
-- **Token comparison must stay constant-time** (`src/auth.rs::require_auth` uses
-  `subtle::ConstantTimeEq`, see RFC 0001) — never replace it with `==`/`as_deref() ==`, which
-  reopens a timing side-channel on the shared secret. Top-10 A02 / API2.
-- **Hub push-token comparison is not constant-time** (`system-hub/src/push.rs`, the auth
-  handshake's `auth.token != expected_token` on `HUB_PUSH_TOKEN`). RFC 0001 fixed only the
-  agent side. Use `subtle::ConstantTimeEq`, as in `src/auth.rs`, if you touch the handshake.
-  In the same handler, `auth.system_id[..8]` panics on a `system_id` shorter than 8 bytes or
-  with a multi-byte character boundary before byte 8. That is reachable by any client when
-  `HUB_PUSH_TOKEN` is unset.
+- **Token comparison must stay constant-time**, on both sides: `src/auth.rs::tokens_match`
+  for `SYSTEM_AGENT_TOKEN` (RFC 0001) and `system-hub/src/push.rs::PushToken::accepts` for
+  `HUB_PUSH_TOKEN` (RFC 0003) both use `subtle::ConstantTimeEq`. Never replace either with
+  `==`/`!=`/`as_deref() ==`, which reopens a timing side-channel on the shared secret. No
+  test can catch that regression, so review must. Top-10 A02 / API2.
+- **The push system id is self-asserted** (`system-hub/src/push.rs::authenticate`): the hub
+  trusts whatever `system_id` the handshake presents, and `GET /api/systems` lists every id.
+  Anyone with the shared push token (or anyone, when `HUB_PUSH_TOKEN` is unset) can push as
+  any registered system. This is API1 / A01. Don't build anything that relies on the push
+  id as proof of identity; binding ids to per-system credentials needs an RFC.
 - **Hub-side SSRF surface**: `POST /api/systems` on `system-hub` accepts an arbitrary `url`
   that the hub's poller (`collector.rs`) will then fetch on a schedule. This is API7 (SSRF) /
   Top-10 A10. Any change to system registration or the poller must consider whether the URL

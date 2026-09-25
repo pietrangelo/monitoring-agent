@@ -95,8 +95,8 @@ match those rules (listed under Open architectural questions below).
 | **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `ActiveAlert`, `AlertManager::evaluate`) | `routes/api.rs` alert endpoints | deciding when a metric breaches a rule, for how long, and cooldown |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
-| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
-| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push.rs` (WS receiver, hub-side `PushPayload`) | turning agent output into hub metrics, alerts and status |
+| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
+| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push.rs` (WS receiver: handshake parsing via `authenticate` / `PushToken` / `HandshakeRejection`, hub-side `PushPayload`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables, `state.rs` live cache, `routes/*` | stored time series, alert history, retention |
 
 **Published contracts between contexts** (both sides must change together, and a
@@ -120,6 +120,8 @@ mixed-version fleet must keep working):
 | **agent** | the `system-agent` process running on one monitored host | `system-agent` crate |
 | **hub** | the `system-hub` process aggregating many agents | `system-hub` crate |
 | **system** | a monitored host *as the hub knows it*: registry entry, config, status | `SystemInfo`, `systems` table |
+| **system id** | the non-empty identifier an agent presents in the push handshake; the hub uses it as the system's primary key | `SystemId` (hub) |
+| **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
 | **system status** | the hub's view of whether a system is reachable: online / offline / unknown | `SystemStatus` |
 | **snapshot** | one point-in-time reading of a host's CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
 | **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
@@ -131,6 +133,7 @@ mixed-version fleet must keep working):
 | **retention** | how long the hub keeps metric points per system per metric | `metric_retention` table |
 | **poll** | the hub fetching a system's snapshot over HTTP on the system's interval | `collector.rs` |
 | **push** | an agent streaming snapshots to the hub over WebSocket + MessagePack | `push.rs` (both crates) |
+| **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured | `PushToken` (hub) |
 | **push handshake** | the JSON text exchange that authenticates a push connection | `AuthMessage` (hub), `HubMessage` (agent) |
 | **push frame** | one binary, positional MessagePack snapshot message on the push connection | `PushPayload` (both crates) |
 
@@ -145,7 +148,16 @@ mixed-version fleet must keep working):
   constant-time byte loop) — only token *content* is protected, which matches standard practice
   for this kind of fixed-secret comparison.
 - **Agent → Hub (push)**: agent presents `system_id` + `token` in a JSON handshake frame before
-  any data frame is accepted; hub compares against `HUB_PUSH_TOKEN`.
+  any data frame is accepted. The hub reads `HUB_PUSH_TOKEN` once, when `push::router` is
+  built (`PushToken::from_env`). If it is unset, empty or not valid unicode, push auth is
+  disabled and startup logs a warning. `push::authenticate` parses the handshake into a
+  `SystemId` or a typed `HandshakeRejection`, checking the shape first, then the token
+  (in constant time via `subtle::ConstantTimeEq`, as on the agent), then that the id is
+  non-empty. So an unauthenticated client can't probe id validation. Each rejection is logged
+  at `warn` with its variant, never the token. Neither `PushToken` nor the `AuthMessage` DTO
+  implements `Debug`. The id itself is self-asserted: any token holder can push as any
+  system id (see Open architectural questions). See
+  `rfcs/0003-hub-push-handshake-hardening.md`.
 - **Hub → Agent (poll)**: hub sends the per-system token stored in `db.rs` (as configured via
   `POST/PUT /api/systems`) as the agent's expected auth token.
 - **Client → Hub**: no auth on the hub's own REST/SSE API in the current implementation — the
@@ -195,6 +207,11 @@ to warrant one).
   tests instead: `axum::serve` bound to an ephemeral `127.0.0.1:0` port inside the test, driven
   from a real client (`tokio_tungstenite::connect_async` for WS, a direct request for SSE
   headers).
+- **`system-hub`'s push receiver** (`push.rs`): the handshake is parsed by the pure
+  `authenticate` function, which a table-driven unit test covers without a server. The
+  real-server tests inject the push token through `router_with_token` instead of setting
+  `HUB_PUSH_TOKEN`, so they run in parallel with no `unsafe` env mutation. After closing the
+  socket they wait for the offline marking, which is ordered after every frame's ingestion.
 - **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector.rs`) are
   tested against real (but temporary) SQLite files via the `tempfile` crate — never against the
   real `system-hub.db`. `collector.rs`'s `poll_system` is tested against a small mock
@@ -230,17 +247,39 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   `<system id>_<agent alert id>`, so once `ongoing_rule_N` is stored, later incidents of that
   rule are ignored (and inherit the old row's `acknowledged` flag). A later incident is only
   recorded if a poll happens to land on its firing tick.
-- No blocking work is offloaded: there is no `spawn_blocking` in either crate. The
-  collectors' and push client's `std::process::Command` shell-outs (`dpkg-query`, `rpm`,
-  `pacman`, `apk`, `systemctl`, `docker`, `ss`, `lsb_release`, `hostname`) run on the async
-  runtime, and the hub's synchronous `rusqlite` calls hold a `std::sync::Mutex` from async
-  code.
+- Most blocking work is not offloaded. The collectors' and push client's
+  `std::process::Command` shell-outs (`dpkg-query`, `rpm`, `pacman`, `apk`, `systemctl`,
+  `docker`, `ss`, `lsb_release`, `hostname`) run on the async runtime. The hub's synchronous
+  `rusqlite` calls hold a `std::sync::Mutex` from async code everywhere except the push
+  receiver, which runs registration, frame ingestion and offline marking in
+  `spawn_blocking`.
 - Retention policy (look up `retention_secs`, fall back to 86400, delete older rows) is
   decided inside `Database::insert_metric`, in the SQL adapter, rather than in the domain.
-- The push handshake compares `HUB_PUSH_TOKEN` with `!=`, which is not constant-time
-  (RFC 0001 covered only the agent). The same handler derives a new system's name with
-  `auth.system_id[..8]`, which panics on a `system_id` shorter than 8 bytes or without a
-  character boundary at byte 8.
+- The push system id is self-asserted (API1). The hub trusts whatever `system_id` the
+  handshake presents, and `GET /api/systems` lists every id without auth. So anyone holding
+  the single shared push token, or anyone at all when it is unset, can push as any
+  registered system, a polled one included: inject metrics, trigger the rename to hostname,
+  or force it offline on disconnect. Fixing this needs per-system push credentials.
+- Push auto-registration is unbounded (API4). Every handshake with an unseen system id
+  inserts a permanent, enabled `systems` row, and the poller visits every enabled row every
+  30 s. There is also no cap on handshake or frame size.
+- Push-registered systems (`url: "push://"`) are also polled. reqwest rejects the scheme,
+  so the poller marks them offline, and they flap between online and offline.
+- A non-UTF-8 `HUB_PUSH_TOKEN` disables push auth (fails open), like an unset one.
+- The push handshake waits for the first message with no timeout. A client that upgrades
+  and never sends anything holds a connection task open indefinitely (API4).
+- The snapshot → metric mapping (metric names `cpu`, `memory`, `swap`, `load1`, `load5`,
+  `disk:<mount>`) is written twice: once in `push::metric_points` over the push DTO, and
+  once in `collector.rs` over the poll DTO. It belongs in one Fleet History domain function.
+- The Fleet Registry rules applied on each push frame are decided inside the Ingestion
+  adapter (`push::update_registry`). Those rules are: refill system info while its
+  hostname or OS is missing, and mark the system online. Only the default-name rule lives
+  in the domain.
+- Rejected push handshakes are logged without the peer's address. The hub isn't served with
+  connect info, and behind a reverse proxy it would need a forwarded-header policy.
+- The agent doesn't treat a missing handshake answer as a failure. Its handshake check has
+  no branch for it, so it enters its push loop, which returns `Ok(())` as soon as the
+  socket closes, and `main` reconnects without backoff.
 - Ingestion reads agent alerts from untyped `serde_json::Value` inside `collector.rs` and
   discards `insert_alert` errors (`let _ =`). Parsing, domain mapping and storage are
   interleaved in one poll function.

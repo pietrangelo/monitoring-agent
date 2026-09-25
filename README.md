@@ -222,7 +222,7 @@ For push-mode agents, they appear automatically — no manual registration neede
 
 | Variable | Default | Description |
 |---|---|---|
-| `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect |
+| `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning) |
 
 ---
 
@@ -272,9 +272,20 @@ For push-mode agents, they appear automatically — no manual registration neede
 **Handshake:**
 
 ```
-Agent → Hub:  {"type":"auth","system_id":"<uuid>","token":"<secret>"}
+Agent → Hub:  {"type":"auth","system_id":"<system id>","token":"<secret>"}
 Hub → Agent:  {"type":"auth_ok"}   or   {"type":"auth_error","message":"..."}
 ```
+
+The system id is the host's `/etc/machine-id`, else the dbus machine id, else its hostname,
+else a random UUID. It must not be empty. The hub registers an unseen id as a new system,
+named after the first 8 bytes of the id until the first data frame supplies a hostname.
+When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` messages are:
+
+| `message` | Cause |
+|---|---|
+| `expected auth message` | the first frame isn't JSON with `"type":"auth"` and a `system_id` |
+| `invalid token` | `HUB_PUSH_TOKEN` is set and `token` doesn't match it |
+| `invalid system_id` | the token is valid (or not required) but `system_id` is empty |
 
 **Data frames (every 2s):**
 
