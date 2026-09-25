@@ -167,7 +167,8 @@ mixed-version fleet must keep working):
   one URL path segment, so not empty, not longer than 255 bytes, and not `.` or `..`
   (`SystemIdError`, all answered `invalid system_id`). So an unauthenticated client can't
   probe id validation. Each rejection is logged
-  at `warn` with its variant, never the token. Neither `PushToken` nor the `AuthMessage` DTO
+  at `warn` with its variant, never the token; an id rejection names the broken rule
+  (`InvalidSystemId(DotSegment)`), never the id. Neither `PushToken` nor the `AuthMessage` DTO
   implements `Debug`. The id itself is self-asserted: any token holder can push as any
   system id (see Open architectural questions). See
   `rfcs/0003-hub-push-handshake-hardening.md`.
@@ -190,9 +191,10 @@ mixed-version fleet must keep working):
   therefore builds its DOM with `createElement` + `textContent` and never assembles HTML from
   data. Ids reach click handlers through closures and URLs through `encodeURIComponent`,
   never through inline `onclick` markup. `encodeURIComponent` keeps an id in one path segment
-  only because `SystemId` refuses `.`, `..` and ids over 255 bytes, which the URL parser
-  would resolve away or a request line couldn't hold; rows stored before that rule may
-  still break it. Values used as CSS classes are checked against a
+  only because `SystemId` refuses `.` and `..`, which the URL parser would resolve away. It
+  also refuses ids over 255 bytes, a margin far below the request-line limits (65,534 bytes
+  in hyper, 8 KB by default in nginx) that an encoded id, up to three times its length, has
+  to fit. Rows stored before that rule may still break it. Values used as CSS classes are checked against a
   fixed allowlist: an unknown system status renders as `unknown`, and an unknown severity
   gets no severity class. Numbers are type-checked before formatting or use in styles: a
   card metric or disk percentage that isn't a number renders as `—`, and a core count that
@@ -320,16 +322,25 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   boundaries). A `script-src 'self'` policy would first need the inline `<script>` moved to
   a file and the static `onclick` attributes replaced by listeners.
 - A hub may still store systems whose ids break the `SystemId` rule (`.`, `..`, or over 255
-  bytes), registered before the rule existed. They can't push again, and the dashboard can't
-  open or delete them. They go offline only because the poller also polls `push://` rows;
-  with no graceful shutdown, the disconnect handler doesn't mark them offline on a restart.
-  To find them without printing hostile bytes, run
+  bytes), registered before the rule existed. None of them can push again. They go offline
+  only because the poller also polls `push://` rows: with no graceful shutdown, the
+  disconnect handler doesn't mark them offline on a restart. To find them without printing
+  hostile bytes, run
   `SELECT hex(substr(id, 1, 16)), length(CAST(id AS BLOB)) FROM systems WHERE id IN ('.', '..') OR length(CAST(id AS BLOB)) > 255`.
-  Delete a dot id with `DELETE /api/systems/%2E` (or `%2E%2E`): the router decodes the segment
-  exactly once. An over-long id can't be addressed by URL, so delete it in SQLite from
-  `metrics`, `alerts`, `metric_retention` and `systems` (see RFC 0005, Rollout). Anyone who
-  parses DB rows into `SystemId` must skip such a row and log that a row was skipped, never
-  its id, rather than fail `list_systems` (whose callers fall back to an empty list).
+  How to delete one depends on the id:
+  - `.` and `..` can't be opened or deleted from the dashboard. Delete them with
+    `curl --path-as-is -X DELETE .../api/systems/%2E` (or `%2E%2E`): the router decodes the
+    segment exactly once.
+  - An id over 255 bytes whose encoded URL still fits a request line opens and deletes from
+    the dashboard as usual.
+  - An id whose encoded URL doesn't fit (from about 2.7 KB behind nginx's default, or 21 KB
+    against hyper directly) can't be addressed by any URL. Delete it in SQLite from `metrics`,
+    `alerts`, `metric_retention` and `systems` (see RFC 0005, Rollout).
+
+  So `DELETE /api/systems/:id` takes the stored id as it is, and must not parse it into
+  `SystemId` while such rows can exist. Anyone who parses DB rows into `SystemId` must skip
+  such a row and log that a row was skipped, never its id, rather than fail `list_systems`
+  (whose callers fall back to an empty list).
 - When a per-system fetch fails (the system was deleted between two refreshes, or its URL
   can't be served), the dashboard returns early and keeps showing the previously opened
   system's details and charts.
@@ -338,8 +349,10 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   `414 URI Too Long`.
 - The bundled SQLite enforces foreign keys (`SQLITE_DEFAULT_FOREIGN_KEYS=1` in
   `libsqlite3-sys`), so `Database::insert_system`'s `INSERT OR REPLACE` would cascade-delete a
-  system's metrics, alerts and retention rows if it ever replaced an existing row. Today every
-  caller inserts a new id (`register_if_new` checks first, and `POST` generates a UUID).
+  system's metrics, alerts and retention rows if it ever replaced an existing row. Every caller
+  means to insert a new id (`POST` generates a UUID, and `register_if_new` checks first), but
+  that check is best-effort: a failed lookup counts as "not registered", so a row-mapping
+  error on an existing push system would replace it and lose its history.
 - The hub's `alerts` table has no retention. With one record per alert incident, a flapping
   rule adds a record for each incident a poll sees.
 - An agent alert without an `id` gets a random id on the hub (`collector.rs`), so it becomes a

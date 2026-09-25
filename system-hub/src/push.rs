@@ -115,7 +115,8 @@ impl PushToken {
 enum HandshakeRejection {
     NotAnAuthMessage,
     InvalidToken,
-    InvalidSystemId,
+    /// Carries the broken rule so the rejection's log line names it, never the id itself.
+    InvalidSystemId(SystemIdError),
 }
 
 impl HandshakeRejection {
@@ -123,18 +124,10 @@ impl HandshakeRejection {
         match self {
             Self::NotAnAuthMessage => "expected auth message",
             Self::InvalidToken => "invalid token",
-            Self::InvalidSystemId => "invalid system_id",
-        }
-    }
-}
-
-impl From<SystemIdError> for HandshakeRejection {
-    /// Every broken system id rule gets the same answer on the wire.
-    fn from(error: SystemIdError) -> Self {
-        match error {
-            SystemIdError::Empty | SystemIdError::TooLong | SystemIdError::DotSegment => {
-                Self::InvalidSystemId
-            }
+            // One answer for every rule: the client learns only that its id was refused.
+            Self::InvalidSystemId(
+                SystemIdError::Empty | SystemIdError::TooLong | SystemIdError::DotSegment,
+            ) => "invalid system_id",
         }
     }
 }
@@ -154,7 +147,7 @@ fn authenticate(
     if push_token.is_some_and(|token| !token.accepts(&auth.token)) {
         return Err(HandshakeRejection::InvalidToken);
     }
-    SystemId::try_from(auth.system_id).map_err(HandshakeRejection::from)
+    SystemId::try_from(auth.system_id).map_err(HandshakeRejection::InvalidSystemId)
 }
 
 /// What the push handler needs per connection: the shared app state and the configured
@@ -761,7 +754,7 @@ mod tests {
                 "empty system id",
                 r#"{"type":"auth","system_id":"","token":"expected-token"}"#,
                 configured,
-                Err(InvalidSystemId),
+                Err(InvalidSystemId(SystemIdError::Empty)),
             ),
             (
                 "empty system id with a wrong token is a token failure",
@@ -813,13 +806,23 @@ mod tests {
         let configured = configured.as_ref();
         let too_long = "a".repeat(256);
         let cases = [
-            ("single dot", ".", "expected-token", Err(InvalidSystemId)),
-            ("double dot", "..", "expected-token", Err(InvalidSystemId)),
+            (
+                "single dot",
+                ".",
+                "expected-token",
+                Err(InvalidSystemId(SystemIdError::DotSegment)),
+            ),
+            (
+                "double dot",
+                "..",
+                "expected-token",
+                Err(InvalidSystemId(SystemIdError::DotSegment)),
+            ),
             (
                 "over-long id",
                 too_long.as_str(),
                 "expected-token",
-                Err(InvalidSystemId),
+                Err(InvalidSystemId(SystemIdError::TooLong)),
             ),
             // The token is checked first, so a bad id can't be probed without it.
             (
@@ -852,7 +855,18 @@ mod tests {
                 "expected auth message",
             ),
             (HandshakeRejection::InvalidToken, "invalid token"),
-            (HandshakeRejection::InvalidSystemId, "invalid system_id"),
+            (
+                HandshakeRejection::InvalidSystemId(SystemIdError::Empty),
+                "invalid system_id",
+            ),
+            (
+                HandshakeRejection::InvalidSystemId(SystemIdError::TooLong),
+                "invalid system_id",
+            ),
+            (
+                HandshakeRejection::InvalidSystemId(SystemIdError::DotSegment),
+                "invalid system_id",
+            ),
         ];
         for (rejection, expected) in cases {
             assert_eq!(rejection.message(), expected, "{rejection:?}");

@@ -132,6 +132,8 @@ async fn update_system(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
+/// Takes the stored id as it is, deliberately not parsed into `SystemId`: rows stored before
+/// RFC 0005 may hold ids that break its rule, and this route is how an operator removes them.
 async fn delete_system(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,

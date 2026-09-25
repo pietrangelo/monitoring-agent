@@ -132,10 +132,11 @@ empty list, so one bad row would empty the dashboard.
   no *newly accepted* id can break it. Stored rows are covered by Rollout and Open questions.
 - **A07 / API2 Authentication:** the token check keeps its order and its constant-time
   comparison. The id check still comes after it.
-- **A09 Logging:** a refused id is logged at `warn` as `InvalidSystemId`, as an empty one is
-  today. Neither side logs the refused id, so an operator can't tell from the logs which rule
-  it broke. That's accepted: the hub shouldn't echo a hostile value into its logs, and a real
-  agent never hits these rules.
+- **A09 Logging:** a refused id is logged at `warn` as `InvalidSystemId(<rule>)`, for example
+  `InvalidSystemId(DotSegment)`. The rejection carries the `SystemIdError`, so the log names
+  the broken rule without echoing the hostile id itself. The wire answer stays
+  `invalid system_id` for every rule. (Settled during implementation, after
+  `rosette-auditor` noted that the first design discarded the rule for no reason.)
 - **API4 Resource Consumption:** partly touched. The id is now bounded. Message size, the
   handshake deadline and registration count are RFC 0006.
 - **API8 Misconfiguration:** unchanged. With `HUB_PUSH_TOKEN` unset, anyone could create these
@@ -206,9 +207,12 @@ a row would stay `online` until deleted, so the operator should delete it:
 sqlite3 system-hub.db "SELECT hex(substr(id, 1, 16)), length(CAST(id AS BLOB)) FROM systems
   WHERE id IN ('.', '..') OR length(CAST(id AS BLOB)) > 255;"
 # A dot-segment id: the hub decodes %2E into the path's id
-curl -X DELETE "http://<hub>/api/systems/%2E"     # the system "."
-curl -X DELETE "http://<hub>/api/systems/%2E%2E"  # the system ".."
-# An over-long id can't be addressed by URL. With the hub stopped, delete it in SQLite from
+# --path-as-is keeps curl from treating %2E as a dot segment itself.
+curl --path-as-is -X DELETE "http://<hub>/api/systems/%2E"     # the system "."
+curl --path-as-is -X DELETE "http://<hub>/api/systems/%2E%2E"  # the system ".."
+# An id over 255 bytes whose encoded URL fits a request line deletes from the dashboard as
+# usual. One that doesn't fit (from about 2.7 KB behind nginx, 21 KB against hyper) can't
+# be addressed by URL. With the hub stopped, delete it in SQLite from
 # the same four tables `Database::delete_system` clears, children first. The hub's bundled
 # SQLite enforces foreign keys, but the sqlite3 CLI usually runs with them off, so don't rely
 # on ON DELETE CASCADE here.
