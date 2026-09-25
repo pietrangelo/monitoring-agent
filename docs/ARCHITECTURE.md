@@ -181,6 +181,18 @@ mixed-version fleet must keep working):
 - **SSRF surface**: the hub polls arbitrary URLs supplied via `POST /api/systems`; there is no
   URL validation today. Anyone who can call that endpoint can make the hub issue HTTP requests
   to arbitrary hosts reachable from the hub.
+- **Hub API → hub dashboard**: every string the dashboard renders is untrusted. Names, URLs,
+  OS fields, disk mount points, alert messages and severities come from agent JSON or push
+  frames, and system ids are self-asserted in the push handshake, so any agent, anyone who
+  can register or re-point a system, and any push-token holder controls them. The dashboard
+  therefore builds its DOM with `createElement` + `textContent` and never assembles HTML from
+  data. Ids reach click handlers through closures and URLs through `encodeURIComponent`,
+  never through inline `onclick` markup. Values used as CSS classes are checked against a
+  fixed allowlist: an unknown system status renders as `unknown`, and an unknown severity
+  gets no severity class. Numbers are type-checked before formatting or use in styles: a
+  card metric or disk percentage that isn't a number renders as `—`, and a core count that
+  isn't one is left out. The hub serves no Content-Security-Policy yet, so this rendering
+  rule is the only XSS control.
 
 ## Storage
 
@@ -258,12 +270,19 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - Agents older than RFC 0004 still report `ongoing_rule_<index>` ids, which collide across
   incidents, so the hub drops their later incidents until they are upgraded. Hub databases
   may still hold stale `<system>_ongoing_rule_N` rows.
-- The hub dashboard (`system-hub/static/index.html`, `loadAlerts`) interpolates `a.id`
-  unescaped into an inline `onclick` handler, and `a.severity` unescaped into a class
-  attribute (A03). `a.severity` and the agent half of `a.id` come from agent JSON; the system
-  half of `a.id` is the system id, self-asserted in the push handshake for push-registered
-  systems. So any agent, anyone who can register or re-point a system, and any push-token
-  holder can plant stored XSS.
+- Neither binary sends a Content-Security-Policy (or any security headers) with its
+  dashboard. The hub dashboard's only XSS control is its rendering rule (see Trust
+  boundaries). A `script-src 'self'` policy would first need the inline `<script>` moved to
+  a file and the static `onclick` attributes replaced by listeners.
+- A system id of `.` or `..` escapes its path segment in the dashboard's URLs:
+  `encodeURIComponent` leaves dots alone, and the URL parser removes dot segments.
+  `SystemId` only rejects the empty id, and push ids are self-asserted. With id `.`, the
+  history fetch `/api/systems/./history` lands on `GET /api/systems/history`, which returns
+  the record of a system whose id is `history`, and the system's own record and delete go to
+  `/api/systems/`. With id `..`, the requests go to `/api/` and `/api/history`, which no
+  route serves. So such a system can't be opened or deleted from the dashboard, and a `.`
+  system shows another system's data in place of its history. The fix is for `SystemId` to
+  reject dot segments.
 - The hub's `alerts` table has no retention. With one record per alert incident, a flapping
   rule adds a record for each incident a poll sees.
 - An agent alert without an `id` gets a random id on the hub (`collector.rs`), so it becomes a

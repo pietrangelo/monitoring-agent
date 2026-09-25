@@ -588,6 +588,39 @@
             var selectedSystemId = null;
             var liveMetricsCache = {};
 
+            // Every server string reaches the DOM through textContent, and every id
+            // through a closure or encodeURIComponent, never through markup. Agents,
+            // anyone who can register a system and any push-token holder control
+            // these strings, so an HTML-building path would be stored XSS.
+            var SYSTEM_STATUSES = ["online", "offline", "unknown"];
+            var ALERT_SEVERITIES = ["critical", "warning", "info"];
+
+            function el(tag, className, text) {
+                var node = document.createElement(tag);
+                if (className) node.className = className;
+                if (text != null) node.textContent = String(text);
+                return node;
+            }
+
+            function oneOf(value, allowed, fallback) {
+                return allowed.indexOf(value) >= 0 ? value : fallback;
+            }
+
+            function finiteNumber(value) {
+                return typeof value === "number" && isFinite(value)
+                    ? value
+                    : null;
+            }
+
+            function fixed1(value, suffix) {
+                var n = finiteNumber(value);
+                return n === null ? "—" : n.toFixed(1) + (suffix || "");
+            }
+
+            function systemPath(id, rest) {
+                return "/api/systems/" + encodeURIComponent(id) + (rest || "");
+            }
+
             async function deleteOfflineSystems() {
                 if (!confirm("Delete ALL offline systems and their data?"))
                     return;
@@ -595,7 +628,7 @@
                 if (!systems) return;
                 for (var i = 0; i < systems.length; i++) {
                     if (systems[i].status === "offline") {
-                        await fetch("/api/systems/" + systems[i].id, {
+                        await fetch(API + systemPath(systems[i].id), {
                             method: "DELETE",
                         });
                     }
@@ -623,114 +656,129 @@
                     data.active_alerts;
 
                 var systems = data.systems || [];
-                var liveMetrics = data.live_metrics || {};
-                liveMetricsCache = liveMetrics;
+                liveMetricsCache = data.live_metrics || {};
                 if (
                     selectedSystemId &&
                     document
                         .getElementById("detailPanel")
                         .classList.contains("active")
                 ) {
-                    var lm2 = liveMetrics[selectedSystemId] || {};
-                    var disks2 = lm2.disks || [];
-                    var diskHtml2 = "";
-                    if (disks2.length > 0) {
-                        disks2.forEach(function (d) {
-                            var pct = d[1] || 0;
-                            var color =
-                                pct > 90
-                                    ? "var(--red)"
-                                    : pct > 75
-                                      ? "var(--yellow)"
-                                      : "var(--green)";
-                            diskHtml2 +=
-                                '<div class="disk-item"><div style="display:flex;justify-content:space-between"><span class="disk-name">' +
-                                esc(d[0]) +
-                                '</span><span class="disk-pct">' +
-                                pct.toFixed(1) +
-                                '%</span></div><div class="disk-bar"><div class="disk-bar-fill" style="width:' +
-                                pct +
-                                "%;background:" +
-                                color +
-                                '"></div></div></div>';
-                        });
-                    } else {
-                        diskHtml2 =
-                            '<div style="color:var(--text-dim);font-size:12px;padding:10px">Waiting for disk data...</div>';
-                    }
-                    var dd = document.getElementById("detailDisks");
-                    if (dd) dd.innerHTML = diskHtml2;
+                    renderDisks(
+                        liveMetricsCache[selectedSystemId],
+                        "Waiting for disk data...",
+                    );
                 }
                 var grid = document.getElementById("sysGrid");
                 var empty = document.getElementById("emptyState");
                 if (systems.length === 0) {
-                    grid.innerHTML = "";
+                    grid.replaceChildren();
                     empty.style.display = "block";
                     return;
                 }
                 empty.style.display = "none";
 
-                grid.innerHTML = systems
-                    .map(function (s) {
-                        var sc = s.status || "unknown";
-                        var lm = liveMetrics[s.id] || {};
-                        return (
-                            '<div class="sys-card' +
-                            (s.id === selectedSystemId ? " selected" : "") +
-                            '" onclick="selectSystem(\'' +
-                            s.id +
-                            "')\">" +
-                            '<div class="sys-card-header"><div><div class="sys-card-name">' +
-                            esc(s.name) +
-                            '</div><div class="sys-card-url">' +
-                            esc(s.url) +
-                            "</div></div>" +
-                            '<div class="sys-status-dot ' +
-                            sc +
-                            '" title="' +
-                            sc +
-                            '"></div></div>' +
-                            '<div class="sys-metrics">' +
-                            '<div class="sys-metric"><div class="val" style="color:var(--accent)">' +
-                            (lm.cpu_percent != null
-                                ? lm.cpu_percent.toFixed(1) + "%"
-                                : "—") +
-                            '</div><div class="lbl">CPU</div></div>' +
-                            '<div class="sys-metric"><div class="val" style="color:var(--green)">' +
-                            (lm.memory_percent != null
-                                ? lm.memory_percent.toFixed(1) + "%"
-                                : "—") +
-                            '</div><div class="lbl">MEM</div></div>' +
-                            '<div class="sys-metric"><div class="val" style="color:var(--cyan)">' +
-                            (lm.load_one != null
-                                ? lm.load_one.toFixed(1)
-                                : "—") +
-                            '</div><div class="lbl">Load</div></div>' +
-                            "</div>" +
-                            '<div class="sys-meta">' +
-                            (s.os ? "<span>" + esc(s.os) + "</span>" : "") +
-                            (s.cpu_cores
-                                ? "<span>" + s.cpu_cores + " cores</span>"
-                                : "") +
-                            (s.total_memory_display
-                                ? "<span>" +
-                                  esc(s.total_memory_display) +
-                                  " RAM</span>"
-                                : "") +
-                            (s.last_seen
-                                ? "<span>Seen: " + esc(s.last_seen) + "</span>"
-                                : "") +
-                            "</div>" +
-                            (s.last_error
-                                ? '<div style="font-size:10px;color:var(--red);margin-top:6px">' +
-                                  esc(s.last_error) +
-                                  "</div>"
-                                : "") +
-                            "</div>"
-                        );
-                    })
-                    .join("");
+                grid.replaceChildren.apply(
+                    grid,
+                    systems.map(function (s) {
+                        return systemCard(s, liveMetricsCache[s.id] || {});
+                    }),
+                );
                 loadAlerts();
+            }
+
+            function systemCard(s, lm) {
+                var status = oneOf(s.status, SYSTEM_STATUSES, "unknown");
+                var card = el("div", "sys-card");
+                card.classList.toggle("selected", s.id === selectedSystemId);
+                card.dataset.systemId = String(s.id);
+                card.addEventListener("click", function () {
+                    selectSystem(s.id);
+                });
+
+                var header = el("div", "sys-card-header");
+                var title = el("div");
+                title.append(
+                    el("div", "sys-card-name", s.name),
+                    el("div", "sys-card-url", s.url),
+                );
+                var dot = el("div", "sys-status-dot " + status);
+                dot.title = status;
+                header.append(title, dot);
+
+                var metrics = el("div", "sys-metrics");
+                metrics.append(
+                    cardMetric(fixed1(lm.cpu_percent, "%"), "CPU", "--accent"),
+                    cardMetric(fixed1(lm.memory_percent, "%"), "MEM", "--green"),
+                    cardMetric(fixed1(lm.load_one), "Load", "--cyan"),
+                );
+
+                card.append(header, metrics, cardMeta(s));
+                if (s.last_error) {
+                    var error = el("div", null, s.last_error);
+                    error.style.cssText =
+                        "font-size:10px;color:var(--red);margin-top:6px";
+                    card.append(error);
+                }
+                return card;
+            }
+
+            function cardMetric(value, label, colorVar) {
+                var metric = el("div", "sys-metric");
+                var val = el("div", "val", value);
+                val.style.color = "var(" + colorVar + ")";
+                metric.append(val, el("div", "lbl", label));
+                return metric;
+            }
+
+            function cardMeta(s) {
+                var meta = el("div", "sys-meta");
+                var cores = finiteNumber(s.cpu_cores);
+                if (s.os) meta.append(el("span", null, s.os));
+                if (cores) meta.append(el("span", null, cores + " cores"));
+                if (s.total_memory_display)
+                    meta.append(
+                        el("span", null, s.total_memory_display + " RAM"),
+                    );
+                if (s.last_seen)
+                    meta.append(el("span", null, "Seen: " + s.last_seen));
+                return meta;
+            }
+
+            function renderDisks(lm, emptyText) {
+                var container = document.getElementById("detailDisks");
+                var disks = (lm && lm.disks) || [];
+                if (disks.length === 0) {
+                    var empty = el("div", null, emptyText);
+                    empty.style.cssText =
+                        "color:var(--text-dim);font-size:12px;padding:10px";
+                    container.replaceChildren(empty);
+                    return;
+                }
+                container.replaceChildren.apply(container, disks.map(diskItem));
+            }
+
+            function diskItem(d) {
+                var pct = finiteNumber(d[1]);
+                var item = el("div", "disk-item");
+                var row = el("div");
+                row.style.cssText = "display:flex;justify-content:space-between";
+                row.append(
+                    el("span", "disk-name", d[0]),
+                    el("span", "disk-pct", fixed1(pct, "%")),
+                );
+                var bar = el("div", "disk-bar");
+                item.append(row, bar);
+                if (pct === null) return item;
+                var fill = el("div", "disk-bar-fill");
+                fill.style.width = Math.min(Math.max(pct, 0), 100) + "%";
+                fill.style.background =
+                    pct > 90
+                        ? "var(--red)"
+                        : pct > 75
+                          ? "var(--yellow)"
+                          : "var(--green)";
+                bar.append(fill);
+                return item;
             }
 
             function selectSystem(id) {
@@ -739,12 +787,10 @@
                 document.querySelectorAll(".sys-card").forEach(function (c) {
                     c.classList.toggle(
                         "selected",
-                        c.querySelector(".sys-card-name") &&
-                            c.getAttribute("onclick") &&
-                            c.getAttribute("onclick").indexOf(id) >= 0,
+                        c.dataset.systemId === String(id),
                     );
                 });
-                fetchJSON("/api/systems/" + id).then(function (sys) {
+                fetchJSON(systemPath(id)).then(function (sys) {
                     if (!sys) return;
                     document.getElementById("detailName").textContent =
                         sys.name + " (" + (sys.hostname || sys.url) + ")";
@@ -752,38 +798,11 @@
                     document.getElementById("dKernel").textContent =
                         sys.kernel || "—";
                     document.getElementById("dCpu").textContent = sys.cpu_model
-                        ? sys.cpu_model.split("@")[0].trim()
+                        ? String(sys.cpu_model).split("@")[0].trim()
                         : "—";
                     document.getElementById("dMem").textContent =
                         sys.total_memory_display || "—";
-                    var lm = liveMetricsCache[id] || {};
-                    var disks = lm.disks || [];
-                    var diskHtml = "";
-                    if (disks.length > 0) {
-                        disks.forEach(function (d) {
-                            var pct = d[1] || 0;
-                            var color =
-                                pct > 90
-                                    ? "var(--red)"
-                                    : pct > 75
-                                      ? "var(--yellow)"
-                                      : "var(--green)";
-                            diskHtml +=
-                                '<div class="disk-item"><div style="display:flex;justify-content:space-between"><span class="disk-name">' +
-                                esc(d[0]) +
-                                '</span><span class="disk-pct">' +
-                                pct.toFixed(1) +
-                                '%</span></div><div class="disk-bar"><div class="disk-bar-fill" style="width:' +
-                                pct +
-                                "%;background:" +
-                                color +
-                                '"></div></div></div>';
-                        });
-                    } else {
-                        diskHtml =
-                            '<div style="color:var(--text-dim);font-size:12px;padding:10px">No disk data yet</div>';
-                    }
-                    document.getElementById("detailDisks").innerHTML = diskHtml;
+                    renderDisks(liveMetricsCache[id], "No disk data yet");
                 });
                 refreshDetailCharts();
             }
@@ -801,7 +820,7 @@
             async function refreshDetailCharts() {
                 if (!selectedSystemId) return;
                 var hist = await fetchJSON(
-                    "/api/systems/" + selectedSystemId + "/history?limit=300",
+                    systemPath(selectedSystemId, "/history?limit=300"),
                 );
                 var hasCpu = hist && hist.cpu && hist.cpu.length > 0;
                 var hasMem = hist && hist.memory && hist.memory.length > 0;
@@ -828,64 +847,43 @@
                         "var(--green)",
                     );
             }
-            var lm = liveMetricsCache[selectedSystemId] || {};
-            var disks = lm.disks || [];
-            var diskHtml = "";
-            if (disks.length > 0) {
-                disks.forEach(function (d) {
-                    var pct = d[1] || 0;
-                    var color =
-                        pct > 90
-                            ? "var(--red)"
-                            : pct > 75
-                              ? "var(--yellow)"
-                              : "var(--green)";
-                    diskHtml +=
-                        '<div class="disk-item"><div style="display:flex;justify-content:space-between"><span class="disk-name">' +
-                        esc(d[0]) +
-                        '</span><span class="disk-pct">' +
-                        pct.toFixed(1) +
-                        '%</span></div><div class="disk-bar"><div class="disk-bar-fill" style="width:' +
-                        pct +
-                        "%;background:" +
-                        color +
-                        '"></div></div></div>';
-                });
-            } else {
-                diskHtml =
-                    '<div style="color:var(--text-dim);font-size:12px;padding:10px">No disk data yet</div>';
-            }
-            document.getElementById("detailDisks").innerHTML = diskHtml;
 
             async function loadAlerts() {
+                var list = document.getElementById("alertsList");
                 var alerts = await fetchJSON(
                     "/api/alerts?acknowledged=false&limit=50",
                 );
                 if (!alerts || !alerts.length) {
-                    document.getElementById("alertsList").innerHTML =
-                        '<div style="color:var(--text-dim);padding:20px">No active alerts</div>';
+                    var none = el("div", null, "No active alerts");
+                    none.style.cssText = "color:var(--text-dim);padding:20px";
+                    list.replaceChildren(none);
                     return;
                 }
-                document.getElementById("alertsList").innerHTML = alerts
-                    .map(function (a) {
-                        return (
-                            '<div class="alert-card ' +
-                            a.severity +
-                            '"><div class="alert-body"><strong>' +
-                            a.severity.toUpperCase() +
-                            "</strong> — " +
-                            esc(a.message) +
-                            '<div class="alert-system">' +
-                            esc(a.system_name) +
-                            " · " +
-                            esc(a.fired_at) +
-                            "</div></div>" +
-                            '<button class="btn btn-ghost btn-sm" onclick="ackAlert(\'' +
-                            a.id +
-                            "')\">✓ Ack</button></div>"
-                        );
-                    })
-                    .join("");
+                list.replaceChildren.apply(list, alerts.map(alertCard));
+            }
+
+            function alertCard(a) {
+                // An unknown severity (e.g. from a newer agent) gets no colour rather
+                // than being passed off as a known level; its raw label still shows.
+                var card = el("div", "alert-card");
+                var severity = oneOf(a.severity, ALERT_SEVERITIES, null);
+                if (severity) card.classList.add(severity);
+                var body = el("div", "alert-body");
+                body.append(
+                    el("strong", null, String(a.severity || "").toUpperCase()),
+                    " — " + (a.message || ""),
+                    el(
+                        "div",
+                        "alert-system",
+                        [a.system_name, a.fired_at].join(" · "),
+                    ),
+                );
+                var ack = el("button", "btn btn-ghost btn-sm", "✓ Ack");
+                ack.addEventListener("click", function () {
+                    ackAlert(a.id);
+                });
+                card.append(body, ack);
+                return card;
             }
 
             async function ackAlert(id) {
@@ -943,7 +941,7 @@
             async function deleteSystem() {
                 if (!selectedSystemId) return;
                 if (!confirm("Delete this system and all its data?")) return;
-                await fetch(API + "/api/systems/" + selectedSystemId, {
+                await fetch(API + systemPath(selectedSystemId), {
                     method: "DELETE",
                 });
                 closeDetail();
@@ -1007,13 +1005,6 @@
                 } catch (_) {
                     return null;
                 }
-            }
-
-            function esc(s) {
-                if (!s) return "";
-                var d = document.createElement("div");
-                d.textContent = s;
-                return d.innerHTML;
             }
 
             connectSSE();
