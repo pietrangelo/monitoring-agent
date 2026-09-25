@@ -223,3 +223,49 @@ Hub-only. No schema change. Rolling back is safe, since an old hub ignores the v
   within one push interval, plus up to 5 s if its agent first has to notice the old connection
   died.
 - A malformed `HUB_MAX_PUSH_SYSTEMS` refuses startup, and the log names it.
+
+## Review status
+
+The first `rfc-adversary` pass left these findings. They must be addressed before this RFC can
+be `Accepted`. It stays `Draft` while RFC 0006 is implemented first.
+
+**CONFIRMED:**
+- **`PUT` still decides what a push system is.** A polled row re-pointed to `push://` stays
+  online forever, and a push row re-pointed away stops counting. Fix: parse `url` at the REST
+  edge into an endpoint enum (`Push` / `Poll(SystemUrl)`). `POST` and `PUT` then refuse
+  `push://`, and refuse any change to a push system's url (API3).
+- **Removing the poller removes the only backstop.** Offline detection moves from about 30 s
+  to RFC 0006's 90 s idle deadline. Fix: declare the dependency on that deadline, state the
+  change, and log a failed offline write at `warn`.
+- **A stale connection marks a live system offline.** A host back within 90 s is marked
+  offline, and its live entry evicted, when its old connection times out. Fix: a per-id
+  connection generation, so only the current connection marks offline or evicts. Drop the
+  "undone" and "only really offline" claims.
+- **The agent recomputes its id on every reconnect.** In its random-UUID fallback (distroless
+  images), one agent uses one registry slot per reconnect. Fix: compute the id once per
+  process and persist the fallback. That is an agent change, so `system-agent` goes into
+  Affects.
+- **The push-only nginx pattern can't isolate REST by itself.** The hub binds `0.0.0.0:9091`
+  and compose publishes it, CORS is `Any`, and SSE needs `proxy_buffering off`. Fix:
+  firewall 9091 from agent networks (or add a bind-address setting), put the upgrade headers
+  only on the push location, and name CORS in §6.
+- **Tests that can't fail:**
+  - exactness needs an `admits`-hook concurrency test;
+  - "not polled" needs a collector tick test, not only the pure selection;
+  - the reset test is already green on HEAD and belongs to RFC 0006;
+  - the limit needs a seam in `PushConfig`;
+  - the `JoinError` branch is best-effort.
+- **A09.** A database error logs nothing, and per-id `debug` lines are dropped at the default
+  INFO level. Fix: log the database error once, rate-limited, and repeat the "full" `warn`
+  periodically with a refusal count.
+- **Inventory:**
+  - define `Refusal`'s new variants against RFC 0006's enum;
+  - add the Ingestion row, the `insert_system` open question and README:281;
+  - an API-based pre-check (`curl … | jq`), since the container has no `sqlite3`;
+  - the motivation's "resets before `auth_ok`" claim is false on HEAD (see RFC 0006 §2).
+
+**PLAUSIBLE:**
+- **Startup marking on poisoned rows.** Use a single `UPDATE … WHERE url = ?1` and a
+  `SELECT 1` existence check, with no row mapping. A marking failure refuses startup. Test
+  with a `..` row and a -1 `poll_interval_secs` row.
+- **The limit bounds rows, not load.** Cite RFC 0007's capacity, and index `systems(url)`.
