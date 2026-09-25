@@ -262,14 +262,15 @@ to warrant one).
   opened, and the class allowlists held. Opening a system, acknowledging an alert record and
   each delete must make exactly their expected requests, and every request must go to a
   known route, whose keys carry ids percent-encoded. It exits 0 on pass, 1 on a failed check or a
-  Chromium failure, and 2 when no Chromium is found. It is run by hand; `cargo test` does not
-  run it. The agent dashboard has no equivalent.
+  Chromium failure, and 2 when no Chromium is found. `cargo test` does not run it; `CLAUDE.md`
+  makes a passing run part of the gate for every change to the hub dashboard or to the test.
+  The agent dashboard has no equivalent.
 - `tower` (`features = ["util"]`, for `ServiceExt::oneshot`), `tempfile`, and `futures-util` (hub
   only, for WS test streams) are the test-only additions beyond what production code already
   depended on.
 - No coverage-measurement tool (`cargo llvm-cov`/`tarpaulin`) is installed in this environment;
-  `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test` are what currently
-  gate a change per `CLAUDE.md`.
+  `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` and, for the hub
+  dashboard, `xss.mjs` are what currently gate a change per `CLAUDE.md`.
 
 ## Open architectural questions / known gaps
 
