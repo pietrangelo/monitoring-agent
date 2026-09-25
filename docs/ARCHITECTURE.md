@@ -244,7 +244,8 @@ to warrant one).
 - **The hub dashboard** (`static/index.html`) has no JS unit-test harness. Its rendering rule
   is checked by an XSS smoke test, `system-hub/dashboard-tests/xss.mjs`: plain Node with no
   npm dependencies, driving headless Chromium (`CHROME_BIN`, else the first found on `PATH`,
-  else in the Linux Playwright cache, `chrome-headless-shell` first). It stubs `fetch` with a
+  else in Playwright's Linux browser folders, `$PLAYWRIGHT_BROWSERS_PATH` then
+  `~/.cache/ms-playwright`, newest build and headless shell first). It stubs `fetch` with a
   route table and `EventSource` with a hostile hub. Every free-text field of an unknown, an
   offline and an online system, and of every alert record, breaks out of text, quoted
   attributes and raw-text elements (statuses and severities are hostile only where they test

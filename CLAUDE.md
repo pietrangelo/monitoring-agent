@@ -40,9 +40,9 @@ sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHI
   ```
   It must exit 0, and this applies to trivial changes too. `cargo test` doesn't run it, so
   this step is the only thing that does. Exit 1 (a failed check, or Chromium failed) is a red
-  gate, just like a failing `cargo test`. Exit 2 means no Chromium was found: point
-  `CHROME_BIN` at a Chromium or headless-shell binary (Playwright keeps them under
-  `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`) and run it again. Exit 2 is never
+  gate, just like a failing `cargo test`. Exit 2 means no Chromium was found on `PATH` or in
+  Playwright's browser folders (`$PLAYWRIGHT_BROWSERS_PATH`, `~/.cache/ms-playwright`): point
+  `CHROME_BIN` at a Chromium or headless-shell binary and run it again. Exit 2 is never
   a pass. If there is no Chromium to point at, stop and ask the user rather than reporting
   the change done.
 - Prefer idiomatic, modern std/Axum 0.7/Tokio patterns over hand-rolled alternatives:

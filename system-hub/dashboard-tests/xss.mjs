@@ -427,13 +427,17 @@ function harnessScript() {
     return `<script>\n${PAGE_SIDE.join("\n")}\nrunPage(${fixtures});\n</script>\n`;
 }
 
+// Playwright's browser folders: PLAYWRIGHT_BROWSERS_PATH, then its default cache. "0" is
+// Playwright's value for "inside node_modules", not a folder.
 function playwrightBuilds() {
-    const cache = join(homedir(), ".cache", "ms-playwright");
-    if (!existsSync(cache)) return [];
-    const build = (name) => Number(name.match(/-(\d+)$/)?.[1] ?? -1);
-    return readdirSync(cache)
-        .sort((a, b) => build(b) - build(a))
-        .map((entry) => join(cache, entry));
+    const custom = process.env.PLAYWRIGHT_BROWSERS_PATH;
+    const roots = [custom !== "0" && custom, join(homedir(), ".cache", "ms-playwright")].filter(
+        (root) => root && existsSync(root),
+    );
+    const build = (dir) => Number(dir.match(/-(\d+)$/)?.[1] ?? -1);
+    return roots
+        .flatMap((root) => readdirSync(root).map((entry) => join(root, entry)))
+        .sort((a, b) => build(b) - build(a));
 }
 
 function findChrome() {
@@ -443,13 +447,17 @@ function findChrome() {
         .split(delimiter)
         .filter(Boolean)
         .flatMap((dir) => names.map((n) => join(dir, n)));
-    // Linux Playwright layouts only; the headless shell first, as it starts fastest.
+    // Linux Playwright layouts only, current and older; the headless shell first, as it
+    // starts fastest.
     const builds = playwrightBuilds();
-    const inCache = [
-        ...builds.map((dir) => join(dir, "chrome-headless-shell-linux64", "chrome-headless-shell")),
+    const inPlaywright = [
+        ...builds.flatMap((dir) => [
+            join(dir, "chrome-headless-shell-linux64", "chrome-headless-shell"),
+            join(dir, "chrome-linux", "headless_shell"),
+        ]),
         ...builds.flatMap((dir) => [join(dir, "chrome-linux64", "chrome"), join(dir, "chrome-linux", "chrome")]),
     ];
-    return [...onPath, ...inCache].find(existsSync) ?? null;
+    return [...onPath, ...inPlaywright].find(existsSync) ?? null;
 }
 
 function dumpDom(chrome, page) {
@@ -637,7 +645,10 @@ function checks(r) {
 
 const chrome = findChrome();
 if (!chrome) {
-    console.error("No Chromium found. Set CHROME_BIN to an existing Chromium or chrome-headless-shell binary.");
+    console.error(
+        "No Chromium found on PATH or in Playwright's browser folders. " +
+            "Set CHROME_BIN to an existing Chromium or headless-shell binary.",
+    );
     process.exit(2);
 }
 
