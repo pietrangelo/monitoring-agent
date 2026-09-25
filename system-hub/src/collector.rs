@@ -532,7 +532,7 @@ mod tests {
         let system_json = serde_json::json!({});
         let alerts_json = serde_json::json!({
             "active": [{
-                "id": "rule_0",
+                "id": "4c0a8f0e-2b1d-4f5e-9a37-6c1e2d3b4a50-1",
                 "rule": {"severity": "critical"},
                 "current_value": 97.5,
                 "fired_at": "2026-01-01T00:00:00Z",
@@ -564,7 +564,103 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].severity, "critical");
         assert_eq!(alerts[0].message, "CPU too high");
-        assert_eq!(alerts[0].id, "id-1_rule_0");
+        assert_eq!(alerts[0].id, "id-1_4c0a8f0e-2b1d-4f5e-9a37-6c1e2d3b4a50-1");
+    }
+
+    fn agent_alert(incident_id: &str, cpu_percent: f64) -> serde_json::Value {
+        serde_json::json!({
+            "id": incident_id,
+            "rule": {"severity": "warning"},
+            "current_value": cpu_percent,
+            "fired_at": "2026-01-01T00:00:00Z",
+            "message": format!("CPU at {cpu_percent}%")
+        })
+    }
+
+    #[tokio::test]
+    async fn poll_system_stores_one_alert_record_per_incident() {
+        const RUN: &str = "4c0a8f0e-2b1d-4f5e-9a37-6c1e2d3b4a50";
+        let (state, _dir) = temp_state();
+        let active = Arc::new(std::sync::Mutex::new(serde_json::json!([])));
+        let served = active.clone();
+        let app = Router::new()
+            .route("/api/system", get(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/api/alerts",
+                get(move || {
+                    let v = served.lock().unwrap().clone();
+                    async move { Json(serde_json::json!({ "active": v })) }
+                }),
+            );
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        // (name, (incident sequence, cpu) served by the agent, sequence to acknowledge after
+        //  the poll, expected (sequence, acknowledged, cpu, message) per record, by sequence).
+        // Each row runs against the records the previous rows left behind.
+        type Served = &'static [(u64, f64)];
+        type Records = &'static [(u64, bool, f32, &'static str)];
+        let cases: [(&str, Served, Option<u64>, Records); 4] = [
+            (
+                "first incident is recorded",
+                &[(1, 95.5)],
+                Some(1),
+                &[(1, true, 95.5, "CPU at 95.5%")],
+            ),
+            (
+                "the same incident on a later poll keeps its first-seen value, message and acknowledgement",
+                &[(1, 97.0)],
+                None,
+                &[(1, true, 95.5, "CPU at 95.5%")],
+            ),
+            (
+                "two incidents on one poll get a record each",
+                &[(2, 96.0), (3, 98.0)],
+                None,
+                &[
+                    (1, true, 95.5, "CPU at 95.5%"),
+                    (2, false, 96.0, "CPU at 96%"),
+                    (3, false, 98.0, "CPU at 98%"),
+                ],
+            ),
+            (
+                "an incident the agent no longer reports stays unacknowledged",
+                &[(3, 98.0)],
+                None,
+                &[
+                    (1, true, 95.5, "CPU at 95.5%"),
+                    (2, false, 96.0, "CPU at 96%"),
+                    (3, false, 98.0, "CPU at 98%"),
+                ],
+            ),
+        ];
+        let record_id = |sequence: u64| format!("id-1_{RUN}-{sequence}");
+        for (name, served, acknowledge, expected) in cases {
+            *active.lock().unwrap() = served
+                .iter()
+                .map(|&(sequence, cpu)| agent_alert(&format!("{RUN}-{sequence}"), cpu))
+                .collect();
+            poll_system(state.clone(), &system).await;
+            if let Some(sequence) = acknowledge {
+                state.db.acknowledge_alert(&record_id(sequence)).unwrap();
+            }
+            let mut records: Vec<(String, bool, f32, String)> = state
+                .db
+                .get_alerts(Some("id-1"), None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|a| (a.id, a.acknowledged, a.current_value, a.message))
+                .collect();
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+            let expected: Vec<(String, bool, f32, String)> = expected
+                .iter()
+                .map(|&(sequence, acked, cpu, message)| {
+                    (record_id(sequence), acked, cpu, message.to_string())
+                })
+                .collect();
+            assert_eq!(records, expected, "{name}");
+        }
     }
 
     #[tokio::test]

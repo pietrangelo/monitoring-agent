@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use crate::alerts::AlertManager;
+use crate::alerts::{AgentRun, AlertManager};
 use crate::models::MetricPoint;
 
 /// Maximum data points stored per metric (e.g., 1 hour at 2s intervals = 1800 points).
@@ -34,7 +34,9 @@ impl AppState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             history: RwLock::new(MetricsHistory::new()),
-            alert_manager: RwLock::new(AlertManager::with_defaults()),
+            alert_manager: RwLock::new(AlertManager::with_defaults(AgentRun::new(
+                uuid::Uuid::new_v4(),
+            ))),
         })
     }
 }
@@ -145,6 +147,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn each_app_state_starts_a_new_agent_run() {
+        // The same breach, seen by three fresh states, gets three different incident ids.
+        let disks = HashMap::new();
+        let incident_ids: Vec<Vec<String>> = (0..3)
+            .map(|_| {
+                let state = AppState::new();
+                let mut mgr = state.alert_manager.write();
+                for now in [1000, 1060] {
+                    mgr.evaluate(99.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, now);
+                }
+                mgr.active_alerts().iter().map(|a| a.id.clone()).collect()
+            })
+            .collect();
+        for (i, ids) in incident_ids.iter().enumerate() {
+            assert!(!ids.is_empty(), "state {i}: an incident is active");
+            for id in ids {
+                // A version-4 run, not merely a different one: a plain counter would repeat
+                // across restarts. This pins the version, not where the bits come from; that
+                // `AppState::new` draws them with `Uuid::new_v4` is left to review.
+                let run = id.get(..36).and_then(|run| uuid::Uuid::parse_str(run).ok());
+                assert_eq!(
+                    run.and_then(|run| run.get_version()),
+                    Some(uuid::Version::Random),
+                    "state {i}: incident id {id} starts with a random agent run"
+                );
+            }
+            for later in &incident_ids[i + 1..] {
+                assert!(
+                    ids.iter().all(|id| !later.contains(id)),
+                    "state {i}'s incident ids {ids:?} repeat in a later state {later:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn new_history_is_empty() {
         let hist = MetricsHistory::new();
         assert!(hist.cpu.is_empty());
@@ -249,6 +287,6 @@ mod tests {
         let hist = state.history.read();
         assert!(hist.cpu.is_empty());
         let mgr = state.alert_manager.read();
-        assert_eq!(mgr.rules.len(), 7);
+        assert_eq!(mgr.rules().len(), 7);
     }
 }

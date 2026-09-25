@@ -222,14 +222,14 @@ fn tail(
 async fn get_alerts(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mgr = s.alert_manager.read();
     Json(serde_json::json!({
-        "active": &mgr.active_alerts,
-        "rules_count": mgr.rules.len(),
+        "active": mgr.active_alerts(),
+        "rules_count": mgr.rules().len(),
     }))
 }
 
 async fn get_alert_config(State(s): State<Arc<AppState>>) -> Json<Vec<AlertRule>> {
     let mgr = s.alert_manager.read();
-    Json(mgr.rules.clone())
+    Json(mgr.rules().to_vec())
 }
 
 #[derive(Deserialize)]
@@ -242,12 +242,10 @@ async fn set_alert_config(
     Json(body): Json<AlertConfigBody>,
 ) -> Json<serde_json::Value> {
     let mut mgr = s.alert_manager.write();
-    mgr.rules = body.rules;
-    mgr.active_alerts.clear();
-    mgr.states.clear();
+    mgr.replace_rules(body.rules);
     Json(serde_json::json!({
         "status": "ok",
-        "rules_count": mgr.rules.len(),
+        "rules_count": mgr.rules().len(),
     }))
 }
 
@@ -555,6 +553,21 @@ mod tests {
     #[tokio::test]
     async fn set_alert_config_replaces_rules_and_clears_active_state() {
         let (app, state) = app();
+        let disks = std::collections::HashMap::new();
+        let breach_cpu = |now| {
+            let mut mgr = state.alert_manager.write();
+            mgr.evaluate(99.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, now);
+            mgr.active_alerts()
+                .iter()
+                .map(|a| a.id.clone())
+                .collect::<Vec<_>>()
+        };
+        breach_cpu(1000);
+        let ids_before = breach_cpu(1060);
+        assert!(
+            !ids_before.is_empty(),
+            "an incident of the default rules is active"
+        );
         let body = serde_json::json!({
             "rules": [{
                 "metric": "cpu",
@@ -579,7 +592,18 @@ mod tests {
         let json = body_json(res).await;
         assert_eq!(json["status"], "ok");
         assert_eq!(json["rules_count"], 1);
-        assert_eq!(state.alert_manager.read().rules.len(), 1);
+        assert_eq!(state.alert_manager.read().rules().len(), 1);
+        assert!(
+            state.alert_manager.read().active_alerts().is_empty(),
+            "no incident survives the replacement"
+        );
+        let ids_after = breach_cpu(1062);
+        assert_eq!(ids_after.len(), 1, "the new rule's incident is active");
+        assert!(
+            !ids_before.contains(&ids_after[0]),
+            "the new rule's incident {} reuses an id from before the replacement {ids_before:?}",
+            ids_after[0]
+        );
 
         let res = app
             .oneshot(

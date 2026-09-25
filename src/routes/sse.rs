@@ -95,7 +95,7 @@ async fn alerts_stream(
         let mgr = s.alert_manager.read();
         let payload = serde_json::json!({
             "type": "alerts",
-            "active": &mgr.active_alerts,
+            "active": mgr.active_alerts(),
         });
         Ok(Event::default()
             .data(serde_json::to_string(&payload).unwrap_or_default())

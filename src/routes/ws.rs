@@ -52,7 +52,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
 
                 let alerts = {
                     let mgr = state.alert_manager.read();
-                    mgr.active_alerts.clone()
+                    mgr.active_alerts().to_vec()
                 };
 
                 let payload = serde_json::json!({
