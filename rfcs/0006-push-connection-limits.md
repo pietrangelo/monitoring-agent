@@ -1,6 +1,6 @@
 # RFC 0006: Push Connection Limits and Fail-Closed Token
 
-- Status: Draft
+- Status: Accepted
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-25
 - Affects: `system-hub`
@@ -129,8 +129,10 @@ const _: PushSocketLimits = PushSocketLimits::PRODUCTION;
     after the handshake, so it finds out about the drop only through a send that fails after
     it. Holding the connection for the linger therefore spaces its reconnects to 30 s or more,
     where an immediate drop would let it loop as fast as the round trip allows.
-  - **Cost:** one linger holds, per authenticated connection, a task, a socket, and up to
-    `max_message` bytes of tungstenite buffers plus the kernel receive queue, for 30 s.
+  - **Cost:** one linger holds, per authenticated connection, a task and a socket for 30 s.
+    It also holds up to about `2 × max_message + max_write_buffer` (about 1.1 MiB) of
+    tungstenite buffers, plus the kernel receive queue. That's two: a message rejected at its
+    second fragment keeps the first fragment and the unread second one.
 
 ### 4. Fail-closed token, and a `main` without panics
 
@@ -192,8 +194,9 @@ enum Handshake {
     Authenticated { id: SystemId, answer: Answer },
     /// Answered with an `auth_error`; nothing was registered.
     Refused(Refusal),
-    /// The socket ended, errored or sent an oversize message before any auth message; no
-    /// answer, nothing registered.
+    /// The socket ended, errored, sent an oversize message, or sent a first message that
+    /// isn't text (binary, ping or pong) before any auth message: no answer, nothing
+    /// registered.
     Closed,
 }
 
@@ -233,7 +236,8 @@ auth)` uses the production values.
   so the hub would have to send its own pings to find out. A capped buffer is enough.
 - **A `const fn` that panics directly.** It works too, but `CLAUDE.md` prefers typed errors.
   With a `Result`, the tests are a table over the error variants.
-- **Drop an oversize connection at once.** Shipped agents would reconnect in a tight loop.
+- **Drop an oversize connection at once after auth too.** Shipped agents would reconnect in a
+  tight loop. Before auth there is no agent to protect, so it is dropped at once.
 - **Refuse pushes instead of refusing to start** on a non-UTF-8 token. It hides the mistake
   behind agent-side errors.
 - **Treat an empty token as invalid.** It breaks compose files that write `VAR=` to mean
@@ -277,7 +281,6 @@ on the diff.
     - a valid set;
     - `ZeroMessageSize`;
     - `WriteBufferNotBelowMax`, with equal and with greater write buffers;
-    - `config()` maps all four fields, for `PRODUCTION` and a custom set.
 - **Binary** (a new `system-hub/tests/` integration test running
   `env!("CARGO_BIN_EXE_system-hub")` in a temp dir, `#[cfg(unix)]`):
   - The hub is spawned with `tokio::process::Command` and `kill_on_drop(true)`, under a 10 s
@@ -303,14 +306,21 @@ on the diff.
     reading, then sends a frame, which must still be stored. It then reads the pongs, which
     must show a **gap**: at least one ping's pong is missing while a later one arrives. Only a
     capped buffer does that, because tungstenite parks one pong and replaces it with each
-    newer one. An uncapped buffer returns every pong in order. `red-test-adversary` runs the
-    test in mutation mode against today's explicit-pong loop and against an `apply` that
-    forgets the cap. Both must go red.
+    newer one. An uncapped buffer returns every pong in order.
+    - To collect the parked pong, the client keeps sending pings numbered N, N + 1, … while it
+      reads, until a pong numbered N or higher arrives. The gap is then asserted over
+      everything received.
+    - The test runs on the current-thread runtime.
+    - The effective (kernel-doubled) send and receive buffers are well below the injected
+      `max_write_buffer`, and the flood is larger than `2 × (both buffers) + max_write_buffer`.
+    - `red-test-adversary` runs it in mutation mode against today's explicit-pong loop and
+      against an `apply` that forgets the cap. Both must go red.
   - **Size limits**, with **long** deadlines, asserting the close arrives well before them:
     - a frame header declaring limit + 1 bytes, with no payload;
     - a message fragmented into frames within the limit but over it in total;
-    - a **valid auth message padded** past the limit: dropped at once (no linger), and
-      nothing is registered.
+    - a **valid auth message padded** past the limit, with an injected `oversize_linger` as
+      long as the deadlines: the close arrives well before it (no linger before auth), with
+      no `auth_error`, and nothing is registered.
   - **Linger:** after `auth_ok` and an oversize frame, the socket stays open without reading
     for the injected linger, then closes.
   - **Answer send failure** (characterisation, in mutation mode): a client that sends auth
@@ -341,8 +351,10 @@ on the diff.
   - the `HUB_PUSH_TOKEN` row (non-UTF-8 refuses to start);
   - in the push protocol section: `handshake timeout` in the `auth_error` table; the two
     deadlines (pings count); the 512 KiB limit; and what an oversize client sees. That is no
-    answer and no Close frame: before auth an immediate drop, after auth 30 s of silence, then
-    a reset.
+    answer and no Close frame: before auth an immediate drop, after auth 30 s of silence. Then
+    the connection closes, with a reset if unsent data is still queued.
+  - the `expected auth message` row: it applies to a first *text* message that isn't a valid
+    auth message. A first message that isn't text gets no answer.
 
 ## Rollout / migration notes
 
