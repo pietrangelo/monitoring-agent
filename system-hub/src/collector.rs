@@ -293,7 +293,7 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
                     let id = alert_val
                         .get("id")
                         .and_then(|v| v.as_str())
-                        .map(|s| format!("{}_{}", &system.id, s))
+                        .map(|s| format!("{}_{}", system.id, s))
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
                     let severity = alert_val
