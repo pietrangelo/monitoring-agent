@@ -23,15 +23,31 @@ mod state;
 
 use axum::Router;
 use std::net::SocketAddr;
+use std::process::ExitCode;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
 
-    let db = Arc::new(db::Database::new("system-hub.db").expect("Failed to open database"));
+    // Configuration first, so a refused start leaves nothing behind.
+    let push_auth = match push::PushAuth::from_env(std::env::var("HUB_PUSH_TOKEN")) {
+        Ok(auth) => auth,
+        Err(err) => {
+            tracing::error!("{err}; refusing to start");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let db = match db::Database::new("system-hub.db") {
+        Ok(db) => Arc::new(db),
+        Err(err) => {
+            tracing::error!("Failed to open database system-hub.db: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     tracing::info!("📁 Database initialized: system-hub.db");
 
     let app_state = state::AppState::new(db);
@@ -47,15 +63,27 @@ async fn main() {
     let app = Router::new()
         .merge(routes::api::router(app_state.clone()))
         .merge(routes::sse::router(app_state.clone()))
-        .merge(push::router(app_state.clone()))
+        .merge(push::router(app_state.clone(), push_auth))
         .nest_service("/", ServeDir::new("static"))
         .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9091));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::error!("Failed to bind {addr}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     tracing::info!("🚀 System Hub listening on http://{}", addr);
     tracing::info!("📊 Hub Dashboard: http://localhost:9091/");
     tracing::info!("📡 Push endpoint: ws://localhost:9091/api/push");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    match axum::serve(listener, app).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!("Server failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

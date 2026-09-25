@@ -31,6 +31,7 @@ use crate::models::{SystemId, SystemIdError, SystemInfo, SystemStatus};
 mod config;
 use crate::state::{AppState, LiveMetrics};
 use config::PushToken;
+pub use config::{PushAuth, PushConfig};
 
 /// Deserialized from MessagePack binary payloads sent by agents.
 #[allow(dead_code)]
@@ -129,91 +130,192 @@ fn authenticate(
     SystemId::try_from(auth.system_id).map_err(HandshakeRejection::InvalidSystemId)
 }
 
-/// What the push handler needs per connection: the shared app state and the configured
-/// push token, read once when the router is built.
+/// What the push handler needs per connection: the shared app state and the push
+/// configuration, fixed when the router is built.
 #[derive(Clone)]
 struct PushContext {
     app: Arc<AppState>,
-    push_token: Option<PushToken>,
+    config: PushConfig,
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
-    let push_token = PushToken::from_env(std::env::var("HUB_PUSH_TOKEN"));
-    if push_token.is_none() {
+/// The push router with the production deadlines and limits.
+pub fn router(state: Arc<AppState>, auth: PushAuth) -> Router {
+    if matches!(auth, PushAuth::Open) {
         tracing::warn!("HUB_PUSH_TOKEN is not set: any client may push to /api/push");
     }
-    router_with_token(state, push_token)
+    router_with_config(state, PushConfig::production(auth))
 }
 
-fn router_with_token(app: Arc<AppState>, push_token: Option<PushToken>) -> Router {
+fn router_with_config(app: Arc<AppState>, config: PushConfig) -> Router {
     Router::new()
         .route("/api/push", get(push_handler))
-        .with_state(PushContext { app, push_token })
+        .with_state(PushContext { app, config })
 }
 
 async fn push_handler(ws: WebSocketUpgrade, State(ctx): State<PushContext>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_push(socket, ctx))
+    ctx.config
+        .limits
+        .apply(ws)
+        .on_upgrade(move |socket| handle_push(socket, ctx))
+}
+
+/// Why a handshake got no `auth_ok`.
+#[derive(Debug)]
+enum Refusal {
+    /// Shape, token or system id; answered with the rejection's own message.
+    Rejected(HandshakeRejection),
+    /// No first message within the handshake deadline.
+    Timeout,
+}
+
+impl Refusal {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Rejected(rejection) => rejection.message(),
+            Self::Timeout => "handshake timeout",
+        }
+    }
+}
+
+/// How a handshake ended, so `handle_push` has one exit per case.
+enum Handshake {
+    /// Registered; `answer` says whether `auth_ok` was delivered.
+    Authenticated { id: SystemId, answer: Answer },
+    /// Answered with an `auth_error`; nothing was registered.
+    Refused(Refusal),
+    /// The socket ended, errored, sent an oversize message, or sent a first message that
+    /// isn't text: no answer, nothing registered.
+    Closed,
+}
+
+enum Answer {
+    Delivered,
+    Failed,
 }
 
 async fn handle_push(mut socket: WebSocket, ctx: PushContext) {
     tracing::info!("Push client connected");
-    let Some(system_id) = handshake(&mut socket, &ctx).await else {
-        return;
+    let (system_id, answer) = match handshake(&mut socket, &ctx).await {
+        Handshake::Authenticated { id, answer } => (id, answer),
+        Handshake::Refused(refusal) => {
+            tracing::warn!("Push handshake refused: {refusal:?}");
+            return;
+        }
+        Handshake::Closed => return,
     };
-    tracing::info!("Push client authenticated: {}", system_id.as_str());
+    tracing::info!("Push client authenticated: {:?}", system_id.as_str());
 
-    receive_frames(&mut socket, &ctx.app, &system_id).await;
+    match answer {
+        Answer::Delivered => receive_frames(&mut socket, &ctx, &system_id).await,
+        // The client never learned it was accepted; its connection ends here.
+        Answer::Failed => {}
+    }
 
     let _ = on_blocking_pool(&ctx.app, &system_id, mark_offline).await;
-    tracing::info!("Push client disconnected: {}", system_id.as_str());
+    tracing::info!("Push client disconnected: {:?}", system_id.as_str());
 }
 
-/// Answers the push handshake. Returns the authenticated system id, or `None` once the
-/// client has been refused or opened with something other than a text message.
-async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Option<SystemId> {
-    let Some(Ok(Message::Text(frame))) = socket.recv().await else {
-        return None;
-    };
-    match authenticate(&frame, ctx.push_token.as_ref()) {
-        Ok(system_id) => {
-            on_blocking_pool(&ctx.app, &system_id, register_if_new)
-                .await
-                .ok()?;
-            let _ = socket
-                .send(Message::Text(r#"{"type":"auth_ok"}"#.into()))
-                .await;
-            Some(system_id)
+/// Reads the auth message within the handshake deadline, registers the system, and answers.
+async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
+    let first = tokio::time::timeout(ctx.config.handshake_timeout, socket.recv()).await;
+    let frame = match first {
+        Err(_elapsed) => return refuse(socket, Refusal::Timeout).await,
+        Ok(Some(Ok(Message::Text(frame)))) => frame,
+        Ok(Some(Err(err))) => {
+            // Dropped at once, with no linger: there is no agent here to protect.
+            if is_oversize(&err) {
+                tracing::warn!("Push auth message over the size limit; dropping the connection");
+            }
+            return Handshake::Closed;
         }
-        Err(rejection) => {
-            tracing::warn!("Push handshake rejected: {rejection:?}");
-            let answer = serde_json::json!({"type": "auth_error", "message": rejection.message()});
-            let _ = socket.send(Message::Text(answer.to_string())).await;
+        Ok(
             None
-        }
+            | Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_))),
+        ) => return Handshake::Closed,
+    };
+    let system_id = match authenticate(&frame, ctx.config.auth.token()) {
+        Ok(system_id) => system_id,
+        Err(rejection) => return refuse(socket, Refusal::Rejected(rejection)).await,
+    };
+    if on_blocking_pool(&ctx.app, &system_id, register_if_new)
+        .await
+        .is_err()
+    {
+        return Handshake::Closed;
+    }
+    let answer = send_answer(socket, r#"{"type":"auth_ok"}"#.to_string()).await;
+    Handshake::Authenticated {
+        id: system_id,
+        answer,
     }
 }
 
-/// Ingests push frames in arrival order until the connection closes or ingestion fails.
-async fn receive_frames(socket: &mut WebSocket, app: &Arc<AppState>, system_id: &SystemId) {
-    while let Some(msg) = socket.recv().await {
+async fn refuse(socket: &mut WebSocket, refusal: Refusal) -> Handshake {
+    let answer = serde_json::json!({"type": "auth_error", "message": refusal.message()});
+    send_answer(socket, answer.to_string()).await;
+    Handshake::Refused(refusal)
+}
+
+/// Sends a handshake answer under `SEND_TIMEOUT`, so no send is awaited without a bound.
+async fn send_answer(socket: &mut WebSocket, answer: String) -> Answer {
+    match tokio::time::timeout(config::SEND_TIMEOUT, socket.send(Message::Text(answer))).await {
+        Ok(Ok(())) => Answer::Delivered,
+        Ok(Err(_)) | Err(_) => Answer::Failed,
+    }
+}
+
+/// Ingests push frames in arrival order until the connection closes, goes idle past its
+/// deadline, sends an oversize message, or ingestion fails. tungstenite answers pings on its
+/// own, so the hub never awaits a send here.
+async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &SystemId) {
+    loop {
+        let msg = match tokio::time::timeout(ctx.config.idle_timeout, socket.recv()).await {
+            Err(_elapsed) => {
+                tracing::info!(
+                    "Push client idle past its deadline: {:?}",
+                    system_id.as_str()
+                );
+                return;
+            }
+            Ok(None) => return,
+            Ok(Some(Err(err))) => {
+                if is_oversize(&err) {
+                    tracing::warn!(
+                        "Push message over the size limit from {:?}; dropping the connection \
+                         after the linger",
+                        system_id.as_str()
+                    );
+                    // Held unread, so an agent that reconnects with no backoff waits too.
+                    tokio::time::sleep(ctx.config.oversize_linger).await;
+                }
+                return;
+            }
+            Ok(Some(Ok(msg))) => msg,
+        };
         match msg {
-            Ok(Message::Binary(data)) => {
+            Message::Binary(data) => {
                 // Frames that don't decode are dropped, as documented in ARCHITECTURE.md.
                 let Ok(payload) = rmp_serde::from_slice::<PushPayload>(&data) else {
                     continue;
                 };
                 let ingest = move |app: &AppState, id: &SystemId| ingest_frame(app, id, &payload);
-                if on_blocking_pool(app, system_id, ingest).await.is_err() {
-                    break;
+                if on_blocking_pool(&ctx.app, system_id, ingest).await.is_err() {
+                    return;
                 }
             }
-            Ok(Message::Ping(data)) => {
-                let _ = socket.send(Message::Pong(data)).await;
-            }
-            Ok(Message::Close(_)) | Err(_) => break,
-            Ok(Message::Text(_) | Message::Pong(_)) => {}
+            Message::Close(_) => return,
+            Message::Text(_) | Message::Ping(_) | Message::Pong(_) => {}
         }
     }
+}
+
+/// Whether a receive error is tungstenite refusing a message over the size limit.
+fn is_oversize(err: &axum::Error) -> bool {
+    use std::error::Error as _;
+    use tokio_tungstenite::tungstenite::{Error as WsError, error::CapacityError};
+    err.source()
+        .and_then(|source| source.downcast_ref::<WsError>())
+        .is_some_and(|ws| matches!(ws, WsError::Capacity(CapacityError::MessageTooLong { .. })))
 }
 
 /// Runs one unit of synchronous SQLite work off the async runtime and waits for it, so a
@@ -226,7 +328,7 @@ async fn on_blocking_pool(
     let (app, id) = (Arc::clone(app), system_id.clone());
     let outcome = tokio::task::spawn_blocking(move || work(&app, &id)).await;
     if let Err(err) = &outcome {
-        tracing::error!("Push work for {} failed: {err}", system_id.as_str());
+        tracing::error!("Push work for {:?} failed: {err}", system_id.as_str());
     }
     outcome
 }
@@ -482,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn push_upgrade_request_without_headers_is_rejected() {
         let (state, _dir) = temp_state();
-        let res = router(state)
+        let res = router(state, PushAuth::Open)
             .oneshot(
                 Request::builder()
                     .uri("/api/push")
@@ -501,7 +603,7 @@ mod tests {
         // The full auth handshake is covered by `push_connects_authenticates_and_registers_system`
         // below, which runs a real server.
         let (state, _dir) = temp_state();
-        let res = router(state)
+        let res = router(state, PushAuth::Open)
             .oneshot(
                 Request::builder()
                     .uri("/api/push")
@@ -517,12 +619,30 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
-    /// Starts the push router on an ephemeral port with the given `HUB_PUSH_TOKEN`
-    /// value injected, so no test has to mutate the process environment.
+    /// The push auth a test hub runs with: open for `""`, else that token.
+    fn auth_for(expected_token: &str) -> PushAuth {
+        PushToken::new(expected_token.to_string()).map_or(PushAuth::Open, PushAuth::Required)
+    }
+
+    /// Starts the push router on an ephemeral port with the production deadlines and limits
+    /// and the given token injected, so no test has to mutate the process environment.
     async fn serve_push(state: Arc<AppState>, expected_token: &str) -> std::net::SocketAddr {
+        serve_push_with(state, PushConfig::production(auth_for(expected_token))).await
+    }
+
+    /// Starts the push router with an injected configuration.
+    async fn serve_push_with(state: Arc<AppState>, config: PushConfig) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        serve_push_on(listener, state, config)
+    }
+
+    fn serve_push_on(
+        listener: tokio::net::TcpListener,
+        state: Arc<AppState>,
+        config: PushConfig,
+    ) -> std::net::SocketAddr {
         let addr = listener.local_addr().unwrap();
-        let app = router_with_token(state, PushToken::new(expected_token.to_string()));
+        let app = router_with_config(state, config);
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -868,6 +988,601 @@ mod tests {
             Ok(true),
             "hub answered the ping after ingesting earlier frames"
         );
+    }
+
+    // ── RFC 0006: connection deadlines, bounded sends, size limits ──────────────────────
+
+    use config::PushSocketLimits;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// The production configuration with some values overridden.
+    fn config_with(change: impl FnOnce(&mut PushConfig)) -> PushConfig {
+        let mut config = PushConfig::production(PushAuth::Open);
+        change(&mut config);
+        config
+    }
+
+    /// Small limits that still fit an auth message and a handshake answer.
+    fn small_limits() -> PushSocketLimits {
+        PushSocketLimits::new(64 * 1024, 1024, 8 * 1024).unwrap()
+    }
+
+    fn frame_bytes(hostname: &str) -> Vec<u8> {
+        rmp_serde::to_vec(&sample_frame(hostname)).unwrap()
+    }
+
+    /// Reads until the hub closes the connection. Returns the messages seen before the close,
+    /// or `None` if the connection is still open after `within`.
+    async fn messages_until_closed(
+        ws: &mut AgentSocket,
+        within: Duration,
+    ) -> Option<Vec<WsMessage>> {
+        use futures_util::StreamExt;
+        tokio::time::timeout(within, async {
+            let mut seen = Vec::new();
+            while let Some(Ok(msg)) = ws.next().await {
+                if matches!(msg, WsMessage::Close(_)) {
+                    seen.push(msg);
+                    // Never answer it: only the hub dropping the socket counts as closed, so a
+                    // hub that waits for the peer's Close can't pass.
+                    use tokio::io::AsyncReadExt;
+                    let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws.get_mut() else {
+                        panic!("test sockets are plain TCP");
+                    };
+                    let mut buf = [0u8; 64];
+                    while let Ok(read) = tcp.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                seen.push(msg);
+            }
+            seen
+        })
+        .await
+        .ok()
+    }
+
+    /// Connects and authenticates as `system_id` on an open hub; panics unless `auth_ok`.
+    async fn connect_authenticated(addr: std::net::SocketAddr, system_id: &str) -> AgentSocket {
+        let (ws, answer) = connect_and_auth(addr, system_id, "").await;
+        assert_eq!(
+            answer,
+            Some(serde_json::json!({"type": "auth_ok"})),
+            "handshake"
+        );
+        ws
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_after_the_upgrade_is_answered_handshake_timeout() {
+        use futures_util::StreamExt;
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| c.handshake_timeout = Duration::from_millis(200));
+        let addr = serve_push_with(state, config).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/push"))
+            .await
+            .unwrap();
+
+        let answer = tokio::time::timeout(Duration::from_secs(1), ws.next()).await;
+
+        // With the late-auth test, whose auth arrives 1.5 s into a 3 s deadline, no fixed
+        // deadline passes both.
+        assert!(
+            answer.is_ok(),
+            "no answer within 1 s of a 200 ms handshake deadline"
+        );
+        let answer = match answer.unwrap() {
+            Some(Ok(WsMessage::Text(text))) => {
+                serde_json::from_str::<serde_json::Value>(&text).ok()
+            }
+            _ => None,
+        };
+        assert_eq!(
+            answer,
+            Some(serde_json::json!({"type": "auth_error", "message": "handshake timeout"}))
+        );
+        let closed = messages_until_closed(&mut ws, Duration::from_secs(3)).await;
+        assert!(
+            closed.is_some(),
+            "the connection ends after the timeout answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auth_message_that_arrives_late_but_inside_the_handshake_deadline_is_accepted() {
+        use futures_util::{SinkExt, StreamExt};
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| c.handshake_timeout = Duration::from_secs(3));
+        let addr = serve_push_with(state, config).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/push"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let auth = serde_json::json!({"type": "auth", "system_id": "sys-late", "token": ""});
+
+        ws.send(WsMessage::Text(auth.to_string())).await.unwrap();
+
+        let answer = match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                serde_json::from_str::<serde_json::Value>(&text).ok()
+            }
+            _ => None,
+        };
+        assert_eq!(answer, Some(serde_json::json!({"type": "auth_ok"})));
+    }
+
+    /// The idle deadline wraps each receive, never the whole connection: a live agent that
+    /// only pings is never cut off on a schedule. Every deadline is short and the client pings
+    /// for longer than the quiet test's 3 s window, so no fixed lifetime, multiplied idle
+    /// deadline or connection-wide handshake deadline passes both.
+    #[tokio::test]
+    async fn an_authenticated_client_that_only_pings_stays_connected_across_idle_deadlines() {
+        use futures_util::SinkExt;
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| {
+            c.handshake_timeout = Duration::from_millis(300);
+            c.idle_timeout = Duration::from_millis(300);
+            c.oversize_linger = Duration::from_millis(300);
+        });
+        let addr = serve_push_with(state.clone(), config).await;
+        let mut ws = connect_authenticated(addr, "sys-pinging").await;
+
+        for _ in 0..35 {
+            let sent = ws.send(WsMessage::Ping(Vec::new())).await;
+            assert!(
+                sent.is_ok(),
+                "the hub closed a connection that kept pinging"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ws.send(WsMessage::Binary(frame_bytes("pinging-host")))
+            .await
+            .unwrap();
+
+        // Not wait_until_hub_caught_up: the earlier pings' pongs are still unread.
+        let stored = eventually(|| {
+            state
+                .live_metrics
+                .read()
+                .unwrap()
+                .contains_key("sys-pinging")
+        })
+        .await;
+        assert!(
+            stored,
+            "the connection outlived many idle deadlines and still ingests"
+        );
+        let sys = state.db.get_system("sys-pinging").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Online);
+    }
+
+    /// Every message resets the idle deadline, not only pings: a data frame (even one that
+    /// doesn't decode) and a pong keep a connection alive too.
+    #[tokio::test]
+    async fn an_authenticated_client_that_only_sends_frames_or_pongs_stays_connected() {
+        use futures_util::SinkExt;
+        let cases = [
+            ("data frames", WsMessage::Binary(vec![0])),
+            ("pongs", WsMessage::Pong(Vec::new())),
+        ];
+        for (name, keep_alive) in cases {
+            let (state, _dir) = temp_state();
+            let config = config_with(|c| {
+                c.handshake_timeout = Duration::from_millis(300);
+                c.idle_timeout = Duration::from_millis(300);
+                c.oversize_linger = Duration::from_millis(300);
+            });
+            let addr = serve_push_with(state.clone(), config).await;
+            let mut ws = connect_authenticated(addr, "sys-alive").await;
+
+            for _ in 0..35 {
+                let sent = ws.send(keep_alive.clone()).await;
+                assert!(sent.is_ok(), "{name}: the hub closed a live connection");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            ws.send(WsMessage::Binary(frame_bytes("alive-host")))
+                .await
+                .unwrap();
+
+            let stored =
+                eventually(|| state.live_metrics.read().unwrap().contains_key("sys-alive")).await;
+            assert!(
+                stored,
+                "{name}: the connection outlived many idle deadlines"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_client_that_goes_quiet_is_disconnected_and_marked_offline() {
+        // Windows that don't overlap, so no fixed idle deadline passes both rows.
+        let cases = [
+            (
+                "short idle",
+                Duration::from_millis(300),
+                Duration::ZERO,
+                Duration::from_millis(1200),
+            ),
+            (
+                "long idle",
+                Duration::from_millis(2500),
+                Duration::from_millis(1800),
+                Duration::from_secs(3),
+            ),
+        ];
+        for (name, idle, still_open_for, then_closed_within) in cases {
+            let (state, _dir) = temp_state();
+            let config = config_with(|c| c.idle_timeout = idle);
+            let addr = serve_push_with(state.clone(), config).await;
+            let mut ws = connect_authenticated(addr, "sys-quiet").await;
+
+            if !still_open_for.is_zero() {
+                let early = messages_until_closed(&mut ws, still_open_for).await;
+                assert!(early.is_none(), "{name}: closed before the idle deadline");
+            }
+            let closed = messages_until_closed(&mut ws, then_closed_within).await;
+
+            assert!(
+                closed.is_some(),
+                "{name}: still open after the idle deadline"
+            );
+            let offline = eventually(|| {
+                state.db.get_system("sys-quiet").unwrap().unwrap().status == SystemStatus::Offline
+            })
+            .await;
+            assert!(
+                offline,
+                "{name}: an idle cut marks the system offline like any disconnect"
+            );
+        }
+    }
+
+    /// Guards the production limits: tungstenite panics after the 101 if the write buffer
+    /// isn't below its cap, and a frame of about 300 KB, well within the 512 KiB limit, must
+    /// be accepted (it would not be under bytes-for-KiB or halved limits).
+    #[tokio::test]
+    async fn a_client_on_the_production_limits_authenticates_and_has_a_large_frame_stored() {
+        use futures_util::SinkExt;
+        let (state, _dir) = temp_state();
+        let addr = serve_push_with(state.clone(), PushConfig::production(PushAuth::Open)).await;
+        let mut ws = connect_authenticated(addr, "sys-production").await;
+        // Padded with processes, which the hub doesn't store, so the frame stays cheap.
+        let mut frame = sample_frame("production-host");
+        frame.top_processes = (0..1000)
+            .map(|pid| MirroredProcess {
+                pid,
+                name: "p".repeat(290),
+                cpu_usage: 0.0,
+                memory_usage_display: "0 B".into(),
+                memory_percent: 0.0,
+            })
+            .collect();
+        let bytes = rmp_serde::to_vec(&frame).unwrap();
+        assert!(
+            bytes.len() > 256 * 1024 && bytes.len() < 512 * 1024,
+            "frame is {} bytes",
+            bytes.len()
+        );
+
+        ws.send(WsMessage::Binary(bytes)).await.unwrap();
+
+        let stored = eventually(|| {
+            state
+                .live_metrics
+                .read()
+                .unwrap()
+                .contains_key("sys-production")
+        })
+        .await;
+        assert!(stored, "a 300 KB frame is within the production limits");
+    }
+
+    /// A peer that pings but never reads must not stall the hub, and the hub must not buffer
+    /// its pongs without limit. tungstenite parks one pong once the write buffer is at its
+    /// cap and replaces it with each newer one, so a capped hub returns pongs with a gap; an
+    /// uncapped one returns every pong, in order.
+    #[tokio::test]
+    async fn a_client_that_pings_without_reading_gets_capped_pongs_and_keeps_a_usable_connection() {
+        use futures_util::{SinkExt, StreamExt};
+        const FLOOD: u64 = 20_000;
+        let (state, _dir) = temp_state();
+        // Kernel buffers (doubled by Linux) well below the injected 32 KiB cap, and a flood of
+        // 10-byte pongs far past 2 x (both buffers) + the cap.
+        let listener_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        listener_socket.set_send_buffer_size(4096).unwrap();
+        listener_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let listener = listener_socket.listen(16).unwrap();
+        let limits = PushSocketLimits::new(64 * 1024, 1024, 32 * 1024).unwrap();
+        let addr = serve_push_on(listener, state.clone(), config_with(|c| c.limits = limits));
+        let client_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        client_socket.set_recv_buffer_size(4096).unwrap();
+        let stream = client_socket.connect(addr).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/api/push"), stream)
+            .await
+            .unwrap();
+        let auth = serde_json::json!({"type": "auth", "system_id": "sys-flood", "token": ""});
+        ws.send(WsMessage::Text(auth.to_string())).await.unwrap();
+        let answer = ws.next().await;
+        assert!(
+            matches!(answer, Some(Ok(WsMessage::Text(_)))),
+            "handshake: {answer:?}"
+        );
+
+        let flooded = tokio::time::timeout(Duration::from_secs(10), async {
+            for seq in 0..FLOOD {
+                ws.send(WsMessage::Ping(seq.to_be_bytes().to_vec()))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+        assert!(
+            flooded.is_ok(),
+            "the hub stopped reading while its pongs went unread"
+        );
+
+        ws.send(WsMessage::Binary(frame_bytes("flood-host")))
+            .await
+            .unwrap();
+        let stored =
+            eventually(|| state.live_metrics.read().unwrap().contains_key("sys-flood")).await;
+        assert!(stored, "a frame after the flood is still ingested");
+
+        // Keep pinging while draining, so the hub retries its parked pong, until the pong of a
+        // drain ping arrives.
+        let mut seqs = Vec::new();
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            for next in FLOOD.. {
+                ws.send(WsMessage::Ping(next.to_be_bytes().to_vec()))
+                    .await
+                    .unwrap();
+                while let Ok(Some(Ok(msg))) =
+                    tokio::time::timeout(Duration::from_millis(20), ws.next()).await
+                {
+                    if let WsMessage::Pong(data) = msg {
+                        seqs.push(u64::from_be_bytes(data.try_into().unwrap()));
+                    }
+                }
+                if seqs.iter().any(|&seq| seq >= FLOOD) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(drained.is_ok(), "no drain pong came back");
+        let gap = seqs.windows(2).any(|pair| pair[1] > pair[0] + 1);
+        assert!(
+            gap,
+            "all {} pongs came back in order, so the hub buffered them without a cap",
+            seqs.len()
+        );
+        // The in-order run is what the cap and the kernel buffers held: at most the cap plus
+        // twice both (doubled) socket buffers, in 10-byte pongs. A larger cap shows up here.
+        let in_order = seqs
+            .iter()
+            .enumerate()
+            .take_while(|(i, seq)| **seq == *i as u64)
+            .count();
+        assert!(
+            in_order * 10 <= 32 * 1024 + 2 * (2 * 4096 + 2 * 4096),
+            "{in_order} pongs came back in order, more than a 32 KiB cap allows"
+        );
+    }
+
+    /// Writes a masked binary frame header declaring `len` payload bytes, and no payload.
+    async fn send_bare_frame_header(ws: &mut AgentSocket, len: u64) {
+        use tokio::io::AsyncWriteExt;
+        let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws.get_mut() else {
+            panic!("test sockets are plain TCP");
+        };
+        let mut header = vec![0x82, 0x80 | 127];
+        header.extend_from_slice(&len.to_be_bytes());
+        header.extend_from_slice(&[1, 2, 3, 4]);
+        tcp.write_all(&header).await.unwrap();
+        tcp.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_frame_header_over_the_limit_closes_the_connection_before_any_deadline() {
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| {
+            c.limits = small_limits();
+            c.oversize_linger = Duration::from_millis(200);
+        });
+        let addr = serve_push_with(state, config).await;
+        let mut ws = connect_authenticated(addr, "sys-header").await;
+
+        send_bare_frame_header(&mut ws, 64 * 1024 + 1).await;
+
+        let closed = messages_until_closed(&mut ws, Duration::from_secs(3)).await;
+        assert!(
+            closed.is_some(),
+            "still open, waiting for a payload the limit forbids"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_fragmented_past_the_limit_closes_the_connection_before_any_deadline() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        };
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| {
+            c.limits = small_limits();
+            c.oversize_linger = Duration::from_millis(200);
+        });
+        let addr = serve_push_with(state, config).await;
+        let mut ws = connect_authenticated(addr, "sys-fragments").await;
+
+        // Each fragment is within the 64 KiB limit; together they are over it.
+        let first = Frame::message(vec![0; 40 * 1024], OpCode::Data(Data::Binary), false);
+        // Not final: only tungstenite's per-fragment accounting can see this message.
+        let last = Frame::message(vec![0; 40 * 1024], OpCode::Data(Data::Continue), false);
+        ws.send(WsMessage::Frame(first)).await.unwrap();
+        ws.send(WsMessage::Frame(last)).await.unwrap();
+
+        let closed = messages_until_closed(&mut ws, Duration::from_secs(3)).await;
+        assert!(
+            closed.is_some(),
+            "still open after a message over the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversize_auth_message_is_dropped_at_once_without_an_answer_or_a_registration() {
+        use futures_util::SinkExt;
+        let (state, _dir) = temp_state();
+        // The linger as long as the deadlines: only an immediate drop closes within 3 s.
+        let config = config_with(|c| {
+            c.limits = small_limits();
+            c.oversize_linger = c.handshake_timeout;
+        });
+        let addr = serve_push_with(state.clone(), config).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/push"))
+            .await
+            .unwrap();
+        let padded = serde_json::json!({
+            "type": "auth",
+            "system_id": "sys-padded",
+            "token": "",
+            "pad": "a".repeat(64 * 1024),
+        });
+
+        ws.send(WsMessage::Text(padded.to_string())).await.unwrap();
+
+        let seen = messages_until_closed(&mut ws, Duration::from_secs(3)).await;
+        assert!(
+            seen.is_some(),
+            "an oversize auth message was not dropped at once"
+        );
+        assert!(
+            !seen
+                .unwrap()
+                .iter()
+                .any(|msg| matches!(msg, WsMessage::Text(_) | WsMessage::Close(_))),
+            "an oversize client gets no answer and no Close frame"
+        );
+        assert!(state.db.get_system("sys-padded").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversize_frame_after_auth_is_held_unread_for_the_linger_then_closed() {
+        use futures_util::SinkExt;
+        // Windows that don't overlap, so no fixed wait passes both rows.
+        let cases = [
+            (
+                "short linger",
+                Duration::from_millis(400),
+                Duration::from_millis(200),
+                Duration::from_millis(1200),
+            ),
+            (
+                "long linger",
+                Duration::from_millis(2500),
+                Duration::from_millis(1800),
+                Duration::from_secs(3),
+            ),
+        ];
+        for (name, linger, still_open_for, then_closed_within) in cases {
+            let (state, _dir) = temp_state();
+            let config = config_with(|c| {
+                c.limits = small_limits();
+                c.oversize_linger = linger;
+            });
+            let addr = serve_push_with(state, config).await;
+            let mut ws = connect_authenticated(addr, "sys-linger").await;
+
+            ws.send(WsMessage::Binary(vec![0; 64 * 1024 + 1]))
+                .await
+                .unwrap();
+
+            let early = messages_until_closed(&mut ws, still_open_for).await;
+            assert!(early.is_none(), "{name}: closed before the linger ended");
+            let closed = messages_until_closed(&mut ws, then_closed_within).await;
+            assert!(closed.is_some(), "{name}: still open after the linger");
+            assert!(
+                !closed
+                    .unwrap()
+                    .iter()
+                    .any(|msg| matches!(msg, WsMessage::Text(_) | WsMessage::Close(_))),
+                "{name}: an oversize client gets no answer and no Close frame"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_exactly_at_the_limit_is_accepted_and_the_connection_goes_on() {
+        use futures_util::SinkExt;
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| {
+            c.limits = small_limits();
+            c.oversize_linger = Duration::from_secs(5);
+        });
+        let addr = serve_push_with(state.clone(), config).await;
+        let mut ws = connect_authenticated(addr, "sys-at-limit").await;
+
+        // Not a valid frame, so it is dropped after decoding, but it is within the limit.
+        ws.send(WsMessage::Binary(vec![0; 64 * 1024]))
+            .await
+            .unwrap();
+        ws.send(WsMessage::Binary(frame_bytes("at-limit-host")))
+            .await
+            .unwrap();
+
+        let stored = eventually(|| {
+            state
+                .live_metrics
+                .read()
+                .unwrap()
+                .contains_key("sys-at-limit")
+        })
+        .await;
+        assert!(stored, "a message of exactly the limit was refused");
+    }
+
+    /// Characterisation: when the handshake answer itself fails, the registered system still
+    /// ends offline. Another connection holds the database exclusively, so registration
+    /// waits until after the client has reset, and the answer is written to a dead socket.
+    #[tokio::test]
+    async fn a_failed_handshake_answer_still_leaves_its_system_offline() {
+        use futures_util::SinkExt;
+        let (state, dir) = temp_state();
+        let addr = serve_push_with(state.clone(), PushConfig::production(PushAuth::Open)).await;
+        let blocker = rusqlite::Connection::open(dir.path().join("test.db")).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/push"))
+            .await
+            .unwrap();
+        let auth = serde_json::json!({"type": "auth", "system_id": "sys-reset", "token": ""});
+        ws.send(WsMessage::Text(auth.to_string())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // A zero linger makes the drop a TCP reset, without reading the answer.
+        let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws.get_ref() else {
+            panic!("test sockets are plain TCP");
+        };
+        tcp.set_zero_linger().unwrap();
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let offline = eventually(|| {
+            state
+                .db
+                .get_system("sys-reset")
+                .unwrap()
+                .is_some_and(|sys| sys.status == SystemStatus::Offline)
+        })
+        .await;
+        assert!(offline, "registered, answer failed, and marked offline");
     }
 
     /// Sends one push frame per snapshot, then closes the connection and waits until the

@@ -331,8 +331,9 @@ suite must cover.
 - **Structure:**
   - Unit tests: `#[cfg(test)] mod tests { ... }` colocated at the bottom of the file under
     test, per standard Rust convention.
-  - Integration tests: `tests/` directory at each crate root (create it — it doesn't exist
-    yet) for anything that needs a running `Router`/`axum::serve` or a temp SQLite file. Use
+  - Integration tests: `tests/` directory at each crate root (the hub has one, for tests that
+    run the real binary; create the agent's when needed) for anything that needs a running
+    `Router`/`axum::serve`, a temp SQLite file, or the binary itself. Use
     `axum::body::Body` + `tower::ServiceExt::oneshot` to test routes without binding a real
     socket; use `tempfile` (already a dev-dependency) for `db.rs` tests instead of touching the
     real `system-hub.db`.

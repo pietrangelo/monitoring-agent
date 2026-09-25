@@ -98,7 +98,7 @@ match those rules (listed under Open architectural questions below).
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
-| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push.rs` (WS receiver: handshake parsing via `authenticate` / `PushToken` / `HandshakeRejection`, hub-side `PushPayload`) | turning agent output into hub metrics, alerts and status |
+| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`; `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables, `state.rs` live cache, `routes/*` | stored time series, alert history, retention |
 
 **Published contracts between contexts** (both sides must change together, and a
@@ -106,12 +106,14 @@ mixed-version fleet must keep working):
 
 - *Push handshake*: Telemetry Publishing → Ingestion. JSON text messages: the agent sends
   `{"type":"auth",…}` (hub-side `AuthMessage`), and the hub answers `auth_ok`/`auth_error`
-  (agent-side `HubMessage`).
+  (agent-side `HubMessage`). The connection carries two deadlines: the auth message within
+  10 s of the upgrade, and after that some message at least every 90 s. Pings count, and the
+  hub answers them itself; every shipped agent pings every 30 s.
 - *Push frame*: Telemetry Publishing → Ingestion. A binary MessagePack `PushPayload`,
   declared independently in `src/push.rs` and `system-hub/src/push.rs`. The agent encodes
   it with `rmp_serde::to_vec`, which is positional: structs become arrays with no field
   names, so field *order* is the contract. The hub silently drops frames that fail to
-  decode.
+  decode. A frame, like any push message, is at most 512 KiB.
 - *Poll responses*: the agent's `/api/system` and `/api/alerts` JSON → Ingestion
   (`collector.rs`). `/api/alerts` is read field by field from untyped `serde_json::Value`.
   Each active alert's `id` is its incident id, the same on every tick of the incident, and
@@ -127,7 +129,7 @@ mixed-version fleet must keep working):
 | **system** | a monitored host *as the hub knows it*: registry entry, config, status | `SystemInfo`, `systems` table |
 | **system id** | the identifier an agent presents in the push handshake; the hub uses it as the system's primary key. It is one URL path segment: non-empty, at most 255 bytes, and not `.` or `..`. The hub refuses any other id at the push handshake; rows stored before the rule may still hold one (see Open architectural questions) | `SystemId` (hub) |
 | **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
-| **system status** | the hub's view of whether a system is reachable: online / offline / unknown | `SystemStatus` |
+| **system status** | the hub's view of whether a system is reachable: online / offline / unknown. A push system is marked offline when its connection ends, and a connection ends at the latest 90 s after its last message, or 30 s after an oversize one | `SystemStatus` |
 | **snapshot** | one point-in-time reading of a host's CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
 | **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
 | **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
@@ -144,7 +146,7 @@ mixed-version fleet must keep working):
 | **retention** | how long the hub keeps metric points per system per metric | `metric_retention` table |
 | **poll** | the hub fetching a system's snapshot over HTTP on the system's interval | `collector.rs` |
 | **push** | an agent streaming snapshots to the hub over WebSocket + MessagePack | `push.rs` (both crates) |
-| **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured | `PushToken` (hub) |
+| **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured. Unset or empty leaves push open; a value that isn't UTF-8 makes the hub refuse to start | `PushToken`, `PushAuth` (hub) |
 | **push handshake** | the JSON text exchange that authenticates a push connection | `AuthMessage` (hub), `HubMessage` (agent) |
 | **push frame** | one binary, positional MessagePack snapshot message on the push connection | `PushPayload` (both crates) |
 
@@ -159,9 +161,10 @@ mixed-version fleet must keep working):
   constant-time byte loop) — only token *content* is protected, which matches standard practice
   for this kind of fixed-secret comparison.
 - **Agent → Hub (push)**: agent presents `system_id` + `token` in a JSON handshake frame before
-  any data frame is accepted. The hub reads `HUB_PUSH_TOKEN` once, when `push::router` is
-  built (`PushToken::from_env`). If it is unset, empty or not valid unicode, push auth is
-  disabled and startup logs a warning. `push::authenticate` parses the handshake into a
+  any data frame is accepted. `main` parses `HUB_PUSH_TOKEN` once, before it opens the
+  database (`PushAuth::from_env`). Unset or empty leaves push open, and startup logs a
+  warning. A value that isn't UTF-8 makes the hub refuse to start: it logs the variable's
+  name, never its value, exits non-zero, and has created no file. `push::authenticate` parses the handshake into a
   `SystemId` or a typed `HandshakeRejection`, checking the shape first, then the token
   (in constant time via `subtle::ConstantTimeEq`, as on the agent), then the id: it must be
   one URL path segment, so not empty, not longer than 255 bytes, and not `.` or `..`
@@ -172,6 +175,22 @@ mixed-version fleet must keep working):
   implements `Debug`. The id itself is self-asserted: any token holder can push as any
   system id (see Open architectural questions). See
   `rfcs/0003-hub-push-handshake-hardening.md`.
+
+  The connection is bounded (`rfcs/0006-push-connection-limits.md`):
+  - The first message must arrive within 10 s of the upgrade, or the hub answers
+    `handshake timeout`. After `auth_ok`, some message must arrive within 90 s of the last
+    one, or the connection ends and the system is marked offline. Each deadline wraps one
+    receive, never the whole connection.
+  - Messages and frames are at most 512 KiB (`PushSocketLimits`, whose `PRODUCTION` value is
+    checked at compile time). An oversize message before `auth_ok` drops the connection at
+    once. After `auth_ok` the hub logs it, holds the socket unread for 30 s, and then drops
+    it, because shipped agents reconnect with no backoff after a drop.
+  - The hub never awaits an unbounded send: tungstenite answers pings on its own, the write
+    buffer is capped at 64 KiB (a peer that never reads gets its pongs parked and replaced,
+    never an ever-growing buffer), and handshake answers are sent under a 5 s timeout.
+  - Every exit after registration, a failed `auth_ok` included, runs the one offline
+    marking. Log lines name a system id in `Debug` form, so a self-asserted id can't forge
+    log lines.
 - **Hub → Agent (poll)**: hub sends the per-system token stored in `db.rs` (as configured via
   `POST/PUT /api/systems`) as the agent's expected auth token.
 - **Client → Hub**: no auth on the hub's own REST/SSE API in the current implementation — the
@@ -238,11 +257,19 @@ to warrant one).
   tests instead: `axum::serve` bound to an ephemeral `127.0.0.1:0` port inside the test, driven
   from a real client (`tokio_tungstenite::connect_async` for WS, a direct request for SSE
   headers).
-- **`system-hub`'s push receiver** (`push.rs`): the handshake is parsed by the pure
+- **`system-hub`'s push receiver** (`push/`): the handshake is parsed by the pure
   `authenticate` function, which a table-driven unit test covers without a server. The
-  real-server tests inject the push token through `router_with_token` instead of setting
-  `HUB_PUSH_TOKEN`, so they run in parallel with no `unsafe` env mutation. After closing the
-  socket they wait for the offline marking, which is ordered after every frame's ingestion.
+  real-server tests inject a `PushConfig` (token, deadlines, limits, linger) through
+  `router_with_config` instead of setting `HUB_PUSH_TOKEN`, so they run in parallel with no
+  `unsafe` env mutation and never wait for a production deadline. After closing the socket
+  they wait for the offline marking, which is ordered after every frame's ingestion. The
+  deadline and linger tests use rows whose time windows don't overlap, so no fixed duration
+  passes them; the pong test shrinks both sockets' kernel buffers so that the write-buffer
+  cap is what the returned pongs show.
+- **`system-hub/tests/`** runs the real binary (`CARGO_BIN_EXE_system-hub`) in a temp dir to
+  check startup configuration no router test can reach: a non-UTF-8 `HUB_PUSH_TOKEN` refuses
+  startup before any file is created, and an unopenable database is a logged exit, not a
+  panic.
 - Route tests drive each module's `router`, not the production app: `main.rs` assembles
   that inline (merging the routers, `ServeDir` and CORS), so no test reaches a layer added
   there.
@@ -379,12 +406,17 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   or force it offline on disconnect. Fixing this needs per-system push credentials.
 - Push auto-registration is unbounded (API4). Every handshake with an unseen system id
   inserts a permanent, enabled `systems` row, and the poller visits every enabled row every
-  30 s. There is also no cap on handshake or frame size.
+  30 s (RFC 0008). Messages are capped at 512 KiB, but what one frame costs to ingest is not
+  (RFC 0007).
 - Push-registered systems (`url: "push://"`) are also polled. reqwest rejects the scheme,
   so the poller marks them offline, and they flap between online and offline.
-- A non-UTF-8 `HUB_PUSH_TOKEN` disables push auth (fails open), like an unset one.
-- The push handshake waits for the first message with no timeout. A client that upgrades
-  and never sends anything holds a connection task open indefinitely (API4).
+- Connections that never finish their HTTP request are unbounded (API4): `axum::serve`
+  gives hyper no timer, so hyper's 30 s header-read timeout is off for every route. The fix
+  is a hyper-util server with `TokioTimer`, which touches every route.
+- The number of push connections is unbounded (API4): a client may open many and keep each
+  alive with a ping every 89 s.
+- The agent never reads after the push handshake, so the hub's automatic pongs collect in
+  its receive buffer. That's harmless now that the hub's write buffer is capped.
 - The snapshot → metric mapping (metric names `cpu`, `memory`, `swap`, `load1`, `load5`,
   `disk:<mount>`) is written twice: once in `push::metric_points` over the push DTO, and
   once in `collector.rs` over the poll DTO. It belongs in one Fleet History domain function.
@@ -396,7 +428,8 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   connect info, and behind a reverse proxy it would need a forwarded-header policy.
 - The agent doesn't treat a missing handshake answer as a failure. Its handshake check has
   no branch for it, so it enters its push loop, which returns `Ok(())` as soon as the
-  socket closes, and `main` reconnects without backoff.
+  socket closes, and `main` reconnects without backoff. After an oversize message the hub's
+  30 s linger spaces those reconnects; after other drops nothing does.
 - Ingestion reads agent alerts from untyped `serde_json::Value` inside `collector.rs` and
   discards `insert_alert` errors (`let _ =`). Parsing, domain mapping and storage are
   interleaved in one poll function.
