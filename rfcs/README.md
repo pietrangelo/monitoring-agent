@@ -34,3 +34,4 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0006](0006-push-connection-limits.md) | Push Connection Limits and Fail-Closed Token | Implemented |
 | [0007](0007-push-ingestion-cost.md) | One Snapshot Rule, One Transaction, One Serialisation | Draft |
 | [0008](0008-push-registry-limit.md) | Push Registry Limit and Push System Lifecycle | Draft |
+| [0009](0009-spring-boot-application-telemetry.md) | Spring Boot Application Telemetry | Accepted |

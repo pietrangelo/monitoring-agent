@@ -48,7 +48,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/alerts/config", get(get_alert_config))
         .route("/api/alerts/config", post(set_alert_config))
-        // Applications
+        // Host inventory
         .route("/api/packages", get(packages))
         .route("/api/services", get(services))
         .route("/api/containers", get(containers))
@@ -249,7 +249,7 @@ async fn set_alert_config(
     }))
 }
 
-// ── Applications ───────────────────────────────────────
+// ── Host inventory ─────────────────────────────────────
 
 async fn packages() -> Json<Vec<crate::models::PackageInfo>> {
     Json(collectors::packages::collect())
