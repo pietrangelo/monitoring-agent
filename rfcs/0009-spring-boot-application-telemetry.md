@@ -196,13 +196,23 @@ what the dashboard shows.
 about counter resets:
 
 ```rust
-pub struct CounterSample { value: f64, at: Instant }
-/// None on the first sample, on a counter reset (`curr < prev`), or when no time has passed.
+pub struct CounterSample { pub value: f64, pub at: Instant }
+/// None on the first sample, on a counter reset (`curr < prev`), when no time has passed or
+/// time ran backwards, and when the result isn't finite.
 pub fn rate_per_second(prev: Option<&CounterSample>, curr: &CounterSample) -> Option<f64>;
 ```
 
 `ScrapeHistory` keeps the previous samples per application and is folded by the pure
-`ScrapeHistory::advance(self, raw: RawScrape, now: Instant) -> (ScrapeHistory, ApplicationReport)`.
+`ScrapeHistory::advance(self, raw: RawScrape, now: Instant) -> (ScrapeHistory, ApplicationReport)`
+(`src/applications/report.rs`). The adapter hands each meter over as a **meter value**,
+`MeterValue<T>::{Published(T), NotPublished, Unavailable}` (`T` is `f64`, or `TimerTotals`
+for `http.server.requests`): `NotPublished` is Actuator's 404, and `Unavailable` is any other
+failure, a transport failure included. ("Meter value", not "reading": **metric readings**
+already names the host values alert rules read.) So the domain, not the adapter, applies the
+"5xx meter 404 while requests are published → 0" rule, and an unavailable meter is never
+mistaken for zero. An `Unreachable` scrape clears the baseline, so no rate is ever averaged
+across an outage; the first reachable scrape after it is the new baseline.
+`rate_per_second` also returns `None` when time ran backwards or the result isn't finite.
 An application restart is a reset for **every** counter of that application. It is detected
 either by `uptime_seconds` going down, which catches a restart whose new count already
 passed the old one, or by any counter going down. A reset or a missing meter starts a new
@@ -211,9 +221,28 @@ baseline and produces no rate that round.
 **Application health** comes from `/actuator/health`'s top-level `status`:
 
 ```rust
-pub enum ApplicationHealth { Up, Down, OutOfService, Unknown, Unreachable(ScrapeFailure) }
+pub enum ReportedHealth { Up, Down, OutOfService, Unknown }
+pub enum ApplicationHealth { Reported(ReportedHealth), Unreachable(ScrapeFailure) }
 pub enum ScrapeFailure { Connect, Timeout, Unauthorized, HttpStatus(u16), BadBody }
+
+pub enum RawScrape { Unreachable(ScrapeFailure), Reached(ReachedScrape) }
+pub struct ReachedScrape { pub health: ReportedHealth, pub version: Option<String>, pub meters: Meters, pub own_requests: u32 }
+
+/// An unreachable report holds no version and no gauges, by construction.
+pub enum ApplicationReport {
+    Unreachable(ScrapeFailure),
+    Reached { health: ReportedHealth, version: Option<ApplicationVersion>, gauges: Gauges },
+}
+/// `build.version`, cut to 64 chars; blank is `None`.
+pub struct ApplicationVersion(String);
+/// Finite values only; built only by the domain.
+pub struct Gauges(BTreeMap<ApplicationGauge, f64>);
 ```
+
+On the wire (§6, §7), `health` is `up`, `down`, `out_of_service` or `unknown` for
+`Reported(_)`, and `unreachable` for `Unreachable(_)`. Each gauge is derived by an exhaustive
+`match` over `ApplicationGauge` (`ApplicationGauge::ALL`), so a new gauge must say where it
+comes from.
 
 `UP`, `DOWN`, `OUT_OF_SERVICE` and `UNKNOWN` map to their variants; a custom status maps to
 `Unknown`. Actuator answers a `DOWN` or `OUT_OF_SERVICE` application with **503 and a normal

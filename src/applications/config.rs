@@ -308,6 +308,18 @@ impl Applications {
     pub fn interval(&self) -> ScrapeInterval {
         self.interval
     }
+
+    /// The targets, for the scrape loop to own.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "taken by the scrape loop, RFC 0009 commit 2 step 3"
+        )
+    )]
+    pub fn into_targets(self) -> Vec<ApplicationTarget> {
+        self.targets
+    }
 }
 
 /// Whether the agent scrapes applications at all.

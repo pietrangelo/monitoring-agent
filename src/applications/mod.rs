@@ -17,4 +17,25 @@
 //! Application Telemetry: the Spring Boot applications the operator asked this agent to
 //! watch, and what it saw of them (RFC 0009).
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired to the scrape loop in RFC 0009 commit 2")
+)]
+pub mod actuator;
 pub mod config;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired to the actuator adapter and scrape loop in RFC 0009 commit 2"
+    )
+)]
+pub mod report;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired to the scrape loop in RFC 0009 commit 2 step 3"
+    )
+)]
+pub mod scraper;
