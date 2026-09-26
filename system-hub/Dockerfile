@@ -30,11 +30,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --system --create-home --home-dir /app hub
 WORKDIR /app
 COPY --from=builder /app/target/release/system-hub /usr/local/bin/system-hub
-COPY static ./static
+# The dashboard lives outside /app, the data volume's mount point: a named volume is filled
+# from the image only when it is created, so a dashboard inside it would never be updated.
+COPY static /usr/share/system-hub/static
+ENV HUB_STATIC_DIR=/usr/share/system-hub/static
 RUN chown -R hub:hub /app
 
 # system-hub.db is created relative to the working directory at startup;
-# mount a volume at WORKDIR to persist it across container restarts.
+# mount a volume at WORKDIR to persist it across container restarts. Only data belongs
+# there; an older volume's leftover /app/static is ignored.
 USER hub
 EXPOSE 9091
 ENTRYPOINT ["system-hub"]

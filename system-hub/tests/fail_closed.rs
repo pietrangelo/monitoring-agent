@@ -21,6 +21,7 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -36,10 +37,21 @@ struct Run {
 /// killed if it is still running after 10 s, so a hub that starts serving fails an
 /// assertion instead of hanging the suite.
 async fn run_hub(dir: &std::path::Path, token: &OsStr) -> Run {
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_system-hub"))
+    run_hub_with(dir, &[("HUB_PUSH_TOKEN", token)]).await
+}
+
+/// Runs the hub in `dir` with `vars` set and `RUST_LOG` and `HUB_STATIC_DIR` removed, under
+/// the same 10 s limit as `run_hub`.
+async fn run_hub_with(dir: &std::path::Path, vars: &[(&str, &OsStr)]) -> Run {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_system-hub"));
+    command
         .current_dir(dir)
         .env_remove("RUST_LOG")
-        .env("HUB_PUSH_TOKEN", token)
+        .env_remove("HUB_STATIC_DIR");
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -147,6 +159,114 @@ async fn an_accepted_push_token_reaches_the_database_and_an_unopenable_one_is_a_
         assert!(
             !run.stdout.contains("leak-marker"),
             "{name}: the token leaked: {}",
+            run.stdout
+        );
+    }
+}
+
+/// A `HUB_STATIC_DIR` that names no directory would serve an empty dashboard, so it refuses
+/// startup before anything is created. One that names a directory, or a symlink to one, or
+/// none at all (unset or empty keep the default `static`, unchecked), gets as far as the
+/// database, which a directory in its place makes fail.
+#[tokio::test]
+async fn a_static_dir_that_is_not_a_directory_refuses_startup_before_touching_the_database() {
+    let outside = tempfile::tempdir().unwrap();
+    let a_file = outside.path().join("index.html");
+    std::fs::write(&a_file, "not a directory").unwrap();
+    let missing = outside.path().join("missing");
+    // A directory the hub can't look inside: its parent has no permissions at all.
+    let locked = outside.path().join("locked");
+    let behind_lock = locked.join("static");
+    std::fs::create_dir_all(&behind_lock).unwrap();
+    std::fs::set_permissions(&locked, PermissionsExt::from_mode(0o000)).unwrap();
+    // (case, HUB_STATIC_DIR, what the refusal says)
+    let cases = [
+        ("a missing path", missing.as_os_str(), "does not exist"),
+        ("a file", a_file.as_os_str(), "is not a directory"),
+        (
+            "a path the hub can't read",
+            behind_lock.as_os_str(),
+            "cannot be read",
+        ),
+    ];
+    for (name, static_dir, says) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_hub_with(dir.path(), &[("HUB_STATIC_DIR", static_dir)]).await;
+
+        assert!(run.exited, "{name}: the hub must exit instead of serving");
+        assert!(!run.success, "{name}: a refused start exits non-zero");
+        assert!(
+            run.stdout.contains("HUB_STATIC_DIR"),
+            "{name}: the refusal names the variable: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains(says),
+            "{name}: the refusal says it {says}: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stderr.contains("panicked"),
+            "{name}: the hub panicked instead of refusing: {}",
+            run.stderr
+        );
+        let created: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(
+            created.is_empty(),
+            "{name}: files were created before the configuration was checked: {created:?}"
+        );
+    }
+    // Let the temporary directory be removed.
+    std::fs::set_permissions(&locked, PermissionsExt::from_mode(0o700)).unwrap();
+}
+
+#[tokio::test]
+async fn a_directory_or_no_static_dir_at_all_gets_past_the_check() {
+    let web = tempfile::tempdir().unwrap();
+    let link_parent = tempfile::tempdir().unwrap();
+    let link = link_parent.path().join("static-link");
+    std::os::unix::fs::symlink(web.path(), &link).unwrap();
+    // (case, HUB_STATIC_DIR if set, whether the working directory has a static/ of its own)
+    let cases: [(&str, Option<&OsStr>, bool); 6] = [
+        (
+            "unset, with no static/ in the working directory",
+            None,
+            false,
+        ),
+        ("an absolute directory", Some(web.path().as_os_str()), false),
+        ("a symlink to a directory", Some(link.as_os_str()), false),
+        (
+            "a relative directory, against the working directory",
+            Some(OsStr::new("web")),
+            false,
+        ),
+        (
+            "empty, with no static/ in the working directory",
+            Some(OsStr::new("")),
+            false,
+        ),
+        (
+            "empty, with a static/ in the working directory",
+            Some(OsStr::new("")),
+            true,
+        ),
+    ];
+    for (name, static_dir, has_static) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("web")).unwrap();
+        if has_static {
+            std::fs::create_dir(dir.path().join("static")).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("system-hub.db")).unwrap();
+        let vars: Vec<(&str, &OsStr)> = static_dir
+            .map(|v| ("HUB_STATIC_DIR", v))
+            .into_iter()
+            .collect();
+        let run = run_hub_with(dir.path(), &vars).await;
+        assert!(
+            run.stdout.contains("unable to open database file")
+                && !run.stdout.contains("HUB_STATIC_DIR"),
+            "{name}: the check passed and the run reached the database: {}",
             run.stdout
         );
     }

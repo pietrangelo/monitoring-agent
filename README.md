@@ -159,7 +159,11 @@ podman compose up --build
 
 Copy `.env.example` to `.env` to override the default dev-only tokens
 (`HUB_PUSH_TOKEN`, `SYSTEM_AGENT_TOKEN`, `PUSH_INTERVAL`). The hub's SQLite file persists
-in the `hub-data` named volume across restarts.
+in the `hub-data` named volume across restarts. The hub's dashboard is part of the image, not
+the volume, so `--build` always serves the current one. Hub images built before this fix
+served the dashboard from the volume, which kept the copy from the volume's creation: rebuild
+with `--build` to get the current dashboard, including its XSS fixes. The stale
+`/app/static` left in an old volume is ignored and can be deleted.
 
 Caveat: the containerized agent reports metrics from its own container namespace, not
 the podman/docker host — fine for exercising the hub↔agent protocol, but CPU/process/
@@ -245,6 +249,7 @@ scrapes each one's Actuator every interval and serves the result on `GET /api/ap
 | Variable | Default | Description |
 |---|---|---|
 | `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning); a value that isn't valid UTF-8 makes the hub refuse to start |
+| `HUB_STATIC_DIR` | `static` | Directory the dashboard is served from. Unset or empty means `static` under the working directory, unchecked. A set value must be a directory, or the hub refuses to start. The container image sets `/usr/share/system-hub/static` |
 
 ---
 
