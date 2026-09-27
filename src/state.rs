@@ -190,13 +190,12 @@ mod tests {
     #[test]
     fn each_app_state_starts_a_new_agent_run() {
         // The same breach, seen by three fresh states, gets three different incident ids.
-        let disks = HashMap::new();
         let incident_ids: Vec<Vec<String>> = (0..3)
             .map(|_| {
                 let state = AppState::new(fixtures::receiver());
                 let mut mgr = state.alert_manager.write();
                 for now in [1000, 1060] {
-                    mgr.evaluate(99.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, now);
+                    mgr.evaluate(&crate::alerts::fixtures::cpu_at(99.0), now);
                 }
                 mgr.active_alerts().iter().map(|a| a.id.clone()).collect()
             })

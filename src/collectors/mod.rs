@@ -21,10 +21,12 @@ pub mod sampler;
 pub mod services;
 pub mod system;
 
+use crate::alerts::{Reading, Readings};
+use crate::environment::usage::{LoadAverage, Percent};
+use crate::models::SystemSnapshot;
 use crate::snapshot::{CollectedSnapshot, PRIMING, PublishedSnapshot, STALENESS_BOUND};
 use crate::state::AppState;
 use sampler::{Gather, Sampler};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::{JoinError, spawn_blocking};
@@ -187,32 +189,47 @@ fn record(state: &AppState, snapshot: &PublishedSnapshot) {
             hist.push_disk(&disk.mount_point, disk.usage_percent, now);
         }
     }
-    let disk_usages: HashMap<String, f32> = snap
-        .disks
-        .iter()
-        .map(|d| (d.mount_point.clone(), d.usage_percent))
-        .collect();
-    let new_alerts = state.alert_manager.write().evaluate(
-        snap.cpu.usage_percent,
-        snap.memory.usage_percent,
-        snap.swap.usage_percent,
-        &disk_usages,
-        snap.load_average.one as f32,
-        snap.load_average.five as f32,
-        snap.load_average.fifteen as f32,
-        snap.cpu.logical_cores,
-        now,
-    );
+    let new_alerts = state
+        .alert_manager
+        .write()
+        .evaluate(&alert_readings(snap), now);
     for alert in &new_alerts {
         tracing::warn!("🚨 ALERT: {}", alert.message);
     }
+}
+
+/// The readings the alert rules see in `snap`. Every one was measured on the snapshot's tick.
+fn alert_readings(snap: &SystemSnapshot) -> Readings {
+    let load = |value: f64| LoadAverage::new(value as f32);
+    Readings {
+        cpu: percent_reading(snap.cpu.usage_percent),
+        memory: percent_reading(snap.memory.usage_percent),
+        swap: percent_reading(snap.swap.usage_percent),
+        disk_usages: snap
+            .disks
+            .iter()
+            .map(|d| (d.mount_point.clone(), d.usage_percent))
+            .collect(),
+        load1: load(snap.load_average.one),
+        load5: load(snap.load_average.five),
+        load15: load(snap.load_average.fifteen),
+        cpu_cores: snap.cpu.logical_cores,
+    }
+}
+
+/// A measured percentage, or `Unavailable` when the snapshot's value isn't a number (a
+/// host that lists no CPU).
+fn percent_reading(value: f32) -> Reading<Percent> {
+    Percent::saturating(value).map_or(Reading::Unavailable, Reading::Measured)
 }
 
 #[cfg(test)]
 mod tests {
     use super::sampler::fakes::{FakeSource, SINCE_BOOT_CPU};
     use super::*;
+    use crate::models::DiskInfo;
     use crate::snapshot::{SnapshotSeq, fixtures};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::watch;
 
@@ -243,6 +260,77 @@ mod tests {
         let sampler = Sampler::prime(source);
         tokio::time::advance(PRIMING).await;
         sampler
+    }
+
+    #[test]
+    fn alert_readings_carry_each_snapshot_value_to_its_metric() {
+        let mut snap = fixtures::published().system;
+        snap.cpu.usage_percent = 11.5;
+        snap.memory.usage_percent = 22.5;
+        snap.swap.usage_percent = 33.5;
+        snap.load_average.one = 1.25;
+        snap.load_average.five = 150.0;
+        snap.load_average.fifteen = 3.75;
+        snap.cpu.logical_cores = 6;
+        snap.disks = [("/", 44.5), ("/data", 55.5)]
+            .map(|(mount_point, usage_percent)| DiskInfo {
+                mount_point: mount_point.into(),
+                filesystem: "fixturefs".into(),
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+                total_display: String::new(),
+                used_display: String::new(),
+                usage_percent,
+            })
+            .into();
+
+        let readings = alert_readings(&snap);
+        let percent = |v| Reading::Measured(Percent::saturating(v).expect("a number"));
+        assert_eq!(readings.cpu, percent(11.5), "cpu");
+        assert_eq!(readings.memory, percent(22.5), "memory");
+        assert_eq!(readings.swap, percent(33.5), "swap");
+        assert_eq!(readings.load1, LoadAverage::new(1.25), "load1");
+        assert_eq!(readings.load5, LoadAverage::new(150.0), "load5");
+        assert_eq!(readings.load15, LoadAverage::new(3.75), "load15");
+        assert_eq!(readings.cpu_cores, 6, "cores");
+        let disks = HashMap::from([("/".to_string(), 44.5), ("/data".to_string(), 55.5)]);
+        assert_eq!(readings.disk_usages, disks, "each mount point's usage");
+    }
+
+    #[test]
+    fn a_snapshot_percentage_becomes_a_reading() {
+        // (name, snapshot value, expected)
+        let cases = [
+            (
+                "inside the scale",
+                42.5,
+                Percent::saturating(42.5).map(Reading::Measured),
+            ),
+            (
+                "over the scale",
+                100.4,
+                Percent::saturating(100.0).map(Reading::Measured),
+            ),
+            (
+                "under the scale",
+                -5.0,
+                Percent::saturating(0.0).map(Reading::Measured),
+            ),
+            (
+                "infinite",
+                f32::INFINITY,
+                Percent::saturating(100.0).map(Reading::Measured),
+            ),
+            (
+                "not a number, as with no CPU listed",
+                f32::NAN,
+                Some(Reading::Unavailable),
+            ),
+        ];
+        for (name, value, expected) in cases {
+            assert_eq!(Some(percent_reading(value)), expected, "{name}");
+        }
     }
 
     fn secs(s: u64) -> Duration {

@@ -640,10 +640,9 @@ mod tests {
     #[tokio::test]
     async fn set_alert_config_replaces_rules_and_clears_active_state() {
         let (app, state) = app();
-        let disks = std::collections::HashMap::new();
         let breach_cpu = |now| {
             let mut mgr = state.alert_manager.write();
-            mgr.evaluate(99.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, now);
+            mgr.evaluate(&crate::alerts::fixtures::cpu_at(99.0), now);
             mgr.active_alerts()
                 .iter()
                 .map(|a| a.id.clone())
