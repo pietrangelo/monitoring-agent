@@ -32,7 +32,7 @@ use crate::environment::cgroup::{
 };
 use crate::environment::evidence::{self, ContainerMarker, CpuArchitecture};
 use crate::environment::sourcing::{CgroupRead, CgroupReadings, CpuFiles, MemoryFiles, SwapFiles};
-use crate::environment::usage::CpuCounters;
+use crate::environment::usage::{CpuCounters, StealCounters};
 
 /// The evidence under `root`, with variables looked up through `var`.
 pub fn gather_evidence(
@@ -199,12 +199,23 @@ fn limits<T>(
     levels.iter().map(|dir| limit(dir, file, parse)).collect()
 }
 
-/// Logs a source that exists but can't be read (a hardened profile, say), so its missing
-/// evidence can be told apart from an absent file, which is the common case and stays quiet.
+/// Logs a file that exists but can't be read (a hardened profile, say), so what it would have
+/// given can be told apart from an absent file, which is the common case and stays quiet.
 fn unreadable(path: &str, err: &io::Error) {
     if err.kind() != io::ErrorKind::NotFound {
-        tracing::debug!("environment evidence /{path} is unreadable: {err}");
+        tracing::debug!("/{path} is unreadable: {err}");
     }
+}
+
+/// The host kernel's steal counters from `/proc/stat` under `root`, read each tick. `None` when
+/// the file is unreadable or has no steal column: steal is then unmeasured, never a guess.
+pub fn read_steal(root: &Path) -> Option<StealCounters> {
+    const PATH: &str = "proc/stat";
+    fs::read_to_string(root.join(PATH))
+        .inspect_err(|err| unreadable(PATH, err))
+        .ok()
+        .as_deref()
+        .and_then(StealCounters::from_proc_stat)
 }
 
 #[cfg(test)]
@@ -246,6 +257,24 @@ mod tests {
 
     fn no_vars(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn steal_counters_are_read_from_proc_stat_under_the_root() {
+        const STAT: &str = "cpu  100 20 30 800 10 5 5 30 40 50\ncpu0 1 2 3 4 5 6 7 8 0 0\n";
+        let present = FakeRoot::with("steal-present", &[("proc/stat", STAT)]);
+        let expected = StealCounters::from_proc_stat(STAT);
+        assert!(expected.is_some(), "the fixture parses");
+        assert_eq!(read_steal(&present.0), expected, "present");
+
+        let no_steal = FakeRoot::with("steal-old-kernel", &[("proc/stat", "cpu  1 2 3 4 5 6 7\n")]);
+        assert_eq!(read_steal(&no_steal.0), None, "no steal column");
+
+        let missing = FakeRoot::with("steal-missing", &[]);
+        assert_eq!(read_steal(&missing.0), None, "no /proc/stat");
+
+        let unreadable = FakeRoot::with("steal-unreadable", &[("proc/stat/x", "")]);
+        assert_eq!(read_steal(&unreadable.0), None, "a directory, not a file");
     }
 
     const VM_CPUINFO: &str = "processor\t: 0\nflags\t\t: fpu vme hypervisor\n";

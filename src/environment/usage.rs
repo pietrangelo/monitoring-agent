@@ -76,9 +76,147 @@ pub fn cpu_usage(prev: &CpuCounters, cur: &CpuCounters, capacity: CpuCount) -> O
     Percent::saturating((share * 100.0) as f32)
 }
 
+/// Where steal sits among `/proc/stat`'s `cpu` columns: user, nice, system, idle, iowait,
+/// irq, softirq, steal.
+const STEAL_COLUMN: usize = 7;
+
+/// The host kernel's cumulative CPU time (`/proc/stat`'s `cpu` line, in jiffies): how much of
+/// it the hypervisor stole, out of all of it. Built only from that line, so `steal` is always
+/// part of `total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StealCounters {
+    steal: u64,
+    total: u64,
+}
+
+impl StealCounters {
+    /// The counters on `/proc/stat`'s aggregate `cpu` line. `None` when there is no such
+    /// line, it has no steal column (kernels before 2.6.11), a column isn't a number, or the
+    /// total overflows. `guest` and `guest_nice` are left out: the kernel already counts them
+    /// in `user` and `nice`.
+    pub fn from_proc_stat(content: &str) -> Option<Self> {
+        let columns = content.lines().find_map(|line| line.strip_prefix("cpu "))?;
+        let user_to_steal = columns
+            .split_whitespace()
+            .take(STEAL_COLUMN + 1)
+            .map(|column| column.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        let steal = *user_to_steal.get(STEAL_COLUMN)?;
+        let total = user_to_steal
+            .iter()
+            .try_fold(0u64, |sum, &jiffies| sum.checked_add(jiffies))?;
+        Some(Self { steal, total })
+    }
+}
+
+/// The share of CPU time the hypervisor withheld between two readings (RFC 0014 §5): Δsteal
+/// over Δtotal. `None` when no time passed or a counter went backwards. On bare metal the
+/// kernel counts no steal, so it is a real 0.
+pub fn steal_share(prev: &StealCounters, cur: &StealCounters) -> Option<Percent> {
+    let stolen = cur.steal.checked_sub(prev.steal)?;
+    let elapsed = cur.total.checked_sub(prev.total).filter(|&t| t > 0)?;
+    Percent::saturating((stolen as f64 * 100.0 / elapsed as f64) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `/proc/stat` whose `cpu` line reads user, nice, system, idle, iowait, irq, softirq
+    /// and steal as given, then guest and guest_nice.
+    fn proc_stat(user_to_steal: [u64; 8]) -> String {
+        let columns = user_to_steal.map(|n| n.to_string()).join(" ");
+        format!("cpu  {columns} 40 50\ncpu0 1 2 3 4 5 6 7 8 0 0\nintr 12345\nctxt 99\n")
+    }
+
+    #[test]
+    fn steal_counters_are_read_from_the_aggregate_cpu_line() {
+        let counters = |steal, total| Some(StealCounters { steal, total });
+        // (name, content, expected)
+        let cases = [
+            (
+                "every column, guest left out of the total",
+                proc_stat([100, 20, 30, 800, 10, 5, 5, 30]),
+                counters(30, 1000),
+            ),
+            (
+                "bare metal: no steal",
+                proc_stat([100, 0, 50, 850, 0, 0, 0, 0]),
+                counters(0, 1000),
+            ),
+            (
+                "a kernel with no guest columns",
+                "cpu  1 2 3 4 5 6 7 8\n".to_owned(),
+                counters(8, 36),
+            ),
+            (
+                "a kernel with no steal column",
+                "cpu  1 2 3 4 5 6 7\ncpu0 1 2 3 4 5 6 7\n".to_owned(),
+                None,
+            ),
+            (
+                "only per-cpu lines",
+                "cpu0 1 2 3 4 5 6 7 8 0 0\n".to_owned(),
+                None,
+            ),
+            (
+                "a cpu0 line first is not the aggregate",
+                "cpu0 9 9 9 9 9 9 9 9 0 0\ncpu  1 2 3 4 5 6 7 8 0 0\n".to_owned(),
+                counters(8, 36),
+            ),
+            (
+                "a column that isn't a number",
+                "cpu  1 2 3 x 5 6 7 8 0 0\n".to_owned(),
+                None,
+            ),
+            (
+                "a negative column",
+                "cpu  1 2 3 -4 5 6 7 8 0 0\n".to_owned(),
+                None,
+            ),
+            (
+                "a total past u64",
+                format!("cpu  {} 1 0 0 0 0 0 0 0 0\n", u64::MAX),
+                None,
+            ),
+            ("empty", String::new(), None),
+        ];
+        for (name, content, expected) in cases {
+            assert_eq!(StealCounters::from_proc_stat(&content), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn steal_share_is_stolen_time_over_all_cpu_time() {
+        let at = |steal, total| StealCounters { steal, total };
+        // (name, prev, cur, expected)
+        let cases = [
+            ("a starved vm", at(100, 1_000), at(400, 2_000), Some(30.0)),
+            ("bare metal", at(0, 1_000), at(0, 3_000), Some(0.0)),
+            ("all of it stolen", at(0, 0), at(500, 500), Some(100.0)),
+            ("a sliver", at(0, 0), at(1, 1_000), Some(0.1)),
+            ("no time passed", at(50, 1_000), at(50, 1_000), None),
+            (
+                "the total went backwards",
+                at(0, 2_000),
+                at(10, 1_000),
+                None,
+            ),
+            (
+                "the steal went backwards",
+                at(90, 1_000),
+                at(10, 2_000),
+                None,
+            ),
+        ];
+        for (name, prev, cur, expected) in cases {
+            assert_eq!(
+                steal_share(&prev, &cur).map(Percent::get),
+                expected,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn cpu_usage_is_cpu_time_over_wall_time_times_capacity() {

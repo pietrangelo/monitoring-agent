@@ -222,6 +222,8 @@ pub mod fixtures {
         let mut system = kernel_snapshot(readings());
         // A fractional capacity, so no route can pass the core count off as it.
         system.cpu.capacity_cpus = 1.5;
+        // A steal no other field holds, so no route can pass another figure off as it.
+        system.cpu.steal_percent = Some(7.5);
         CollectedSnapshot {
             system,
             environment: ENVIRONMENT,

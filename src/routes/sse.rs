@@ -81,6 +81,7 @@ fn system_event(published: &PublishedSnapshot) -> Event {
         "cpu_percent": snap.cpu.usage_percent,
         "cpu_logical_cores": snap.cpu.logical_cores,
         "cpu_capacity_cpus": snap.cpu.capacity_cpus,
+        "cpu_steal_percent": snap.cpu.steal_percent,
         "memory_percent": snap.memory.usage_percent,
         "memory_used_display": snap.memory.used_display,
         "memory_total_display": snap.memory.total_display,
@@ -205,7 +206,12 @@ mod tests {
 
     /// The first event's JSON on `path`, at once: the streams tick immediately.
     async fn first_event(path: &str) -> serde_json::Value {
-        let state = AppState::new(crate::snapshot::fixtures::receiver());
+        first_event_of(crate::snapshot::fixtures::published(), path).await
+    }
+
+    async fn first_event_of(snapshot: PublishedSnapshot, path: &str) -> serde_json::Value {
+        let (_publisher, snapshots) = crate::snapshot::fixtures::channel(snapshot);
+        let state = AppState::new(snapshots);
         let mut events = open(state, path).await;
         next_event(&mut events, Duration::from_secs(5))
             .await
@@ -245,6 +251,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_system_stream_sends_steal_as_measured_or_null() {
+        // (name, steal, expected)
+        let cases = [
+            ("measured", Some(7.5), serde_json::json!(7.5)),
+            ("a real zero", Some(0.0), serde_json::json!(0.0)),
+            ("unmeasured", None, serde_json::Value::Null),
+        ];
+        for (name, steal, expected) in cases {
+            let mut snapshot = crate::snapshot::fixtures::published();
+            snapshot.system.cpu.steal_percent = steal;
+            let system = first_event_of(snapshot, "/api/stream/system").await;
+            assert_eq!(system.get("cpu_steal_percent"), Some(&expected), "{name}");
+        }
+    }
+
+    #[tokio::test]
     async fn streams_send_the_published_snapshot() {
         let fixture = crate::snapshot::fixtures::published();
         let system = first_event("/api/stream/system").await;
@@ -253,6 +275,10 @@ mod tests {
         assert_eq!(
             system["cpu_capacity_cpus"],
             fixture.system.cpu.capacity_cpus
+        );
+        assert_eq!(
+            system["cpu_steal_percent"],
+            serde_json::json!(fixture.system.cpu.steal_percent)
         );
         assert_eq!(
             system["memory_used_bytes"],

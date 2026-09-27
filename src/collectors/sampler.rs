@@ -28,7 +28,7 @@ use crate::environment::cgroup::MonitoredCgroup;
 use crate::environment::sourcing::{
     self, CgroupRead, GroupFailure, ReadingGroup, SourcingHistory, SourcingWarning, Warning,
 };
-use crate::environment::usage::CpuCounters;
+use crate::environment::usage::{self, CpuCounters, StealCounters};
 use crate::snapshot::{CollectedSnapshot, Priming};
 
 /// Where a sampler's readings come from. `read_at` stamps any cumulative counters it reads.
@@ -68,6 +68,8 @@ pub struct Sampler<G> {
     primed_at: Instant,
     /// The monitored cgroup's CPU counters at the last reading that had them.
     prev_cpu: Option<CpuCounters>,
+    /// The kernel's steal counters at the last reading that had them.
+    prev_steal: Option<StealCounters>,
 }
 
 /// A published reading, and the sourcing history it leaves for the next one.
@@ -86,6 +88,7 @@ impl<G: Gather> Sampler<G> {
             environment,
             primed_at: monotonic_now(),
             prev_cpu: cpu_counters(&raw),
+            prev_steal: raw.steal,
         }
     }
 
@@ -99,12 +102,13 @@ impl<G: Gather> Sampler<G> {
             .unwrap_or_default()
             .as_secs();
         let raw = self.source.gather(read_at);
-        let counters = cpu_counters(&raw);
+        let (counters, steal) = (cpu_counters(&raw), raw.steal);
         let sampled = match Priming::of(self.primed_at, read_at) {
             Priming::Done => Some(self.sampled(raw, history, read_at, collected_at)),
             Priming::Pending => None,
         };
         self.prev_cpu = counters.or(self.prev_cpu);
+        self.prev_steal = steal.or(self.prev_steal);
         sampled
     }
 
@@ -117,6 +121,10 @@ impl<G: Gather> Sampler<G> {
         collected_at: u64,
     ) -> Sampled {
         let kernel = system::kernel_readings(&raw);
+        let steal = self
+            .prev_steal
+            .zip(raw.steal)
+            .and_then(|(prev, cur)| usage::steal_share(&prev, &cur));
         // Only a container with a monitored cgroup is measured by it, whatever the source read.
         let cgroup = raw
             .cgroup
@@ -137,7 +145,7 @@ impl<G: Gather> Sampler<G> {
         let origins = sourcing.readings.origins();
         Sampled {
             snapshot: CollectedSnapshot {
-                system: system::snapshot_from(raw, &sourcing.readings, &workload),
+                system: system::snapshot_from(raw, &sourcing.readings, &workload, steal),
                 environment: self.environment.clone(),
                 origins,
                 collected_at,
@@ -210,6 +218,10 @@ pub mod fakes {
     pub struct FakeSource {
         readings: u32,
         panic_on: Option<u32>,
+        /// Whether its readings have steal counters: `steal_on`'s when they do.
+        steal: bool,
+        /// The one reading, counting the first as 1, whose `/proc/stat` fails to give steal.
+        steal_missing_on: Option<u32>,
     }
 
     impl FakeSource {
@@ -217,13 +229,31 @@ pub mod fakes {
             Self {
                 readings: 0,
                 panic_on: None,
+                steal: true,
+                steal_missing_on: None,
             }
         }
 
         pub fn panicking_on(reading: u32) -> Self {
             Self {
-                readings: 0,
                 panic_on: Some(reading),
+                ..Self::new()
+            }
+        }
+
+        /// A source whose reading `reading` alone has no steal counters.
+        pub fn steal_missing_on(reading: u32) -> Self {
+            Self {
+                steal_missing_on: Some(reading),
+                ..Self::new()
+            }
+        }
+
+        /// A source on a kernel whose `/proc/stat` has no steal column.
+        pub fn without_steal() -> Self {
+            Self {
+                steal: false,
+                ..Self::new()
             }
         }
     }
@@ -243,6 +273,21 @@ pub mod fakes {
                 pid1_cgroup: Some(CgroupPath::ROOT),
             }),
         }
+    }
+
+    /// A fake source's steal counters on reading `n`, counting the first as 1: n² × 10 jiffies
+    /// stolen of n × 1000. Not linear, so a share measured from the wrong counters shows:
+    /// 3 % from reading 1 to 2, 5 % from 2 to 3, 4 % from 1 to 3.
+    /// Meant for readings 1 to 100, where the steal stays within the total.
+    pub fn steal_on(n: u32) -> Option<StealCounters> {
+        assert!(
+            (1..=100).contains(&n),
+            "steal_on is defined for readings 1 to 100"
+        );
+        let n = u64::from(n);
+        let (steal, total) = (n * n * 10, n * 1000);
+        let idle = total - steal;
+        StealCounters::from_proc_stat(&format!("cpu  0 0 0 {idle} 0 0 0 {steal} 0 0\n"))
     }
 
     /// PID 1's start in a fake cgroup source: this long before each reading.
@@ -332,6 +377,7 @@ pub mod fakes {
                 cpus: (0..4)
                     .map(|_| crate::collectors::system::fixtures::cpu("Xeon", SINCE_BOOT_CPU, 2400))
                     .collect(),
+                steal: steal_on(n),
                 ..raw_with_cpu(SINCE_BOOT_CPU)
             }
         }
@@ -343,9 +389,15 @@ pub mod fakes {
             if self.panic_on == Some(self.readings) {
                 panic!("fake source: reading {} fails", self.readings);
             }
-            match self.readings {
+            let raw = match self.readings {
                 1 => raw_with_cpu(SINCE_BOOT_CPU),
                 n => raw_with_cpu((n - 1) as f32),
+            };
+            RawReadings {
+                steal: (self.steal && self.steal_missing_on != Some(self.readings))
+                    .then(|| steal_on(self.readings))
+                    .flatten(),
+                ..raw
             }
         }
     }
@@ -394,6 +446,11 @@ mod tests {
         );
         assert_eq!(system.cpu.capacity_cpus, 2.0);
         assert_eq!(system.cpu.logical_cores, 4, "the host's cores stay");
+        assert_eq!(
+            system.cpu.steal_percent,
+            Some(3.0),
+            "a container still reports the host kernel's steal"
+        );
         assert_eq!(
             (system.memory.total_bytes, system.memory.used_bytes),
             (1000, 500),
@@ -448,6 +505,71 @@ mod tests {
                 swap: Origin::Kernel,
             }
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_carries_the_steal_since_the_previous_reading() {
+        let steal =
+            |sampled: Option<Sampled>| sampled.and_then(|s| s.snapshot.system.cpu.steal_percent);
+        let history = SourcingHistory::new();
+
+        let mut sampler = Sampler::prime(FakeSource::new(), ExecutionEnvironment::BareMetal);
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(steal(sampler.read(&history)), Some(3.0), "from priming");
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(
+            steal(sampler.read(&history)),
+            Some(5.0),
+            "from the previous reading"
+        );
+
+        let mut sampler = Sampler::prime(FakeSource::new(), ExecutionEnvironment::BareMetal);
+        assert!(sampler.read(&history).is_none(), "too early to publish");
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(
+            steal(sampler.read(&history)),
+            Some(5.0),
+            "from the early reading's counters, not priming's (4 %)"
+        );
+
+        let mut sampler =
+            Sampler::prime(FakeSource::without_steal(), ExecutionEnvironment::BareMetal);
+        tokio::time::advance(PRIMING).await;
+        let sampled = sampler.read(&history).expect("past priming");
+        assert_eq!(
+            sampled.snapshot.system.cpu.steal_percent, None,
+            "unmeasurable"
+        );
+
+        // Reading 2 fails to give steal: it publishes none, and reading 3 is measured from
+        // the last counters there were, reading 1's (4 %), not left unmeasured.
+        let mut sampler = Sampler::prime(
+            FakeSource::steal_missing_on(2),
+            ExecutionEnvironment::BareMetal,
+        );
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(
+            steal(sampler.read(&history)),
+            None,
+            "no counters this reading"
+        );
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(
+            steal(sampler.read(&history)),
+            Some(4.0),
+            "from reading 1's counters"
+        );
+
+        // Priming itself has no steal counters: the first snapshot has nothing to measure
+        // from, never a share since boot, and the next one is measured from it.
+        let mut sampler = Sampler::prime(
+            FakeSource::steal_missing_on(1),
+            ExecutionEnvironment::BareMetal,
+        );
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(steal(sampler.read(&history)), None, "nothing primed");
+        tokio::time::advance(PRIMING).await;
+        assert_eq!(steal(sampler.read(&history)), Some(5.0), "from reading 2's");
     }
 
     #[tokio::test(start_paused = true)]

@@ -507,6 +507,7 @@ mod tests {
                 frequency_mhz: 2400,
                 // Not on the frame: its shape doesn't change (RFC 0014 §8).
                 capacity_cpus: 1.5,
+                steal_percent: Some(3.5),
                 source: ReadingSourceName::Cgroup,
             },
             memory: MemoryInfo {
