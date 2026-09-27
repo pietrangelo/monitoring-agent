@@ -17,15 +17,16 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::alerts::AlertRule;
 use crate::collectors;
 use crate::models::{HealthStatus, HistoryResponse};
-use crate::state::AppState;
+use crate::state::{AppState, StaleSnapshot};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -68,28 +69,51 @@ async fn health() -> Json<HealthStatus> {
 
 // ── System ─────────────────────────────────────────────
 
-async fn system_full() -> Json<crate::models::SystemSnapshot> {
-    Json(collectors::system::collect())
+/// While the snapshot is stale, the system routes answer 503 with no snapshot fields, so a
+/// hub's poller marks the system offline.
+impl IntoResponse for StaleSnapshot {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({ "error": "stale snapshot" });
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
 }
 
-async fn system_cpu() -> Json<crate::models::CpuInfo> {
-    Json(collectors::system::collect().cpu)
+/// `GET /api/system`: the published snapshot, and when it was read.
+#[derive(Serialize)]
+struct SystemResponse<'a> {
+    collected_at: u64,
+    #[serde(flatten)]
+    system: &'a crate::models::SystemSnapshot,
 }
 
-async fn system_memory() -> Json<serde_json::Value> {
-    let snap = collectors::system::collect();
-    Json(serde_json::json!({
-        "memory": snap.memory,
-        "swap": snap.swap,
+async fn system_full(State(s): State<Arc<AppState>>) -> Result<Response, StaleSnapshot> {
+    let snap = s.fresh_snapshot()?;
+    Ok(Json(SystemResponse {
+        collected_at: snap.collected_at,
+        system: &snap.system,
+    })
+    .into_response())
+}
+
+async fn system_cpu(State(s): State<Arc<AppState>>) -> Result<Response, StaleSnapshot> {
+    Ok(Json(&s.fresh_snapshot()?.system.cpu).into_response())
+}
+
+async fn system_memory(State(s): State<Arc<AppState>>) -> Result<Response, StaleSnapshot> {
+    let snap = s.fresh_snapshot()?;
+    Ok(Json(serde_json::json!({
+        "memory": snap.system.memory,
+        "swap": snap.system.swap,
     }))
+    .into_response())
 }
 
-async fn system_disk() -> Json<Vec<crate::models::DiskInfo>> {
-    Json(collectors::system::collect().disks)
+async fn system_disk(State(s): State<Arc<AppState>>) -> Result<Response, StaleSnapshot> {
+    Ok(Json(&s.fresh_snapshot()?.system.disks).into_response())
 }
 
-async fn system_network() -> Json<Vec<crate::models::NetworkInfo>> {
-    Json(collectors::system::collect().networks)
+async fn system_network(State(s): State<Arc<AppState>>) -> Result<Response, StaleSnapshot> {
+    Ok(Json(&s.fresh_snapshot()?.system.networks).into_response())
 }
 
 #[derive(Deserialize)]
@@ -102,10 +126,13 @@ fn default_limit() -> usize {
     20
 }
 
-async fn system_processes(Query(q): Query<ProcessQuery>) -> Json<Vec<crate::models::ProcessInfo>> {
-    let snap = collectors::system::collect();
-    let procs: Vec<_> = snap.top_processes.into_iter().take(q.limit).collect();
-    Json(procs)
+async fn system_processes(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ProcessQuery>,
+) -> Result<Response, StaleSnapshot> {
+    let snap = s.fresh_snapshot()?;
+    let procs = &snap.system.top_processes;
+    Ok(Json(&procs[..q.limit.min(procs.len())]).into_response())
 }
 
 // ── History ────────────────────────────────────────────
@@ -331,7 +358,7 @@ mod tests {
     }
 
     fn app() -> (Router, Arc<AppState>) {
-        let state = AppState::new();
+        let state = AppState::new(crate::snapshot::fixtures::receiver());
         (router(state.clone()), state)
     }
 
@@ -354,23 +381,83 @@ mod tests {
         assert!(json["timestamp"].as_str().unwrap().ends_with('Z'));
     }
 
+    /// Every system route answers from the published snapshot, never from a reading of its
+    /// own: the fixture's values can only come from there.
     #[tokio::test]
-    async fn system_full_returns_snapshot_shape() {
-        let (app, _) = app();
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/system")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let json = body_json(res).await;
-        assert!(json.get("hostname").is_some());
-        assert!(json.get("cpu").is_some());
-        assert!(json.get("memory").is_some());
+    async fn system_routes_serve_the_published_snapshot() {
+        let fixture = crate::snapshot::fixtures::published();
+        let snap = serde_json::to_value(&fixture.system).unwrap();
+        let mut whole = snap.clone();
+        whole["collected_at"] = fixture.collected_at.into();
+        let cases = [
+            ("/api/system", whole),
+            ("/api/system/cpu", snap["cpu"].clone()),
+            (
+                "/api/system/memory",
+                serde_json::json!({ "memory": snap["memory"], "swap": snap["swap"] }),
+            ),
+            ("/api/system/disk", snap["disks"].clone()),
+            ("/api/system/network", snap["networks"].clone()),
+            ("/api/system/processes", snap["top_processes"].clone()),
+        ];
+        for (uri, expected) in cases {
+            let (app, _) = app();
+            let res = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            assert_eq!(body_json(res).await, expected, "{uri}");
+        }
+    }
+
+    /// A stale snapshot takes the system routes down, and only them: alerts and history keep
+    /// answering with what they last knew.
+    #[tokio::test]
+    async fn a_stale_snapshot_is_never_served() {
+        let stale = serde_json::json!({ "error": "stale snapshot" });
+        let cases = [
+            ("/api/system", StatusCode::SERVICE_UNAVAILABLE, Some(&stale)),
+            (
+                "/api/system/cpu",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(&stale),
+            ),
+            (
+                "/api/system/memory",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(&stale),
+            ),
+            (
+                "/api/system/disk",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(&stale),
+            ),
+            (
+                "/api/system/network",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(&stale),
+            ),
+            (
+                "/api/system/processes",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(&stale),
+            ),
+            ("/api/alerts", StatusCode::OK, None),
+            ("/api/history/cpu", StatusCode::OK, None),
+        ];
+        for (uri, status, body) in cases {
+            let (_sender, snapshots) =
+                crate::snapshot::fixtures::channel(crate::snapshot::fixtures::stale());
+            let res = router(AppState::new(snapshots))
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), status, "{uri}");
+            if let Some(body) = body {
+                assert_eq!(&body_json(res).await, body, "{uri}");
+            }
+        }
     }
 
     #[tokio::test]

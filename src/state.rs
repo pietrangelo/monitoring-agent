@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use crate::alerts::{AgentRun, AlertManager};
 use crate::applications::scrape_loop::RoundReceiver;
+use crate::collectors::{SnapshotReceiver, monotonic_now};
 use crate::models::MetricPoint;
+use crate::snapshot::{PublishedSnapshot, SnapshotFreshness};
 
 /// Maximum data points stored per metric (e.g., 1 hour at 2s intervals = 1800 points).
 const MAX_HISTORY: usize = 3600;
@@ -34,29 +36,50 @@ pub struct AppState {
     /// The scrape loop's latest round: `None` when applications are off. A closed channel
     /// means the loop ended, whatever round it last held.
     pub rounds: Option<RoundReceiver>,
+    /// The background collector's latest snapshot, the only one anything serves.
+    snapshots: SnapshotReceiver,
 }
 
 impl AppState {
     /// A state with no scrape loop: applications are off.
-    pub fn new() -> Arc<Self> {
-        Self::build(None)
+    pub fn new(snapshots: SnapshotReceiver) -> Arc<Self> {
+        Self::build(snapshots, None)
     }
 
     /// A state whose applications come from the scrape loop publishing to `rounds`.
-    pub fn with_rounds(rounds: RoundReceiver) -> Arc<Self> {
-        Self::build(Some(rounds))
+    pub fn with_rounds(snapshots: SnapshotReceiver, rounds: RoundReceiver) -> Arc<Self> {
+        Self::build(snapshots, Some(rounds))
     }
 
-    fn build(rounds: Option<RoundReceiver>) -> Arc<Self> {
+    fn build(snapshots: SnapshotReceiver, rounds: Option<RoundReceiver>) -> Arc<Self> {
         let run = AgentRun::new(uuid::Uuid::new_v4());
         Arc::new(Self {
             history: RwLock::new(MetricsHistory::new()),
             alert_manager: RwLock::new(AlertManager::with_defaults(run)),
             run,
             rounds,
+            snapshots,
         })
     }
+
+    /// The latest published snapshot, whatever its age.
+    pub fn snapshot(&self) -> Arc<PublishedSnapshot> {
+        self.snapshots.borrow().clone()
+    }
+
+    /// The latest published snapshot, if it may still be served now.
+    pub fn fresh_snapshot(&self) -> Result<Arc<PublishedSnapshot>, StaleSnapshot> {
+        let snapshot = self.snapshot();
+        match snapshot.freshness(monotonic_now()) {
+            SnapshotFreshness::Fresh => Ok(snapshot),
+            SnapshotFreshness::Stale => Err(StaleSnapshot),
+        }
+    }
 }
+
+/// The latest snapshot was read too long ago to serve.
+#[derive(Debug)]
+pub struct StaleSnapshot;
 
 /// Ring buffers for each tracked metric.
 #[derive(Default)]
@@ -162,6 +185,7 @@ fn push_max(buf: &mut VecDeque<MetricPoint>, point: MetricPoint, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::fixtures;
 
     #[test]
     fn each_app_state_starts_a_new_agent_run() {
@@ -169,7 +193,7 @@ mod tests {
         let disks = HashMap::new();
         let incident_ids: Vec<Vec<String>> = (0..3)
             .map(|_| {
-                let state = AppState::new();
+                let state = AppState::new(fixtures::receiver());
                 let mut mgr = state.alert_manager.write();
                 for now in [1000, 1060] {
                     mgr.evaluate(99.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, now);
@@ -300,7 +324,7 @@ mod tests {
 
     #[test]
     fn app_state_new_has_default_alert_manager_and_empty_history() {
-        let state = AppState::new();
+        let state = AppState::new(fixtures::receiver());
         let hist = state.history.read();
         assert!(hist.cpu.is_empty());
         let mgr = state.alert_manager.read();

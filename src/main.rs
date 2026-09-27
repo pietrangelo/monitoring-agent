@@ -21,14 +21,19 @@ mod collectors;
 mod models;
 mod push;
 mod routes;
+mod snapshot;
 mod state;
 
 use applications::config::ApplicationsConfig;
 use applications::scrape_loop::scrape_loop;
 use applications::scraper::{Scraper, Timeouts};
 use axum::{Router, middleware};
+use collectors::SnapshotReceiver;
+use collectors::sampler::SysinfoSource;
+use snapshot::SnapshotSeq;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -44,6 +49,7 @@ enum StartupError {
     Config(applications::config::ApplicationsConfigError),
     Runtime(std::io::Error),
     Scraper(applications::scraper::ScraperError),
+    Collector(tokio::task::JoinError),
     Bind(SocketAddr, std::io::Error),
     Serve(std::io::Error),
 }
@@ -54,7 +60,11 @@ impl StartupError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) => 78,
-            Self::Runtime(_) | Self::Scraper(_) | Self::Bind(..) | Self::Serve(_) => 1,
+            Self::Runtime(_)
+            | Self::Scraper(_)
+            | Self::Collector(_)
+            | Self::Bind(..)
+            | Self::Serve(_) => 1,
         }
     }
 }
@@ -65,6 +75,7 @@ impl fmt::Display for StartupError {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
             Self::Runtime(err) => write!(f, "Failed to start the async runtime: {err}"),
             Self::Scraper(err) => write!(f, "Failed to start scraping applications: {err}"),
+            Self::Collector(err) => write!(f, "Failed to read the system: {err}"),
             Self::Bind(addr, err) => write!(f, "Failed to bind {addr}: {err}"),
             Self::Serve(err) => write!(f, "Server failed: {err}"),
         }
@@ -115,8 +126,20 @@ fn announce(applications: &ApplicationsConfig) {
     }
 }
 
+/// The system collector's source: sysinfo, and the files under `/` (the OS release file and,
+/// later, `/proc` and `/sys`).
+fn system_source() -> SysinfoSource {
+    SysinfoSource::new(PathBuf::from("/"))
+}
+
 async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
-    let app_state = start_applications(applications)?;
+    // The startup snapshot is read before anything can ask for one, so none ever waits.
+    let (sampler, first) = collectors::first_snapshot(system_source())
+        .await
+        .map_err(StartupError::Collector)?;
+    let (publisher, snapshots) =
+        tokio::sync::watch::channel(Arc::new(first.published(SnapshotSeq::FIRST)));
+    let app_state = start_applications(applications, snapshots.clone())?;
 
     if auth::configured_token().is_some() {
         tracing::info!("🔐 API authentication enabled (SYSTEM_AGENT_TOKEN set)");
@@ -124,11 +147,22 @@ async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
         tracing::info!("🔓 No auth token configured — API is open");
     }
 
-    let bg_state = app_state.clone();
+    let collecting = tokio::spawn(collectors::background_collector(
+        app_state.clone(),
+        publisher,
+        sampler,
+        system_source,
+    ));
+    // The collector runs for the agent's lifetime; if it ends, say so once, where operators look.
     tokio::spawn(async move {
-        collectors::background_collector(bg_state).await;
+        match collecting.await {
+            Ok(()) => tracing::error!("The system collector ended; the snapshot will go stale"),
+            Err(err) => {
+                tracing::error!("The system collector failed: {err}; the snapshot will go stale")
+            }
+        }
     });
-    spawn_push_client(app_state.rounds.clone());
+    spawn_push_client(snapshots, app_state.rounds.clone());
 
     serve(router(app_state)).await
 }
@@ -137,13 +171,14 @@ async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
 /// its rounds. With applications off, no loop runs and the state has no rounds.
 fn start_applications(
     applications: ApplicationsConfig,
+    snapshots: SnapshotReceiver,
 ) -> Result<Arc<state::AppState>, StartupError> {
     let ApplicationsConfig::On(applications) = applications else {
-        return Ok(state::AppState::new());
+        return Ok(state::AppState::new(snapshots));
     };
     let scraper = Scraper::new(Timeouts::PRODUCTION).map_err(StartupError::Scraper)?;
     let (rounds, receiver) = tokio::sync::watch::channel(None);
-    let app_state = state::AppState::with_rounds(receiver);
+    let app_state = state::AppState::with_rounds(snapshots, receiver);
     let scraping = tokio::spawn(scrape_loop(scraper, applications, app_state.run, rounds));
     // The loop runs for the agent's lifetime; if it ends, say so once, where operators look.
     tokio::spawn(async move {
@@ -157,7 +192,10 @@ fn start_applications(
 
 /// Starts the push client if `PUSH_TO` names a hub. It reconnects for the agent's lifetime,
 /// sending the scrape loop's rounds too when applications are on.
-fn spawn_push_client(rounds: Option<applications::scrape_loop::RoundReceiver>) {
+fn spawn_push_client(
+    snapshots: SnapshotReceiver,
+    rounds: Option<applications::scrape_loop::RoundReceiver>,
+) {
     let Ok(hub_url) = std::env::var("PUSH_TO") else {
         return;
     };
@@ -175,13 +213,23 @@ fn spawn_push_client(rounds: Option<applications::scrape_loop::RoundReceiver>) {
                 return;
             }
         };
-        let mut rounds = rounds;
+        let mut feed = push::PushFeed {
+            snapshots: push::SnapshotCursor::new(snapshots),
+            rounds,
+        };
         loop {
             let pushed =
-                push::run_push_client(&hub_url, &token, &system_id, interval, &mut rounds).await;
-            if let Err(e) = pushed {
-                tracing::error!("Push client error: {e}, retrying in 5s...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                push::run_push_client(&hub_url, &token, &system_id, interval, &mut feed).await;
+            match pushed {
+                Ok(()) => {}
+                Err(push::PushError::CollectorEnded) => {
+                    tracing::error!("The system collector has ended; no longer pushing");
+                    return;
+                }
+                Err(push::PushError::Connection(e)) => {
+                    tracing::error!("Push client error: {e}, retrying in 5s...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
             }
         }
     });
@@ -219,8 +267,14 @@ mod tests {
     use super::*;
     use applications::config::ApplicationsConfigError;
 
-    #[test]
-    fn only_a_refused_configuration_exits_with_ex_config() {
+    async fn panicked() -> tokio::task::JoinError {
+        tokio::spawn(async { panic!("boom") })
+            .await
+            .expect_err("the task panicked")
+    }
+
+    #[tokio::test]
+    async fn only_a_refused_configuration_exits_with_ex_config() {
         let io = || std::io::Error::other("boom");
         let addr = SocketAddr::from(([0, 0, 0, 0], 9090));
         let cases = [
@@ -233,6 +287,11 @@ mod tests {
             (
                 "no HTTP client",
                 StartupError::Scraper(applications::scraper::ScraperError::for_test()),
+                1,
+            ),
+            (
+                "a panicking first reading",
+                StartupError::Collector(panicked().await),
                 1,
             ),
             ("a busy port", StartupError::Bind(addr, io()), 1),

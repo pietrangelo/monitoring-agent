@@ -19,6 +19,26 @@ Runs on every monitored Linux host. Responsibilities:
   network, processes (`system.rs`, via `sysinfo`), installed packages (`packages.rs`, shells
   out to `dpkg`/`rpm`/`pacman`/`apk`), systemd units (`services.rs`), Docker containers
   (`containers.rs`), and listening TCP ports (`ports.rs`).
+- Reads the system in exactly one place (RFC 0014 §6). `collectors/sampler.rs::Sampler` owns
+  one long-lived `sysinfo::System`, so CPU usage is measured over the time since the previous
+  reading. Its first reading only primes it and is never published. `main` primes it, waits
+  1 s and reads the startup snapshot before the listener is bound.
+  `collectors/mod.rs::background_collector` then reads every 2 s, the first tick a full
+  period after startup, in `spawn_blocking`. It publishes each snapshot (`snapshot.rs::
+  PublishedSnapshot`: the snapshot, `collected_at`, the monotonic `read_at` and a
+  `SnapshotSeq`) on a `tokio::sync::watch` channel, then records it in history and evaluates
+  alerts on it at its `collected_at`. Every `/api/system*` route, the SSE and WS streams and
+  the push client read that channel, so request rate doesn't drive collection cost. A panic
+  in a tick rebuilds the sampler, at most once a tick. The rebuilt sampler's first publish is
+  a full period later, and its seq continues the old one's. If the collector task
+  itself ends, `main` logs it once and the push client stops.
+- Stops serving a **stale snapshot**, one read more than 30 s ago on the monotonic clock
+  (a hung read, or a sampler that keeps panicking; the collector logs a hung read once and
+  never abandons it). The `/api/system*` routes answer `503 {"error": "stale snapshot"}`, so
+  a polling hub marks the system offline. The SSE and WS streams send one `stale` event and
+  then nothing until a fresh snapshot. The push client closes its connection, and makes no
+  new handshake until a snapshot is fresh again. Alerts, history and application routes keep
+  answering with what they last held.
 - Keeps a ring-buffer history of key metrics in memory (`state.rs`, 3600 points).
 - Evaluates alert rules against live metrics (`alerts.rs`) — threshold + duration + cooldown
   model, default rules for CPU/memory/disk warning and critical. Each uninterrupted breach is
@@ -29,7 +49,11 @@ Runs on every monitored Linux host. Responsibilities:
 - Optionally authenticates inbound API requests via a shared bearer/API-key/query-param token
   (`auth.rs`, `SYSTEM_AGENT_TOKEN`). Auth is opt-in: if the env var is unset, the API is open.
 - Optionally pushes periodic snapshots to a `system-hub` instance over WebSocket, MessagePack-
-  encoded (`push/`), if `PUSH_TO`/`PUSH_TOKEN`/`PUSH_INTERVAL` are configured. When
+  encoded (`push/`), if `PUSH_TO`/`PUSH_TOKEN`/`PUSH_INTERVAL` are configured. Each push tick
+  sends the published snapshot, its frame `timestamp` being the snapshot's `collected_at`,
+  unless the hub already has that snapshot's seq (kept across reconnects). The hub is never
+  sent the same snapshot twice. Since a tick may send nothing, the client also reads the
+  connection, and ends its session as soon as the hub hangs up. When
   applications are configured, the same connection also carries each published scrape round
   as an application frame (`push/application_frame.rs`): once right after the handshake if a
   round exists and the scrape loop still runs, then on every publish. The reconnect loop keeps
@@ -142,10 +166,10 @@ match those rules (listed under Open architectural questions below).
 
 | Context | Crate | Domain core | Adapters (I/O) | Owns |
 |---|---|---|---|---|
-| **Host Telemetry** | agent | `models.rs`, `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs) | the snapshot of one host and its recent history |
+| **Host Telemetry** | agent | `models.rs`, `snapshot.rs` (`CollectedSnapshot`, `PublishedSnapshot`, `SnapshotSeq`, `Priming` / `PRIMING`, `SnapshotFreshness` / `STALENESS_BOUND`, `StreamState` / `StreamEmit`; no tokio types), `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs); `collectors/sampler.rs` (`Sampler`, `Gather`, `SysinfoSource`); `collectors/mod.rs` (`first_snapshot`, `background_collector`, `monotonic_now`, the snapshot `watch` channel: `SnapshotSender` / `SnapshotReceiver`) | the snapshot of one host and its recent history |
 | **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `AgentRun`, `IncidentId`, the per-rule `Breach` state, `AlertManager::evaluate` and `replace_rules`) | `routes/api.rs` alert endpoints, `routes/sse.rs` and `routes/ws.rs` alert streams | deciding when a metric breaches a rule, for how long, and cooldown; the identity of each alert incident |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
-| **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
+| **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `PushFeed` and `SnapshotCursor`, which sends each published snapshot once, by seq; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
 | **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`); `applications/round.rs` (`RoundId`, `RoundSequence`, `ScrapeRound`, `NamedReport`, `health_change`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version); `applications/scraper.rs` (the HTTP client: `Scraper`, `Timeouts`, the body cap); `applications/scrape_loop.rs` (`scrape_loop`, the round `watch` channel); `routes/applications.rs` (`GET /api/applications` and its JSON) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`, `ConnectionRounds` (a connection's pace and refusal count), `RefusedFrame`; `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `refused_poll`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
@@ -193,6 +217,11 @@ mixed-version fleet must keep working):
 | **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
 | **system status** | the hub's view of whether a system is reachable: online / offline / unknown. A push system is marked offline when its connection ends, and a connection ends at the latest 90 s after its last message, or 30 s after an oversize one | `SystemStatus` |
 | **snapshot** | one point-in-time reading of a host's CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
+| **collected snapshot** | a snapshot the sampler read at least 1 s after its priming reading, not yet published, with its `collected_at` (unix seconds on the agent's clock) and `read_at` (the monotonic clock) | `CollectedSnapshot` |
+| **priming reading** | a sampler's first reading, which only gives the next one an interval to measure CPU over. It is never published, since sysinfo's first CPU figure is a since-boot average. A reading becomes a collected snapshot only once priming is done | `Sampler::prime`, `Priming` |
+| **published snapshot** | the latest collected snapshot, published by the background collector with its snapshot seq. It is the only snapshot any route, stream or push frame reads | `PublishedSnapshot`, `SnapshotReceiver` |
+| **snapshot seq** | the collector's count of published snapshots, from 0 at startup. It only grows, across sampler rebuilds, and never reads the wall clock. It stays inside the agent | `SnapshotSeq` |
+| **stale snapshot** | a published snapshot read more than 30 s ago on the monotonic clock. The agent never serves one. Not *application freshness*, which is the hub's rule for scrape rounds | `SnapshotFreshness`, `STALENESS_BOUND` |
 | **raw readings** | what one collection reads from sysinfo and the OS, before the snapshot's rules (averages, percentages, the top processes) are applied. The OS description is the one field already resolved, since its `lsb_release` fallback runs only when needed. Not *metric readings* | `RawReadings` |
 | **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
 | **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
@@ -474,9 +503,8 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - `AlertManager::evaluate` takes nine positional arguments (seven metrics, `cpu_cores`,
   `now_secs`) under `#[allow(clippy::too_many_arguments)]`. It packs them into a private
   `Readings` value object at once; retiring the exception only needs `Readings` made public
-  and the one production caller (`collectors/mod.rs::background_collector`) changed. It was
-  kept because touching that caller obliges fixing its blocking `sysinfo` collection on the
-  runtime (RFC 0004).
+  and the one production caller (`collectors/mod.rs::record`) changed, which RFC 0014's
+  next step does.
 - Agents older than RFC 0004 still report `ongoing_rule_<index>` ids, which collide across
   incidents, so the hub drops their later incidents until they are upgraded. Hub databases
   may still hold stale `<system>_ongoing_rule_N` rows.
@@ -526,9 +554,10 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - Replacing the alert rule set ends every incident, including those of rules the new set leaves
   unchanged: they come back one duration later under new ids. Per-rule state is keyed by
   position because rules have no ids.
-- Most blocking work is not offloaded. The collectors' and push client's
-  `std::process::Command` shell-outs (`dpkg-query`, `rpm`, `pacman`, `apk`, `systemctl`,
-  `docker`, `ss`, `lsb_release`, `hostname`) run on the async runtime. The hub's synchronous
+- Most blocking work is not offloaded. The inventory collectors' `std::process::Command`
+  shell-outs (`dpkg-query`, `rpm`, `pacman`, `apk`, `systemctl`, `docker`, `ss`) run on the
+  async runtime, per request. The system reading (sysinfo, `/etc/os-release`,
+  `lsb_release`) and the push client's system id (`hostname`) run in `spawn_blocking`. The hub's synchronous
   `rusqlite` calls hold a `std::sync::Mutex` from async code everywhere except the push
   receiver, which runs registration, frame ingestion and offline marking in
   `spawn_blocking`.

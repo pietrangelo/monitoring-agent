@@ -665,6 +665,14 @@
                     document.getElementById("refreshIndicator").style.display =
                         "inline";
                 });
+                // The agent's snapshot is stale: the stream stays open and resumes with a
+                // "system" event once a fresh snapshot is read.
+                eventSource.addEventListener("stale", function () {
+                    document.getElementById("statusDot").className =
+                        "dot offline";
+                    document.getElementById("refreshIndicator").style.display =
+                        "none";
+                });
                 eventSource.addEventListener("open", function () {
                     document.getElementById("statusDot").className =
                         "dot online";
@@ -860,6 +868,8 @@
                 if (TOKEN) headers["X-API-Key"] = TOKEN;
                 try {
                     var r = await fetch(url, { headers: headers });
+                    // A stale snapshot answers 503: no data, not an error body to render.
+                    if (!r.ok) return null;
                     return await r.json();
                 } catch (_) {
                     return null;
