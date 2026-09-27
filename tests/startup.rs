@@ -15,12 +15,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Runs the real `system-agent` binary to check what no unit test can: that a malformed
-//! applications configuration refuses startup before anything starts (RFC 0009 §2).
+//! configuration refuses startup before anything starts (RFC 0009 §2, RFC 0015), and that the
+//! agent serves where `SYSTEM_AGENT_LISTEN` says.
 
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::net::TcpListener;
+use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -31,6 +34,9 @@ const EX_CONFIG: i32 = 78;
 
 /// The line `run` logs once the configuration has been accepted, before binding.
 const STARTED: &str = "No auth token configured";
+
+/// What the agent logs first once its runtime runs: a refusal must come before it.
+const FIRST_RUNTIME_LINE: &str = "execution environment";
 
 /// What the startup warning about plain-text Basic credentials says.
 const PLAINTEXT_WARNING: &str = "in plain text";
@@ -44,7 +50,7 @@ struct Run {
 
 /// Runs the agent with `vars` and nothing else in its environment until it exits,
 /// it prints a line containing `stop_at`, or 10 s pass. Then it is killed if still running.
-fn run_agent(vars: &[(&str, &str)], stop_at: Option<&str>) -> Run {
+fn run_agent(vars: &[(&str, &OsStr)], stop_at: Option<&str>) -> Run {
     let mut command = Command::new(env!("CARGO_BIN_EXE_system-agent"));
     // A clean environment, so nothing inherited from the developer's shell decides a case.
     command
@@ -134,7 +140,7 @@ fn run_with(push_to: Option<&str>, extra: &[(&str, &str)], stop_at: Option<&str>
         .filter(|(key, _)| extra.iter().all(|(k, _)| k != key))
         .collect();
     vars.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
-    let borrowed: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let borrowed: Vec<(&str, &OsStr)> = vars.iter().map(|(k, v)| (*k, OsStr::new(v))).collect();
     run_agent(&borrowed, stop_at)
 }
 
@@ -177,6 +183,21 @@ fn a_malformed_applications_config_refuses_startup_before_anything_starts() {
             names: "SPRING_BOOT_APP_ORDERS_USERNAME",
         },
         Refusal {
+            name: "a listen address that isn't one, pushing",
+            pushing: true,
+            breaking: &[("SYSTEM_AGENT_LISTEN", "leak-marker-listen:9090")],
+            names: "SYSTEM_AGENT_LISTEN",
+        },
+        Refusal {
+            name: "a listen address that isn't one, not pushing",
+            pushing: false,
+            breaking: &[
+                ("SPRING_BOOT_APPS", VALID_APPS),
+                ("SYSTEM_AGENT_LISTEN", "leak-marker-listen:9090"),
+            ],
+            names: "SYSTEM_AGENT_LISTEN",
+        },
+        Refusal {
             name: "an interval below the minimum",
             pushing: true,
             breaking: &[
@@ -217,6 +238,10 @@ fn a_malformed_applications_config_refuses_startup_before_anything_starts() {
         assert!(
             !output.contains(STARTED) && !output.contains("listening"),
             "case {name}: the agent refused before starting anything: {output}"
+        );
+        assert!(
+            !output.contains(FIRST_RUNTIME_LINE),
+            "case {name}: refused before the runtime, whose first task logs this: {output}"
         );
         assert_eq!(
             hub_connections, 0,
@@ -317,4 +342,183 @@ fn basic_credentials_over_plain_http_to_another_host_are_warned_about_at_startup
             }
         }
     }
+}
+
+/// The rest of the first line of `lines` after `marker`, up to whitespace, read until the agent
+/// logs one, it exits, or 10 s pass; else what it logged instead.
+fn logged_after(
+    lines: &mpsc::Receiver<String>,
+    child: &mut std::process::Child,
+    marker: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("the agent can be waited on") {
+            return Err(format!(
+                "exited ({status}) before logging {marker:?}: {seen}"
+            ));
+        }
+        let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) else {
+            continue;
+        };
+        if let Some((_, rest)) = line.split_once(marker) {
+            return Ok(rest.chars().take_while(|c| !c.is_whitespace()).collect());
+        }
+        seen.push_str(&line);
+        seen.push('\n');
+    }
+    Err(format!("never logged {marker:?}: {seen}"))
+}
+
+/// A port nothing listens on at `ip` right now.
+fn free_port(ip: &str) -> u16 {
+    TcpListener::bind((ip, 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port()
+}
+
+#[test]
+fn the_agent_serves_at_its_configured_listen_address() {
+    let fixed = format!("127.0.0.2:{}", free_port("127.0.0.2"));
+    // (name, SYSTEM_AGENT_LISTEN, the address it must bind (`:0` when the OS picks the port),
+    // the host the dashboard is suggested at, `None` for the bound IP)
+    let cases = [
+        (
+            "any port on loopback",
+            "127.0.0.1:0".to_owned(),
+            "127.0.0.1:0".to_owned(),
+            None,
+        ),
+        (
+            "a fixed port on another address",
+            fixed.clone(),
+            fixed,
+            None,
+        ),
+        (
+            "any port on every interface",
+            "0.0.0.0:0".to_owned(),
+            "0.0.0.0:0".to_owned(),
+            Some("localhost"),
+        ),
+        (
+            "any port on every ipv6 interface",
+            "[::]:0".to_owned(),
+            "[::]:0".to_owned(),
+            Some("localhost"),
+        ),
+    ];
+    for (name, listen, expected, suggested_host) in cases {
+        let expected: std::net::SocketAddr = expected.parse().expect("a test address");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_system-agent"))
+            .env_clear()
+            .env("SYSTEM_AGENT_LISTEN", &listen)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the agent binary starts");
+        let (lines, received) = mpsc::channel();
+        let stdout = child.stdout.take().expect("stdout is piped");
+        // Drains stdout for the agent's whole life, so a full pipe never blocks its logging.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = lines.send(line);
+            }
+        });
+
+        let listening = logged_after(&received, &mut child, "listening on http://");
+        let dashboard = logged_after(&received, &mut child, "Dashboard: ");
+        let bound: Option<std::net::SocketAddr> =
+            listening.as_ref().ok().and_then(|a| a.parse().ok());
+        let reach = bound.map(reachable);
+        let answer = reach.map(health);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(bound.is_some(), "{name}: the agent serves: {listening:?}");
+        let (bound, answer) = (bound.unwrap(), answer.unwrap_or_else(|| Err(String::new())));
+
+        assert_eq!(bound.ip(), expected.ip(), "{name}: the configured address");
+        match expected.port() {
+            0 => assert_ne!(bound.port(), 0, "{name}: the port the OS chose, not 0"),
+            port => assert_eq!(bound.port(), port, "{name}: the configured port"),
+        }
+        let host = suggested_host.map_or_else(|| bound.ip().to_string(), str::to_owned);
+        assert_eq!(
+            dashboard,
+            Ok(format!("http://{host}:{}/", bound.port())),
+            "{name}: the dashboard is suggested where it can be reached"
+        );
+        assert!(
+            answer.as_ref().is_ok_and(|a| a.starts_with("HTTP/1.1 200")),
+            "{name}: the agent answers there: {answer:?}"
+        );
+    }
+}
+
+#[test]
+fn a_listen_address_that_isnt_utf8_refuses_startup_before_anything_starts() {
+    let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    hub.set_nonblocking(true).unwrap();
+    let push_to = format!("ws://{}", hub.local_addr().unwrap());
+    let run = run_agent(
+        &[
+            ("PUSH_TO", OsStr::new(&push_to)),
+            (
+                "SYSTEM_AGENT_LISTEN",
+                OsStr::from_bytes(b"leak-marker-\xff:9090"),
+            ),
+        ],
+        None,
+    );
+    let output = &run.output;
+
+    assert_eq!(
+        run.code,
+        Some(EX_CONFIG),
+        "a refused configuration: {output}"
+    );
+    assert!(
+        output.contains("SYSTEM_AGENT_LISTEN") && output.contains("not valid UTF-8"),
+        "the refusal names the variable and the problem: {output}"
+    );
+    assert!(
+        !output.contains("leak-marker"),
+        "the value leaked: {output}"
+    );
+    assert!(
+        !output.contains(FIRST_RUNTIME_LINE) && !output.contains("listening"),
+        "refused before the runtime, never on the default address: {output}"
+    );
+    assert_eq!(connections(&hub), 0, "refused before the push client");
+}
+
+/// Where a client reaches a service bound at `bound`: an unspecified IP can't be connected
+/// to, so its family's loopback stands in.
+fn reachable(bound: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match bound.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => (Ipv4Addr::LOCALHOST, bound.port()).into(),
+        IpAddr::V6(ip) if ip.is_unspecified() => (Ipv6Addr::LOCALHOST, bound.port()).into(),
+        IpAddr::V4(_) | IpAddr::V6(_) => bound,
+    }
+}
+
+/// The raw answer to `GET /api/health` at `address`, or why there was none. Never panics, so
+/// a failing case still kills its agent.
+fn health(address: std::net::SocketAddr) -> Result<String, String> {
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|err| format!("no connection at {address}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: agent\r\nConnection: close\r\n\r\n")
+        .map_err(|err| err.to_string())?;
+    let mut answer = String::new();
+    let _ = stream.read_to_string(&mut answer);
+    Ok(answer)
 }

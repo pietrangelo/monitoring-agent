@@ -19,6 +19,7 @@ mod applications;
 mod clock;
 mod collector;
 mod db;
+mod listen;
 mod models;
 mod push;
 mod retention;
@@ -39,6 +40,7 @@ use tower_http::services::ServeDir;
 /// secret.
 enum StartupError {
     Config(push::PushAuthError),
+    Listen(listen::ListenAddressError),
     StaticDir(StaticDirError),
     Database(rusqlite::Error),
     Bind(SocketAddr, std::io::Error),
@@ -49,6 +51,7 @@ impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
+            Self::Listen(err) => write!(f, "{err}; refusing to start"),
             Self::StaticDir(err) => write!(f, "{err}; refusing to start"),
             Self::Database(err) => write!(f, "Failed to open database system-hub.db: {err}"),
             Self::Bind(addr, err) => write!(f, "Failed to bind {addr}: {err}"),
@@ -71,6 +74,8 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), StartupError> {
     // Configuration first, so a refused start leaves nothing behind.
+    let listen = listen::ListenAddress::from_env(std::env::var(listen::ListenAddress::VARIABLE))
+        .map_err(StartupError::Listen)?;
     let push_auth =
         push::PushAuth::from_env(std::env::var("HUB_PUSH_TOKEN")).map_err(StartupError::Config)?;
     let static_dir = StaticDir::from_env(std::env::var_os(StaticDir::VARIABLE))
@@ -89,13 +94,23 @@ async fn run() -> Result<(), StartupError> {
 
     let app = app(app_state, push_auth, &static_dir);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 9091));
+    serve(app, listen).await
+}
+
+/// Binds `listen`, says where the hub is reached, and serves `app` until it fails.
+async fn serve(app: Router, listen: listen::ListenAddress) -> Result<(), StartupError> {
+    let addr = listen.get();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|err| StartupError::Bind(addr, err))?;
-    tracing::info!("🚀 System Hub listening on http://{}", addr);
-    tracing::info!("📊 Hub Dashboard: http://localhost:9091/");
-    tracing::info!("📡 Push endpoint: ws://localhost:9091/api/push");
+    // The bound address, not the configured one: port 0 is only known once bound.
+    let bound = listener
+        .local_addr()
+        .map_err(|err| StartupError::Bind(addr, err))?;
+    let at = listen::reachable_at(bound);
+    tracing::info!("🚀 System Hub listening on http://{bound}");
+    tracing::info!("📊 Hub Dashboard: http://{at}/");
+    tracing::info!("📡 Push endpoint: ws://{at}/api/push");
 
     axum::serve(listener, app)
         .await
