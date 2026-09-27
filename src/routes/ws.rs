@@ -94,6 +94,7 @@ fn system_message(published: &PublishedSnapshot, state: &AppState) -> String {
         "collected_at": published.collected_at,
         "cpu_percent": snap.cpu.usage_percent,
         "cpu_logical_cores": snap.cpu.logical_cores,
+        "cpu_capacity_cpus": snap.cpu.capacity_cpus,
         "memory_percent": snap.memory.usage_percent,
         "memory_used_display": snap.memory.used_display,
         "memory_total_display": snap.memory.total_display,
@@ -187,6 +188,7 @@ mod tests {
                 assert_eq!(json["type"], "system");
                 assert_eq!(json["collected_at"], fixture.collected_at);
                 assert_eq!(json["cpu_percent"], fixture.system.cpu.usage_percent);
+                assert_eq!(json["cpu_capacity_cpus"], fixture.system.cpu.capacity_cpus);
                 assert_eq!(
                     json["top_processes"],
                     serde_json::to_value(&fixture.system.top_processes).unwrap()

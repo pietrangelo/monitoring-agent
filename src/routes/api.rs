@@ -396,6 +396,7 @@ mod tests {
             "kind": "container",
             "runtime": "podman",
             "hypervisor": null,
+            "cgroup": "unreadable",
             "load_scope": "host",
         });
         let cases = [

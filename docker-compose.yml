@@ -9,11 +9,11 @@
 # .env.example to .env and setting your own values. Never reuse these
 # defaults outside a local sandbox.
 #
-# Note on metric fidelity: system-agent collects CPU/memory/disk/process data
-# from *its own* container namespace, not the podman host — fine for
-# exercising the hub<->agent protocol locally, but don't expect host-level
-# numbers. See CLAUDE.md for why /proc or docker.sock bind-mounts aren't
-# wired in by default (expands the container's access to the host).
+# Note on metric fidelity: system-agent monitors *its container*, not the
+# podman host (RFC 0014). CPU, memory, swap and uptime come from the
+# container's cgroup, against its limits; load average, cores and disk sizes
+# stay the host's. No /proc or docker.sock bind mount is needed, and none is
+# wired in (it would expand the container's access to the host).
 
 services:
   system-hub:

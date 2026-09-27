@@ -9,47 +9,7 @@ A two-component monitoring stack for Linux servers. **System Agent** runs on eve
 
 ## Architecture
 
-```
- ┌──────────────────────────────────────────────────────────────────┐
- │                        SYSTEM HUB  :9091                         │
- │                                                                  │
- │  ┌──────────┐  ┌──────────────┐  ┌───────────┐  ┌────────────┐  │
- │  │ REST API │  │ Push Receiver│  │ Collector │  │ SQLite DB  │  │
- │  │ /api/*   │  │ WS /api/push │  │ (poller)  │  │            │  │
- │  └────┬─────┘  └──────┬───────┘  └─────┬─────┘  └─────┬──────┘  │
- │       │               │               │              │          │
- │       │         ┌─────┴─────┐   ┌─────┴─────┐  ┌─────┴─────┐    │
- │       │         │ Live      │   │ Metrics   │  │ Alerts    │    │
- │       │         │ Metrics   │   │ History   │  │ History   │    │
- │       │         │ Cache     │   │ (TS)      │  │           │    │
- │       │         └───────────┘   └───────────┘  └───────────┘    │
- │       │                                                          │
- │  ┌────┴──────────────────────────────────────────────────────┐   │
- │  │  SSE Stream  (/api/stream/summary)                        │   │
- │  │  Web Dashboard (static/index.html)                        │   │
- │  └───────────────────────────────────────────────────────────┘   │
- └──────────────────────┬──────────────────────┬────────────────────┘
-                        │                      │
-        ┌───────────────┘                      └───────────────┐
-        ▼ (HTTP poll)                           ▼ (WS push)    ▼
- ┌──────────────┐                        ┌──────────────┐
- │ SYSTEM AGENT │                        │ SYSTEM AGENT │
- │    :9090     │                        │    :9090     │
- │              │                        │              │
- │ ┌──────────┐ │                        │ ┌──────────┐ │
- │ │ REST API │ │◄── Dashboard (local)   │ │ REST API │ │
- │ │ /api/*   │ │                        │ │ /api/*   │ │
- │ ├──────────┤ │                        │ ├──────────┤ │
- │ │ Alerts   │ │                        │ │ Alerts   │ │
- │ │ Engine   │ │                        │ │ Engine   │ │
- │ ├──────────┤ │                        │ ├──────────┤ │
- │ │ SSE/WS   │ │                        │ │ SSE/WS   │ │
- │ │ Streams  │ │                        │ │ Streams  │ │
- │ └──────────┘ │                        │ ├──────────┤ │
- │              │                        │ │Push Client│─┼──▶ Hub
- └──────────────┘                        │ └──────────┘ │
-                                         └──────────────┘
-```
+![Architecture: one System Hub polls some System Agents over HTTP and receives WebSocket pushes from others; inside each agent one background collector publishes the snapshot every route, stream, alert rule and push reads](docs/images/architecture.svg)
 
 **Two connection modes** between agent and hub:
 
@@ -75,6 +35,7 @@ monitoring-agent/
     ├── main.rs                 # Server entry, startup snapshot, push client spawn
     ├── models.rs               # Data types
     ├── snapshot.rs             # The published snapshot, its seq and staleness
+    ├── environment/            # Execution environment, cgroup capacity, reading sourcing (pure)
     ├── state.rs                # Shared state (history ring buffers)
     ├── auth.rs                 # Token auth middleware
     ├── alerts.rs               # Alert engine (thresholds, cooldowns)
@@ -84,7 +45,8 @@ monitoring-agent/
     ├── applications/           # Spring Boot scraping (config, actuator, rounds, wire DTO)
     ├── collectors/
     │   ├── mod.rs              # Background collector: reads, publishes, records
-    │   ├── sampler.rs          # Long-lived sysinfo reader, never publishes its priming
+    │   ├── environment.rs      # Environment evidence and cgroup files, read under a root
+    │   ├── sampler.rs          # Long-lived sysinfo + cgroup reader, never publishes its priming
     │   ├── system.rs           # CPU, memory, disk, network, processes
     │   ├── packages.rs         # dpkg/rpm/pacman/apk
     │   ├── services.rs         # systemd units
@@ -167,11 +129,11 @@ served the dashboard from the volume, which kept the copy from the volume's crea
 with `--build` to get the current dashboard, including its XSS fixes. The stale
 `/app/static` left in an old volume is ignored and can be deleted.
 
-Caveat: the containerized agent reports metrics from its own container namespace, not
-the podman/docker host — fine for exercising the hub↔agent protocol, but CPU/process/
-package data won't match the host machine unless you bind-mount `/proc`, `/sys`, or the
-container socket in yourself (not done by default, since that widens the container's
-access to the host).
+A containerized agent monitors *its container*, not the podman/docker host (RFC 0014): with
+a readable cgroup v2 hierarchy, its CPU, memory, swap and uptime are the container's,
+measured against the container's limits (`--cpus`, `--memory`), and its process list is the
+container's. No bind mount is needed, and none widens the container's access to the host.
+Load average, core count and disk sizes stay the host's, and packages are the image's.
 
 ---
 
@@ -262,9 +224,9 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | Endpoint | Description |
 |---|---|
 | `GET /api/health` | Health check + version |
-| `GET /api/system` | Full snapshot — CPU, memory, disk, network, load, processes — plus `collected_at` (unix seconds, the agent's clock, when it was read) and `environment`: `kind` (`bare_metal` \| `virtual_machine` \| `container` \| `undetermined`), `runtime` (a container's: `docker` \| `podman` \| `kubernetes` \| `lxc` \| `systemd_nspawn`, or `null` when unnamed or not a container), `hypervisor` (a virtual machine's: `kvm` \| `qemu` \| `vmware` \| `hyperv` \| `wsl` \| `xen` \| `virtualbox` \| `amazon_ec2` \| `google_compute` \| `other`, else `null`) and `load_scope` (`host` in a container, else `environment`), classified once at startup. Every `/api/system*` route serves the background collector's latest snapshot (at most one 2 s tick old) and answers `503` with `{"error": "stale snapshot"}` when it was read more than 30 s ago |
-| `GET /api/system/cpu` | CPU model, cores, usage % |
-| `GET /api/system/memory` | RAM + swap |
+| `GET /api/system` | Full snapshot — CPU, memory, disk, network, load, processes — plus `collected_at` (unix seconds, the agent's clock, when it was read) and `environment`: `kind` (`bare_metal` \| `virtual_machine` \| `container` \| `undetermined`), `runtime` (a container's: `docker` \| `podman` \| `kubernetes` \| `lxc` \| `systemd_nspawn`, or `null` when unnamed or not a container), `hypervisor` (a virtual machine's: `kvm` \| `qemu` \| `vmware` \| `hyperv` \| `wsl` \| `xen` \| `virtualbox` \| `amazon_ec2` \| `google_compute` \| `other`, else `null`), `cgroup` (a container's: `v2` \| `unreadable`, else `null`) and `load_scope` (`host` in a container, else `environment`), classified once at startup. In a container with a readable cgroup v2 hierarchy, CPU, memory, swap and uptime are the container's, against its limits; `cpu`, `memory` and `swap` each carry a `source` (`cgroup` \| `kernel` \| `unavailable`), `cpu` its `capacity_cpus` and `memory`/`swap` their cgroup `limit` (`{"bounded": <bytes>}` \| `"unbounded"`, absent outside a container's cgroup). Load average and `logical_cores` stay the host's. Every `/api/system*` route serves the background collector's latest snapshot (at most one 2 s tick old) and answers `503` with `{"error": "stale snapshot"}` when it was read more than 30 s ago |
+| `GET /api/system/cpu` | CPU model, cores, usage %, `capacity_cpus` and `source` (as in `/api/system`) |
+| `GET /api/system/memory` | Memory and swap, each with `source` and, in a container's cgroup, `limit` (as in `/api/system`) |
 | `GET /api/system/disk` | All mounted disks |
 | `GET /api/system/network` | Interfaces, IPs, traffic |
 | `GET /api/system/processes?limit=N` | Top N processes by CPU |
@@ -274,10 +236,10 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | `POST /api/alerts/config` | Replace alert rules (JSON body) |
 | `GET /api/{packages,services,containers,ports}` | Installed packages, services, Docker, ports |
 | `GET /api/applications` | Latest scrape round of the Spring Boot applications: round id (`run`, `seq`), `interval_secs`, `scraped_at`, and per application its `name`, `health` (`up`, `down`, `out_of_service`, `unknown`, `unreachable`), `version` and `gauges`. `round`, `interval_secs` and `scraped_at` are `null` (and `applications` is `[]`) before the first round and whenever no scrape loop runs |
-| `GET /api/stream/system` | **SSE** — CPU/mem/load and `collected_at` every 2s. A stale snapshot sends one `stale` event, then nothing until a fresh one; the stream stays open |
+| `GET /api/stream/system` | **SSE** — CPU/mem/load, `cpu_capacity_cpus` and `collected_at` every 2s. A stale snapshot sends one `stale` event, then nothing until a fresh one; the stream stays open |
 | `GET /api/stream/processes` | **SSE** — Top processes every 3s; `stale` as above |
 | `GET /api/stream/alerts` | **SSE** — Active alerts every 3s |
-| `GET /api/ws/system` | **WebSocket** — Full state and `collected_at` every 2s; one `{"type": "stale"}` message while the snapshot is stale |
+| `GET /api/ws/system` | **WebSocket** — Full state, `cpu_capacity_cpus` and `collected_at` every 2s; one `{"type": "stale"}` message while the snapshot is stale |
 
 ### System Hub (port 9091)
 

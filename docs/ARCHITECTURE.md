@@ -28,11 +28,32 @@ Runs on every monitored Linux host. Responsibilities:
   a container or undetermined. Only an explicit marker makes a container. A file that can't
   be read is no evidence. The result is logged once and stamped by the sampler on every
   snapshot, and `/api/system` serves it as `environment` through a wire DTO
-  (`models.rs::EnvironmentInfo`). It doesn't change any reading yet: cgroup-sourced
-  readings are RFC 0014's next step.
+  (`models.rs::EnvironmentInfo`).
+- In a container, locates the **monitored cgroup** at startup (RFC 0014 §4):
+  `gather_cgroup_evidence` reads `/proc/self/cgroup`, the cgroup2 line of
+  `/proc/self/mountinfo`, `cgroup.type` at the mount point and `/proc/1/cgroup`, and the
+  pure `environment::cgroup::cgroup_access` picks the root of a private cgroup namespace
+  (it has `cgroup.type`) or else the agent's own cgroup, and places PID 1 inside or outside
+  it. No readable v2 hierarchy (v1 only, no cgroup2 mount, the agent outside the mounted
+  subtree) is `cgroup: "unreadable"`, and the container reports the kernel's values.
+- Measures a container against its **resource capacity** (RFC 0014 §4, §6). Each tick
+  `collectors/environment.rs::read_cgroup` reads `cpu.stat`, `memory.current`,
+  `memory.stat` and `memory.swap.current` from the monitored cgroup, and `cpu.max`,
+  `memory.max` and `memory.swap.max` from it and each visible ancestor (at most 32 levels);
+  an absent limit file is unbounded, a malformed or unreadable one fails its reading group.
+  The pure `environment::sourcing::choose_readings` then decides each **reading group**
+  (CPU, memory, swap) from the cgroup or the kernel by the group's lineage: a group read from
+  the cgroup once is never read from the kernel again, and on a failure its last values are
+  *carried* for up to 30 s, then *unavailable*. The lineage and carry live in the collector,
+  so a rebuilt sampler inherits them, and each transition is logged once. CPU is usage over
+  capacity between two readings; memory is the working set (`memory.current` −
+  `inactive_file`) over the tightest limit. Uptime is the container's PID 1's and process
+  memory % is over the memory capacity, unless PID 1 is outside the monitored cgroup (a
+  shared PID namespace). Load average and `logical_cores` stay host-wide.
 - Reads the system in exactly one place (RFC 0014 §6). `collectors/sampler.rs::Sampler` owns
   one long-lived `sysinfo::System`, so CPU usage is measured over the time since the previous
-  reading. Its first reading only primes it and is never published. `main` primes it, waits
+  reading, and the previous cgroup CPU counters. Its first reading only primes it and is
+  never published. `main` primes it, waits
   1 s and reads the startup snapshot before the listener is bound.
   `collectors/mod.rs::background_collector` then reads every 2 s, the first tick a full
   period after startup, in `spawn_blocking`. It publishes each snapshot (`snapshot.rs::
@@ -135,28 +156,7 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 
 ## Data flow
 
-```
-System Agent (:9090)                         System Hub (:9091)
-┌───────────────────────┐                    ┌───────────────────────────┐
-│ collectors/ (bg loop)  │                    │ collector/ (HTTP poll)    │
-│   → state.rs (ring     │◄──── GET ──────────│   pulls /api/system on    │
-│     buffer history)    │      /api/system    │   each system's interval  │
-│   → alerts.rs          │                    │                            │
-│                        │                    │ push/ (WS receiver)       │
-│ routes/api.rs  (REST)  │                    │   accepts agent WS conns, │
-│ routes/sse.rs  (SSE)   │                    │   auth via HUB_PUSH_TOKEN,│
-│ routes/ws.rs   (WS)    │                    │   decodes MessagePack     │
-│                        │                    │   frames                  │
-│ push/ (WS client) ─────┼──── WS + MsgPack ──►│                            │
-│   PUSH_TO/PUSH_TOKEN   │      /api/push      │ db.rs (SQLite)            │
-└───────────────────────┘                    │   systems / metrics /     │
-                                              │   alerts / metric_retention│
-                                              │                            │
-                                              │ state.rs (live cache)     │
-                                              │ routes/api.rs (REST)      │
-                                              │ routes/sse.rs (SSE)       │
-                                              └───────────────────────────┘
-```
+![Data flow: in the agent, one background collector reads the system and its cgroup off the runtime and publishes the snapshot that history, alerts, the routes and the push client read; the hub's poller reads the agent's /api/system over HTTP, the agent's push client sends MessagePack frames to the hub's push receiver, and both write the hub's live cache and SQLite store](images/data-flow.svg)
 
 | Mode | Direction | Protocol | Use case |
 |---|---|---|---|
@@ -177,7 +177,7 @@ match those rules (listed under Open architectural questions below).
 
 | Context | Crate | Domain core | Adapters (I/O) | Owns |
 |---|---|---|---|---|
-| **Host Telemetry** | agent | `environment/` (the pure core of RFC 0014: `mod.rs`: `ExecutionEnvironment`, `Hypervisor`, `ContainerRuntime`, `LoadScope`, `classify`; `evidence.rs`: `EnvironmentEvidence`, `ContainerMarker`, `CpuArchitecture` and the evidence parsers; `usage.rs`: `Percent`, `LoadAverage`), `models.rs`, `snapshot.rs` (`CollectedSnapshot`, `PublishedSnapshot`, `SnapshotSeq`, `Priming` / `PRIMING`, `SnapshotFreshness` / `STALENESS_BOUND`, `StreamState` / `StreamEmit`; no tokio types), `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs); `collectors/environment.rs` (`gather_evidence`, over a root path and a variable lookup); `collectors/sampler.rs` (`Sampler`, `Gather`, `SysinfoSource`); `collectors/mod.rs` (`first_snapshot`, `background_collector`, `monotonic_now`, the snapshot `watch` channel: `SnapshotSender` / `SnapshotReceiver`) | the snapshot of one host and its recent history |
+| **Host Telemetry** | agent | `environment/` (the pure core of RFC 0014: `mod.rs`: `ExecutionEnvironment`, `Hypervisor`, `ContainerRuntime`, `LoadScope`, `classify`; `evidence.rs`: `EnvironmentEvidence`, `ContainerMarker`, `CpuArchitecture` and the evidence parsers; `cgroup.rs`: `CgroupPath`, `CgroupEvidence`, `CgroupAccess`, `MonitoredCgroup`, `ResourceLimit`, `CpuCount`, `Bytes`, the cgroup file parsers, `cgroup_access` and the capacity rules; `usage.rs`: `Percent`, `LoadAverage`, `CpuCounters`, `cpu_usage`; `sourcing.rs`: `choose_readings`, `SourcingHistory`, the reading groups, `Origin`, `ProcessView`, `uptime`, `process_memory_base`), `models.rs`, `snapshot.rs` (`CollectedSnapshot`, `PublishedSnapshot`, `SnapshotSeq`, `Priming` / `PRIMING`, `SnapshotFreshness` / `STALENESS_BOUND`, `StreamState` / `StreamEmit`; no tokio types), `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs); `collectors/environment.rs` (`gather_evidence` and `gather_cgroup_evidence` at startup, `read_cgroup` each tick, all over a root path); `collectors/sampler.rs` (`Sampler`, `Gather`, `SysinfoSource`); `collectors/mod.rs` (`first_snapshot`, `background_collector`, `monotonic_now`, the snapshot `watch` channel: `SnapshotSender` / `SnapshotReceiver`) | the snapshot of the agent's execution environment and its recent history |
 | **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `AgentRun`, `IncidentId`, `Readings` / `Reading`, the per-rule `Breach` state, `AlertManager::evaluate` and `replace_rules`) | `routes/api.rs` alert endpoints, `routes/sse.rs` and `routes/ws.rs` alert streams | deciding when a metric breaches a rule, for how long, and cooldown; the identity of each alert incident |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `PushFeed` and `SnapshotCursor`, which sends each published snapshot once, by seq; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
@@ -227,23 +227,29 @@ mixed-version fleet must keep working):
 | **system id** | the identifier an agent presents in the push handshake; the hub uses it as the system's primary key. It is one URL path segment: non-empty, at most 255 bytes, and not `.` or `..`. The hub refuses any other id at the push handshake; rows stored before the rule may still hold one (see Open architectural questions) | `SystemId` (hub) |
 | **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
 | **system status** | the hub's view of whether a system is reachable: online / offline / unknown. A push system is marked offline when its connection ends, and a connection ends at the latest 90 s after its last message, or 30 s after an oversize one | `SystemStatus` |
-| **snapshot** | one point-in-time reading of a host's CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
+| **snapshot** | one point-in-time reading of the agent's execution environment: its CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
 | **collected snapshot** | a snapshot the sampler read at least 1 s after its priming reading, not yet published, with its `collected_at` (unix seconds on the agent's clock) and `read_at` (the monotonic clock) | `CollectedSnapshot` |
 | **priming reading** | a sampler's first reading, which only gives the next one an interval to measure CPU over. It is never published, since sysinfo's first CPU figure is a since-boot average. A reading becomes a collected snapshot only once priming is done | `Sampler::prime`, `Priming` |
 | **published snapshot** | the latest collected snapshot, published by the background collector with its snapshot seq. It is the only snapshot any route, stream or push frame reads | `PublishedSnapshot`, `SnapshotReceiver` |
 | **snapshot seq** | the collector's count of published snapshots, from 0 at startup. It only grows, across sampler rebuilds, and never reads the wall clock. It stays inside the agent | `SnapshotSeq` |
 | **stale snapshot** | a published snapshot read more than 30 s ago on the monotonic clock. The agent never serves one. Not *application freshness*, which is the hub's rule for scrape rounds | `SnapshotFreshness`, `STALENESS_BOUND` |
-| **raw readings** | what one collection reads from sysinfo and the OS, before the snapshot's rules (averages, percentages, the top processes) are applied. The OS description is the one field already resolved, since its `lsb_release` fallback runs only when needed. Not *metric readings* | `RawReadings` |
+| **raw readings** | what one collection reads from sysinfo, the OS and, in a container, the monitored cgroup's files, before the snapshot's rules (sourcing, averages, percentages, the top processes) are applied. The OS description is the one field already resolved, since its `lsb_release` fallback runs only when needed. Not *metric readings* | `RawReadings`, `CgroupReadings` |
 | **execution environment** | what the agent runs in, classified once at startup: *bare metal*, a *virtual machine* (with its hypervisor when known), a *container* (with its runtime when known) or *undetermined*. Only an explicit container marker makes a container; a cgroup limit or an overlay root never does | `ExecutionEnvironment`, `classify` |
 | **container marker** | an explicit statement that the agent runs in a container: `/.dockerenv`, `/run/.containerenv`, `KUBERNETES_SERVICE_HOST`, or a `container` value (the agent's variable or `/run/systemd/container`) other than `wsl`. The only thing that makes a container | `ContainerMarker` and the marker fields of `EnvironmentEvidence` |
 | **environment evidence** | the observations classification weighs: container markers, the hypervisor CPU flag, DMI, Xen and a WSL kernel, each parsed at the edge. An unreadable source is no evidence | `EnvironmentEvidence` |
+| **monitored cgroup** | in a container, the cgroup holding the whole workload: the root of the agent's cgroup namespace when that namespace is the container's own (the mount point shows a non-root cgroup, which has `cgroup.type`), else the agent's own cgroup | `MonitoredCgroup`, `cgroup_access` |
+| **resource limit** | a cgroup's bound on one resource: *bounded* by an amount, or *unbounded* (`max`, or no limit file because the controller isn't enabled there) | `ResourceLimit` |
+| **resource capacity** | how much CPU (possibly fractional) and memory the monitored environment may use: the kernel's amount outside a container; in one, the least of the host's amount and every resource limit on the monitored cgroup and its visible ancestors | `cpu_capacity`, `memory_capacity`, `CpuCount`, `Bytes` |
+| **reading group** | readings sourced and carried together so their invariants hold: CPU (usage, capacity), memory (total, used, free, available), swap | `ReadingGroup`, `CpuGroup`, `MemoryGroup`, `SwapGroup` |
+| **reading source** | where a reading group came from on a tick: the *cgroup*, the *kernel* (the host-wide view), or *unavailable* (carried past 30 s). A carried group's source is still the cgroup. A group's *lineage* is kernel until its first cgroup reading and cgroup ever after | `Origin`, `ReadingSource`, `SourcingHistory` |
+| **workload** | the processes inside the container that the agent monitors. When PID 1 of the agent's PID namespace is outside the monitored cgroup, the namespace is shared and the process list isn't only the workload | `ProcessView` |
 | **load scope** | whose load average the kernel reports to the agent: the host's in a container, which shares the host's run queue, else the execution environment's own | `LoadScope` |
 | **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
 | **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
 | **alert rule** | a metric, an operator, a threshold, a duration and a cooldown | `AlertRule` |
 | **agent run** | one lifetime of the agent process, identified by a random UUID minted at startup | `AgentRun` |
 | **tick** | one evaluation of every enabled alert rule against one snapshot, every 2 s | `AlertManager::evaluate` |
-| **metric readings** | the values of one snapshot that alert rules read on a tick (CPU, memory, swap, disks, load, core count). CPU, memory and swap are each a *reading*: *measured* on the tick, *carried* (the tick couldn't measure it and the last measured value stands: the rule skips the tick, keeping its breach and incident, notifying nothing), or *unavailable* (the rule clears, ending its incident or pending breach, and stays idle until a measured tick). Today the collector passes every reading as measured, except a percentage that isn't a number, which is unavailable | `Readings`, `Reading` |
+| **metric readings** | the values of one snapshot that alert rules read on a tick (CPU, memory, swap, disks, load, core count). CPU, memory and swap are each a *reading*: *measured* on the tick, *carried* (the tick couldn't measure it and the last measured value stands: the rule skips the tick, keeping its breach and incident, notifying nothing), or *unavailable* (the rule clears, ending its incident or pending breach, and stays idle until a measured tick). A reading follows its group's reading source: a group read on the tick (from the cgroup or the kernel) is measured, a carried group is carried, an unavailable one is unavailable, and a measured percentage that isn't a number is unavailable too. Percentages are over the resource capacity | `Readings`, `Reading`, `ReadingOrigins` |
 | **percent** | a share of a resource, held to 0–100 inclusive. NaN isn't one | `Percent` |
 | **load average** | runnable tasks averaged over 1, 5 or 15 minutes. Not a percent and not bounded above | `environment::usage::LoadAverage` (domain), `models::LoadAverage` (the snapshot's DTO) |
 | **alert incident** | one uninterrupted breach of one alert rule. It becomes active on the first tick the breach has lasted the rule's duration, and ends on the first tick the rule no longer breaches, when the rule set is replaced, or when the agent restarts | `Incident`, held by `Breach::Active` |
@@ -488,6 +494,21 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
 
 Tracked here so they aren't rediscovered from scratch; promote any of these to an RFC
 (`rfcs/`) before acting on them.
+
+- In a container, disks list bind mounts whose sizes are the host filesystem's.
+- The alert readings are rebuilt from the snapshot DTO's percentages (`collectors/mod.rs::
+  alert_readings`), not from the domain's reading groups: a CPU group with no usage reaches
+  the rules as a NaN in the DTO that parses as unavailable. Building `Readings` from
+  `SourcedReadings` in the sampler would keep the wire shape out of the alert decision.
+- A container with an init under `--cgroupns=host` is measured by the agent's own service
+  cgroup, not the container's: not detected (RFC 0014 §4).
+- Limits the cgroup namespace hides aren't seen: Kubernetes pod-level limits with no
+  container-level limit read as the host's amount.
+- The hub doesn't know a system's execution environment until the push frame is versioned,
+  so it can't mark the switch of a containerised system's `cpu` and `memory` history from
+  host to workload values at the agent upgrade, nor tell a carried value from a measured
+  one: past the carry bound the agent's API says `unavailable`, while the frame keeps the
+  carried value.
 
 - The poller ignores `poll_interval_secs` and polls every enabled system every 30 s, so with
   the default 15 s scrape interval it stores about every other round: push is the path for

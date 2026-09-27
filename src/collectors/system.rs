@@ -14,11 +14,18 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use super::environment::read_cgroup;
+use crate::environment::cgroup::{Bytes, CpuCount, MonitoredCgroup};
+use crate::environment::sourcing::{
+    CgroupReadings, CpuGroup, KernelReadings, MemoryGroup, Sourced, SourcedReadings, SwapGroup,
+};
+use crate::environment::usage::Percent;
 use crate::models::*;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use sysinfo::{Disks, Networks, System};
+use std::time::Instant;
+use sysinfo::{Disks, Networks, Pid, System};
 
 /// Processes kept in a snapshot, busiest first.
 const TOP_PROCESSES: usize = 20;
@@ -39,6 +46,10 @@ pub(crate) struct RawReadings {
     pub disks: Vec<RawDisk>,
     pub networks: Vec<RawNetwork>,
     pub processes: Vec<RawProcess>,
+    /// When PID 1 of the agent's PID namespace started, in unix seconds, if it is visible.
+    pub pid1_started_at: Option<u64>,
+    /// The monitored cgroup's files, in a container with a readable cgroup v2 hierarchy.
+    pub cgroup: Option<CgroupReadings>,
 }
 
 pub(crate) struct RawCpu {
@@ -83,12 +94,20 @@ pub(crate) struct RawProcess {
     pub status: String,
 }
 
-/// Refreshes `sys` in place, then reads it and the OS release file under `root`. A long-lived
-/// `sys` is what makes CPU usage a reading over the time since its previous refresh.
-pub(crate) fn gather(sys: &mut System, root: &Path) -> RawReadings {
+/// Refreshes `sys` in place, then reads it, the OS release file under `root` and, when there
+/// is one, the monitored cgroup's files, stamped `read_at`. A long-lived `sys` is what makes
+/// CPU usage a reading over the time since its previous refresh.
+pub(crate) fn gather(
+    sys: &mut System,
+    root: &Path,
+    cgroup: Option<&MonitoredCgroup>,
+    read_at: Instant,
+) -> RawReadings {
     sys.refresh_all();
     let load = System::load_average();
     RawReadings {
+        pid1_started_at: sys.process(Pid::from_u32(1)).map(|p| p.start_time()),
+        cgroup: cgroup.map(|monitored| read_cgroup(root, monitored, read_at)),
         hostname: System::host_name(),
         kernel: System::kernel_version(),
         os: read_os_release(root),
@@ -167,56 +186,102 @@ fn gather_processes(sys: &System) -> Vec<RawProcess> {
         .collect()
 }
 
-/// The snapshot one collection's readings make.
-pub(crate) fn snapshot_from(raw: RawReadings) -> SystemSnapshot {
-    let top_processes = top_processes(raw.processes, raw.memory.total);
+/// The kernel's host-wide reading groups in `raw`.
+pub(crate) fn kernel_readings(raw: &RawReadings) -> KernelReadings {
+    let mean = raw.cpus.iter().map(|c| c.usage).sum::<f32>() / raw.cpus.len() as f32;
+    KernelReadings {
+        cpu: CpuGroup {
+            usage: Percent::saturating(mean),
+            capacity: CpuCount::cores(raw.cpus.len()),
+        },
+        memory: MemoryGroup {
+            total: Bytes::new(raw.memory.total),
+            used: Bytes::new(raw.memory.used),
+            free: Bytes::new(raw.memory.free),
+            available: Bytes::new(raw.memory.available),
+            limit: None,
+        },
+        swap: SwapGroup {
+            total: Bytes::new(raw.swap.total),
+            used: Bytes::new(raw.swap.used),
+            free: Bytes::new(raw.swap.free),
+            limit: None,
+        },
+    }
+}
+
+/// The figures that depend on whose processes the agent lists (RFC 0014 §6).
+pub(crate) struct Workload {
+    pub uptime_secs: u64,
+    /// What a process's memory share is taken over.
+    pub process_memory_base: Bytes,
+}
+
+/// The snapshot one collection's readings make, its CPU, memory and swap from `sourced`.
+pub(crate) fn snapshot_from(
+    raw: RawReadings,
+    sourced: &SourcedReadings,
+    workload: &Workload,
+) -> SystemSnapshot {
+    let top_processes = top_processes(raw.processes, workload.process_memory_base.get());
     SystemSnapshot {
         hostname: raw.hostname.unwrap_or_else(|| "unknown".into()),
         os: raw.os,
         kernel: raw.kernel.unwrap_or_else(|| "unknown".into()),
-        uptime_seconds: raw.uptime_secs,
-        uptime_display: format_uptime(raw.uptime_secs),
+        uptime_seconds: workload.uptime_secs,
+        uptime_display: format_uptime(workload.uptime_secs),
         load_average: raw.load,
-        cpu: cpu_info(&raw.cpus, raw.physical_cores),
-        memory: memory_info(&raw.memory),
-        swap: swap_info(&raw.swap),
+        cpu: cpu_info(&raw.cpus, raw.physical_cores, &sourced.cpu),
+        memory: memory_info(&sourced.memory),
+        swap: swap_info(&sourced.swap),
         disks: raw.disks.into_iter().map(disk_info).collect(),
         networks: raw.networks.into_iter().map(network_info).collect(),
         top_processes,
     }
 }
 
-fn cpu_info(cpus: &[RawCpu], physical_cores: Option<usize>) -> CpuInfo {
-    let usage = cpus.iter().map(|c| c.usage).sum::<f32>() / cpus.len() as f32;
+/// The CPU's DTO: the model and core counts are the host's, usage and capacity the group's.
+fn cpu_info(cpus: &[RawCpu], physical_cores: Option<usize>, cpu: &Sourced<CpuGroup>) -> CpuInfo {
+    let usage = cpu.value.usage.map_or(f32::NAN, Percent::get);
     CpuInfo {
         model: cpus.first().map(|c| c.brand.clone()).unwrap_or_default(),
         physical_cores: physical_cores.unwrap_or(cpus.len()),
         logical_cores: cpus.len(),
         usage_percent: (usage * 10.0).round() / 10.0,
         frequency_mhz: cpus.first().map(|c| c.frequency_mhz).unwrap_or(0),
+        capacity_cpus: cpu.value.capacity.get(),
+        source: cpu.origin.source().into(),
     }
 }
 
-fn memory_info(memory: &RawMemory) -> MemoryInfo {
+fn memory_info(memory: &Sourced<MemoryGroup>) -> MemoryInfo {
+    let group = &memory.value;
+    let (total, used) = (group.total.get(), group.used.get());
     MemoryInfo {
-        total_bytes: memory.total,
-        used_bytes: memory.used,
-        free_bytes: memory.free,
-        available_bytes: memory.available,
-        total_display: format_bytes(memory.total),
-        used_display: format_bytes(memory.used),
-        usage_percent: percent_of(memory.used, memory.total),
+        total_bytes: total,
+        used_bytes: used,
+        free_bytes: group.free.get(),
+        available_bytes: group.available.get(),
+        total_display: format_bytes(total),
+        used_display: format_bytes(used),
+        usage_percent: percent_of(used, total),
+        limit: group.limit.map(LimitInfo::from),
+        source: memory.origin.source().into(),
     }
 }
 
-fn swap_info(swap: &RawSwap) -> SwapInfo {
+fn swap_info(swap: &Sourced<SwapGroup>) -> SwapInfo {
+    let group = &swap.value;
+    let (total, used) = (group.total.get(), group.used.get());
     SwapInfo {
-        total_bytes: swap.total,
-        used_bytes: swap.used,
-        free_bytes: swap.free,
-        total_display: format_bytes(swap.total),
-        used_display: format_bytes(swap.used),
-        usage_percent: percent_of(swap.used, swap.total),
+        total_bytes: total,
+        used_bytes: used,
+        free_bytes: group.free.get(),
+        total_display: format_bytes(total),
+        used_display: format_bytes(used),
+        usage_percent: percent_of(used, total),
+        limit: group.limit.map(LimitInfo::from),
+        source: swap.origin.source().into(),
     }
 }
 
@@ -411,7 +476,34 @@ pub(crate) mod fixtures {
             disks: vec![],
             networks: vec![],
             processes: vec![],
+            pid1_started_at: None,
+            cgroup: None,
         }
+    }
+
+    /// The snapshot `raw` makes with every group read from the kernel, as outside a container.
+    pub fn kernel_snapshot(raw: RawReadings) -> SystemSnapshot {
+        use crate::environment::sourcing::{Origin, Sourced};
+        let kernel = kernel_readings(&raw);
+        let sourced = SourcedReadings {
+            cpu: Sourced {
+                value: kernel.cpu,
+                origin: Origin::Kernel,
+            },
+            memory: Sourced {
+                value: kernel.memory,
+                origin: Origin::Kernel,
+            },
+            swap: Sourced {
+                value: kernel.swap,
+                origin: Origin::Kernel,
+            },
+        };
+        let workload = Workload {
+            uptime_secs: raw.uptime_secs,
+            process_memory_base: kernel.memory.total,
+        };
+        snapshot_from(raw, &sourced, &workload)
     }
 
     /// `raw()` with every CPU at `usage`, so the snapshot's CPU usage is `usage`.
@@ -530,7 +622,7 @@ mod tests {
             ),
         ];
         for (name, hostname, kernel, expected) in cases {
-            let snap = snapshot_from(RawReadings {
+            let snap = kernel_snapshot(RawReadings {
                 hostname: hostname.map(Into::into),
                 kernel: kernel.map(Into::into),
                 ..raw()
@@ -574,7 +666,7 @@ mod tests {
             ("no cpus", vec![], None, ("", 0, 0, 0)),
         ];
         for (name, cpus, physical, (model, phys, logical, freq)) in cases {
-            let c = snapshot_from(RawReadings {
+            let c = kernel_snapshot(RawReadings {
                 cpus,
                 physical_cores: physical,
                 ..raw()
@@ -586,7 +678,7 @@ mod tests {
             assert_eq!(c.frequency_mhz, freq, "{name}");
         }
         let mean = |cpus| {
-            snapshot_from(RawReadings { cpus, ..raw() })
+            kernel_snapshot(RawReadings { cpus, ..raw() })
                 .cpu
                 .usage_percent
         };
@@ -606,7 +698,7 @@ mod tests {
             ("no totals", (0, 0, 0.0), (0, 0, 0.0)),
         ];
         for (name, (mem_total, mem_used, mem_pct), (swap_total, swap_used, swap_pct)) in cases {
-            let snap = snapshot_from(RawReadings {
+            let snap = kernel_snapshot(RawReadings {
                 memory: RawMemory {
                     total: mem_total,
                     used: mem_used,
@@ -653,7 +745,7 @@ mod tests {
             ("empty disk", 0, 0, (0, 0.0)),
         ];
         for (name, total, available, (used, percent)) in cases {
-            let snap = snapshot_from(RawReadings {
+            let snap = kernel_snapshot(RawReadings {
                 disks: vec![RawDisk {
                     mount_point: "/data".into(),
                     filesystem: "ext4".into(),
@@ -687,7 +779,7 @@ mod tests {
             total,
             available: 0,
         };
-        let snap = snapshot_from(RawReadings {
+        let snap = kernel_snapshot(RawReadings {
             disks: vec![disk("/", 10), disk("/home", 20), disk("/var", 30)],
             ..raw()
         });
@@ -701,7 +793,7 @@ mod tests {
 
     #[test]
     fn network_totals_are_shown_in_bytes() {
-        let snap = snapshot_from(RawReadings {
+        let snap = kernel_snapshot(RawReadings {
             networks: vec![
                 RawNetwork {
                     interface: "eth0".into(),
@@ -782,8 +874,118 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_shows_the_sourced_groups_and_the_workload() {
+        use crate::environment::cgroup::ResourceLimit;
+        use crate::environment::sourcing::{Origin, Sourced};
+        let sourced = SourcedReadings {
+            cpu: Sourced {
+                value: CpuGroup {
+                    usage: Percent::saturating(12.54),
+                    capacity: CpuCount::new(1.5).unwrap(),
+                },
+                origin: Origin::Cgroup,
+            },
+            memory: Sourced {
+                value: MemoryGroup {
+                    total: Bytes::new(2048),
+                    used: Bytes::new(512),
+                    free: Bytes::new(1024),
+                    available: Bytes::new(1536),
+                    limit: Some(ResourceLimit::Bounded(Bytes::new(2048))),
+                },
+                origin: Origin::Carried,
+            },
+            swap: Sourced {
+                value: SwapGroup {
+                    total: Bytes::new(100),
+                    used: Bytes::new(25),
+                    free: Bytes::new(75),
+                    limit: Some(ResourceLimit::Unbounded),
+                },
+                origin: Origin::Unavailable,
+            },
+        };
+        let workload = Workload {
+            uptime_secs: 3 * 3600,
+            process_memory_base: Bytes::new(2048),
+        };
+        let snap = snapshot_from(
+            RawReadings {
+                processes: vec![process(7, 1.0, 1024)],
+                ..raw()
+            },
+            &sourced,
+            &workload,
+        );
+        let wire = serde_json::to_value(&snap).unwrap();
+        assert_eq!(
+            wire["cpu"],
+            serde_json::json!({
+                "model": "Xeon",
+                "physical_cores": 1,
+                "logical_cores": 2,
+                "usage_percent": 12.5,
+                "frequency_mhz": 2400,
+                "capacity_cpus": 1.5,
+                "source": "cgroup",
+            }),
+            "usage and capacity from the group; cores stay the host's"
+        );
+        assert_eq!(
+            wire["memory"],
+            serde_json::json!({
+                "total_bytes": 2048,
+                "used_bytes": 512,
+                "free_bytes": 1024,
+                "available_bytes": 1536,
+                "total_display": "2.0 KB",
+                "used_display": "512.0 B",
+                "usage_percent": 25.0,
+                "limit": { "bounded": 2048 },
+                "source": "cgroup",
+            }),
+            "a carried group's source is still the cgroup"
+        );
+        assert_eq!(
+            wire["swap"],
+            serde_json::json!({
+                "total_bytes": 100,
+                "used_bytes": 25,
+                "free_bytes": 75,
+                "total_display": "100.0 B",
+                "used_display": "25.0 B",
+                "usage_percent": 25.0,
+                "limit": "unbounded",
+                "source": "unavailable",
+            })
+        );
+        assert_eq!(
+            (snap.uptime_seconds, snap.uptime_display.as_str()),
+            (3 * 3600, "3h 0m")
+        );
+        assert_eq!(
+            snap.top_processes[0].memory_percent, 50.0,
+            "over the workload's base"
+        );
+    }
+
+    #[test]
+    fn a_kernel_snapshot_has_no_limits_and_the_hosts_capacity() {
+        let wire = serde_json::to_value(kernel_snapshot(raw())).unwrap();
+        assert_eq!(wire["cpu"]["capacity_cpus"], 2.0);
+        assert_eq!(wire["cpu"]["source"], "kernel");
+        for group in ["memory", "swap"] {
+            assert_eq!(wire[group]["source"], "kernel", "{group}");
+            assert!(
+                wire[group].get("limit").is_none(),
+                "{group}: no limit field at all"
+            );
+        }
+    }
+
+    #[test]
     fn snapshot_keeps_the_top_processes_over_its_memory_total() {
-        let snap = snapshot_from(RawReadings {
+        let snap = kernel_snapshot(RawReadings {
             processes: vec![process(7, 1.0, 1024), process(9, 2.0, 2048)],
             ..raw()
         });

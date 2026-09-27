@@ -121,9 +121,12 @@ presence is evidence (the CPU flag), only its name is missing. Every rule that f
 machine finds a hypervisor, so it isn't optional: `Other` is the one spelling of "unnamed". All three enums are closed and
 carry no free text, so no string read from the environment reaches the API.
 
-`Container`'s `cgroup` field, and the `self_cgroup` / `cgroup2_mount` evidence it needs, land
-with step 5 (cgroup location): rules 1–4 below don't read them, so step 4 classifies without
-them and `/api/system`'s `environment` gains `cgroup` then.
+`Container`'s `cgroup` field, and the `self_cgroup` / `cgroup2_mount` evidence it needs,
+landed with step 5 (cgroup location): rules 1–4 below don't read them, so step 4 classified
+without them and `/api/system`'s `environment` gained `cgroup` then. Whose processes the
+agent lists is a `ProcessView` derived from the environment: `Host` outside a container,
+`UnmeasuredContainer` with no readable v2 hierarchy, `Workload` when PID 1 is in the monitored
+cgroup, `SharedNamespace` when it isn't.
 
 ### 3. Classification (pure, run once at startup)
 
@@ -217,14 +220,20 @@ cgroup v2, cpu capacity 1.5, memory capacity 512 MiB`.
   delegated (rootless Podman under a systemd user session gets memory and pids only), and
   `memory.swap.max` is absent without swap accounting. Absence is the kernel saying "no limit
   here", not an error.
-- **A present but malformed file is an error** (`CgroupReadError`), never a guess.
+- **A present but malformed file is an error** (`CgroupReadError`), never a guess. So is a
+  `memory.stat` missing beside a present `memory.current`, and an empty
+  `cpuset.cpus.effective`: neither is how the kernel says "no limit".
+- mountinfo is read for its first line whose filesystem type (after the ` - ` separator) is
+  `cgroup2`, with the kernel's octal escapes decoded; a relative or climbing mount point, or
+  a root that climbs, doesn't count. The namespace root is only ever monitored when the
+  mount root is `/`: a subtree mount can't show it.
 
 ### 5. Usage from cumulative counters (pure deltas)
 
 Container CPU usage and steal time are rates, so they need the previous reading.
 
 ```rust
-pub struct CpuCounters { usage: Duration, read_at: MonotonicMicros }   // cgroup cpu.stat usage_usec
+pub struct CpuCounters { usage: Duration, read_at: Instant }          // cgroup cpu.stat usage_usec
 pub struct StealCounters { steal: u64, total: u64 }                    // /proc/stat "cpu" line, jiffies
 
 pub fn cpu_usage(prev: &CpuCounters, cur: &CpuCounters, capacity: CpuCount) -> Option<Percent>;
@@ -236,7 +245,8 @@ pub fn steal_share(prev: &StealCounters, cur: &StealCounters) -> Option<Percent>
   Δwall is under 500 ms, or a counter went backwards (a cgroup recreated).
 - `steal_share` = Δsteal / Δtotal. `None` when Δtotal is zero, a counter went backwards, or the
   kernel's `cpu` line has no steal column. On bare metal it's a real `0.0`, not a sentinel.
-- The clock is passed in: the sampler reads `Instant`, the domain gets `MonotonicMicros`.
+- The clock is passed in: the sampler reads the monotonic clock and stamps the counters with
+  that `Instant`, a plain value the domain compares and never reads.
 
 ### 6. One collector, one snapshot: the prerequisite this design forces
 
@@ -357,6 +367,12 @@ at runtime) counts as unreadable.
 
 A group that recovers returns to **Measured**, source `cgroup`.
 
+A tick with no cgroup reading at all counts as every usage file absent: quiet for a group
+whose lineage is `Kernel` (outside a container, the only case), a failure for one whose
+lineage is `Cgroup`. The CPU group also fails on a tick with no previous counters (`None`
+delta); the sampler's priming reading takes counters, so a published reading always has them
+unless the file was unreadable at priming.
+
 The carry is bounded because a file that stays unreadable (a permission change) would
 otherwise publish a frozen value as `cgroup` and hold an incident "active, quiet" forever. Past
 the bound the agent says it doesn't know: `source: "unavailable"` on its API, and the incident
@@ -405,7 +421,7 @@ How each value is sourced when its cgroup reading is available:
 | memory `used_bytes` | sysinfo (total − available) | `memory.current` − `inactive_file` (the working set, saturating), capped at capacity |
 | memory `free_bytes` | sysinfo | capacity − `memory.current`, saturating |
 | memory `available_bytes` | sysinfo | capacity − used |
-| swap total / used / free | sysinfo | swap capacity / `memory.swap.current` / the difference, saturating |
+| swap total / used / free | sysinfo | swap capacity / `memory.swap.current` capped at capacity / the difference |
 | `*_display` strings | from the bytes above | from the bytes above |
 | uptime | `System::uptime()` | now − start time of PID 1 in the agent's PID namespace; `System::uptime()` if PID 1 isn't visible (`hidepid`) |
 | process memory % | over host RAM | over memory capacity |
