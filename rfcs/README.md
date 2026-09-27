@@ -39,3 +39,4 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0011](0011-registry-and-alert-catalog.md) | Registry and Alert Catalog, with Sealed Agent Tokens | Draft |
 | [0012](0012-hub-access-control.md) | Hub Access Control: Admin Token over Registry and Retention Writes, Reserved Push Ids | Draft |
 | [0013](0013-sqlite-import.md) | One-Shot Import from SQLite into the Hub Store | Rejected |
+| [0014](0014-execution-environment.md) | Execution Environment: the Agent Monitors What It Runs In | Accepted |
