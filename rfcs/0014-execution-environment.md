@@ -245,6 +245,10 @@ pub fn steal_share(prev: &StealCounters, cur: &StealCounters) -> Option<Percent>
   Δwall is under 500 ms, or a counter went backwards (a cgroup recreated).
 - `steal_share` = Δsteal / Δtotal. `None` when Δtotal is zero, a counter went backwards, or the
   kernel's `cpu` line has no steal column. On bare metal it's a real `0.0`, not a sentinel.
+  Δtotal is over the line's first eight columns, user through steal: the kernel already
+  counts `guest` and `guest_nice` inside `user` and `nice`. A reading with no counters (an
+  unreadable `/proc/stat`) publishes `null` and keeps the previous counters, so the next
+  share spans both intervals; one after a priming reading without counters is `null` too.
 - The clock is passed in: the sampler reads the monotonic clock and stamps the counters with
   that `Instant`, a plain value the domain compares and never reads.
 

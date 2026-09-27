@@ -203,6 +203,9 @@ pub struct CpuInfo {
     pub frequency_mhz: u64,
     /// CPUs the monitored environment may use: the host's cores outside a container.
     pub capacity_cpus: f64,
+    /// The share of CPU time a hypervisor withheld since the previous snapshot, host-wide;
+    /// `null` when it can't be measured.
+    pub steal_percent: Option<f32>,
     pub source: ReadingSourceName,
 }
 

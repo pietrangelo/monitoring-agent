@@ -14,12 +14,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use super::environment::read_cgroup;
+use super::environment::{read_cgroup, read_steal};
 use crate::environment::cgroup::{Bytes, CpuCount, MonitoredCgroup};
 use crate::environment::sourcing::{
     CgroupReadings, CpuGroup, KernelReadings, MemoryGroup, Sourced, SourcedReadings, SwapGroup,
 };
-use crate::environment::usage::Percent;
+use crate::environment::usage::{Percent, StealCounters};
 use crate::models::*;
 use std::fs;
 use std::path::Path;
@@ -50,6 +50,8 @@ pub(crate) struct RawReadings {
     pub pid1_started_at: Option<u64>,
     /// The monitored cgroup's files, in a container with a readable cgroup v2 hierarchy.
     pub cgroup: Option<CgroupReadings>,
+    /// The host kernel's steal counters, when `/proc/stat` has them.
+    pub steal: Option<StealCounters>,
 }
 
 pub(crate) struct RawCpu {
@@ -108,6 +110,7 @@ pub(crate) fn gather(
     RawReadings {
         pid1_started_at: sys.process(Pid::from_u32(1)).map(|p| p.start_time()),
         cgroup: cgroup.map(|monitored| read_cgroup(root, monitored, read_at)),
+        steal: read_steal(root),
         hostname: System::host_name(),
         kernel: System::kernel_version(),
         os: read_os_release(root),
@@ -217,11 +220,13 @@ pub(crate) struct Workload {
     pub process_memory_base: Bytes,
 }
 
-/// The snapshot one collection's readings make, its CPU, memory and swap from `sourced`.
+/// The snapshot one collection's readings make, its CPU, memory and swap from `sourced`, and
+/// `steal` the share stolen since the previous reading.
 pub(crate) fn snapshot_from(
     raw: RawReadings,
     sourced: &SourcedReadings,
     workload: &Workload,
+    steal: Option<Percent>,
 ) -> SystemSnapshot {
     let top_processes = top_processes(raw.processes, workload.process_memory_base.get());
     SystemSnapshot {
@@ -231,7 +236,7 @@ pub(crate) fn snapshot_from(
         uptime_seconds: workload.uptime_secs,
         uptime_display: format_uptime(workload.uptime_secs),
         load_average: raw.load,
-        cpu: cpu_info(&raw.cpus, raw.physical_cores, &sourced.cpu),
+        cpu: cpu_info(&raw.cpus, raw.physical_cores, &sourced.cpu, steal),
         memory: memory_info(&sourced.memory),
         swap: swap_info(&sourced.swap),
         disks: raw.disks.into_iter().map(disk_info).collect(),
@@ -240,16 +245,27 @@ pub(crate) fn snapshot_from(
     }
 }
 
+/// `value` rounded to one decimal place, as the API shows a percent.
+fn one_decimal(value: f32) -> f32 {
+    (value * 10.0).round() / 10.0
+}
+
 /// The CPU's DTO: the model and core counts are the host's, usage and capacity the group's.
-fn cpu_info(cpus: &[RawCpu], physical_cores: Option<usize>, cpu: &Sourced<CpuGroup>) -> CpuInfo {
+fn cpu_info(
+    cpus: &[RawCpu],
+    physical_cores: Option<usize>,
+    cpu: &Sourced<CpuGroup>,
+    steal: Option<Percent>,
+) -> CpuInfo {
     let usage = cpu.value.usage.map_or(f32::NAN, Percent::get);
     CpuInfo {
         model: cpus.first().map(|c| c.brand.clone()).unwrap_or_default(),
         physical_cores: physical_cores.unwrap_or(cpus.len()),
         logical_cores: cpus.len(),
-        usage_percent: (usage * 10.0).round() / 10.0,
+        usage_percent: one_decimal(usage),
         frequency_mhz: cpus.first().map(|c| c.frequency_mhz).unwrap_or(0),
         capacity_cpus: cpu.value.capacity.get(),
+        steal_percent: steal.map(|share| one_decimal(share.get())),
         source: cpu.origin.source().into(),
     }
 }
@@ -478,6 +494,7 @@ pub(crate) mod fixtures {
             processes: vec![],
             pid1_started_at: None,
             cgroup: None,
+            steal: None,
         }
     }
 
@@ -503,7 +520,7 @@ pub(crate) mod fixtures {
             uptime_secs: raw.uptime_secs,
             process_memory_base: kernel.memory.total,
         };
-        snapshot_from(raw, &sourced, &workload)
+        snapshot_from(raw, &sourced, &workload, None)
     }
 
     /// `raw()` with every CPU at `usage`, so the snapshot's CPU usage is `usage`.
@@ -916,6 +933,7 @@ mod tests {
             },
             &sourced,
             &workload,
+            Percent::saturating(7.46),
         );
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -927,9 +945,10 @@ mod tests {
                 "usage_percent": 12.5,
                 "frequency_mhz": 2400,
                 "capacity_cpus": 1.5,
+                "steal_percent": 7.5,
                 "source": "cgroup",
             }),
-            "usage and capacity from the group; cores stay the host's"
+            "usage and capacity from the group, steal rounded like usage; cores stay the host's"
         );
         assert_eq!(
             wire["memory"],
@@ -974,6 +993,11 @@ mod tests {
         let wire = serde_json::to_value(kernel_snapshot(raw())).unwrap();
         assert_eq!(wire["cpu"]["capacity_cpus"], 2.0);
         assert_eq!(wire["cpu"]["source"], "kernel");
+        assert_eq!(
+            wire["cpu"].get("steal_percent"),
+            Some(&serde_json::Value::Null),
+            "no steal reading: present, and null"
+        );
         for group in ["memory", "swap"] {
             assert_eq!(wire[group]["source"], "kernel", "{group}");
             assert!(
