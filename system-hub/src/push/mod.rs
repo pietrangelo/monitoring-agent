@@ -25,10 +25,15 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::applications::{ScrapeRound, SourcePace};
+use crate::clock::unix_now;
+use crate::db::RoundStored;
 use crate::models::{SystemId, SystemIdError, SystemInfo, SystemStatus};
+use crate::round_intake::{self, Arrival};
 
+mod application_wire;
 mod config;
 use crate::state::{AppState, LiveMetrics};
 pub use config::{PushAuth, PushAuthError, PushConfig};
@@ -290,10 +295,31 @@ async fn send_answer(socket: &mut WebSocket, answer: String) -> Answer {
 /// deadline, sends an oversize message, or ingestion fails. tungstenite answers pings on its
 /// own, so the hub never awaits a send here.
 async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &SystemId) {
+    let mut rounds = ConnectionRounds::new(Instant::now());
+    receive_until_end(socket, ctx, system_id, &mut rounds).await;
+    if rounds.refusals > 0 {
+        tracing::info!(
+            "Push connection of {:?} refused {} application frame(s)",
+            system_id.as_str(),
+            rounds.refusals
+        );
+    }
+}
+
+async fn receive_until_end(
+    socket: &mut WebSocket,
+    ctx: &PushContext,
+    system_id: &SystemId,
+    rounds: &mut ConnectionRounds,
+) {
     loop {
         match recv_within(socket, ctx.config.idle_timeout).await {
             Received::Message(Message::Binary(data)) => {
-                if ingest(ctx, system_id, &data).await.is_err() {
+                if let Err(stop) = ingest(ctx, system_id, &data, rounds).await {
+                    tracing::info!(
+                        "Ending the push connection of {:?}: {stop:?}",
+                        system_id.as_str()
+                    );
                     return;
                 }
             }
@@ -322,18 +348,113 @@ async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &S
     }
 }
 
+/// What one push connection keeps of the rounds it sends: its own pace, and how many of its
+/// application frames were refused.
+struct ConnectionRounds {
+    pace: SourcePace,
+    refusals: u64,
+}
+
+impl ConnectionRounds {
+    fn new(now: Instant) -> Self {
+        Self {
+            pace: SourcePace::new(now),
+            refusals: 0,
+        }
+    }
+
+    /// Counts a refused application frame, and says whether it is the connection's first:
+    /// logged at `warn`, the rest at `debug`, so a sender can't flood the log.
+    fn note_refusal(&mut self) -> RefusedFrame {
+        self.refusals += 1;
+        if self.refusals == 1 {
+            RefusedFrame::First
+        } else {
+            RefusedFrame::Repeat
+        }
+    }
+}
+
+/// Which of a connection's refused application frames this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusedFrame {
+    First,
+    Repeat,
+}
+
+/// Why a push connection stops ingesting.
+#[derive(Debug)]
+enum IngestStop {
+    /// A unit of blocking storage work failed (`on_blocking_pool` logs why).
+    WorkFailed,
+    /// The system's row is gone, so nothing more from this connection can be stored.
+    SystemGone,
+}
+
 /// Decodes and stores one data frame. Frames that don't decode are dropped, as documented in
 /// ARCHITECTURE.md; only a failed unit of storage work is an error.
 async fn ingest(
     ctx: &PushContext,
     system_id: &SystemId,
     data: &[u8],
-) -> Result<(), tokio::task::JoinError> {
-    let Ok(payload) = rmp_serde::from_slice::<PushPayload>(data) else {
+    rounds: &mut ConnectionRounds,
+) -> Result<(), IngestStop> {
+    if let Ok(payload) = rmp_serde::from_slice::<PushPayload>(data) {
+        let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, &payload);
+        return on_blocking_pool(&ctx.app, system_id, work)
+            .await
+            .map_err(|_| IngestStop::WorkFailed);
+    }
+    let Some(frame) = application_wire::decode(data) else {
         return Ok(());
     };
-    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, &payload);
-    on_blocking_pool(&ctx.app, system_id, work).await
+    match ScrapeRound::try_from(frame) {
+        Ok(round) => ingest_round(ctx, system_id, round, rounds).await,
+        Err(refusal) => {
+            let id = system_id.as_str();
+            match rounds.note_refusal() {
+                RefusedFrame::First => {
+                    tracing::warn!("Refused an application frame from {id:?}: {refusal:?}")
+                }
+                RefusedFrame::Repeat => {
+                    tracing::debug!("Refused an application frame from {id:?}: {refusal:?}")
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Admits and stores one scrape round off the async runtime, under this connection's pace.
+async fn ingest_round(
+    ctx: &PushContext,
+    system_id: &SystemId,
+    round: ScrapeRound,
+    rounds: &mut ConnectionRounds,
+) -> Result<(), IngestStop> {
+    let pace = rounds.pace;
+    let work = move |app: &AppState, id: &SystemId| {
+        let arrival = Arrival {
+            now: Instant::now(),
+            received_at: unix_now(),
+        };
+        round_intake::store_round(app, id, round, pace, arrival)
+    };
+    let (stored, pace) = on_blocking_pool(&ctx.app, system_id, work)
+        .await
+        .map_err(|_| IngestStop::WorkFailed)?;
+    rounds.pace = pace;
+    match stored {
+        Ok(RoundStored::SystemGone) => Err(IngestStop::SystemGone),
+        Ok(RoundStored::Stored | RoundStored::Duplicate | RoundStored::TooSoon) => Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                "Storing a scrape round from {:?} failed: {err}",
+                system_id.as_str()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Whether a receive error is tungstenite refusing a message over the size limit.
@@ -347,11 +468,11 @@ fn is_oversize(err: &axum::Error) -> bool {
 
 /// Runs one unit of synchronous SQLite work off the async runtime and waits for it, so a
 /// connection never has more than one unit in flight and units land in order.
-async fn on_blocking_pool(
+async fn on_blocking_pool<T: Send + 'static>(
     app: &Arc<AppState>,
     system_id: &SystemId,
-    work: impl FnOnce(&AppState, &SystemId) + Send + 'static,
-) -> Result<(), tokio::task::JoinError> {
+    work: impl FnOnce(&AppState, &SystemId) -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
     let (app, id) = (Arc::clone(app), system_id.clone());
     let outcome = tokio::task::spawn_blocking(move || work(&app, &id)).await;
     if let Err(err) = &outcome {
@@ -596,6 +717,24 @@ mod tests {
             top_processes: vec![],
             timestamp: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn a_snapshot_frame_and_an_application_frame_never_decode_as_each_other() {
+        let golden: &[u8] = include_bytes!("../../../testdata/application-frame-v1.msgpack");
+        let snapshot = rmp_serde::to_vec(&sample_frame("host")).unwrap();
+        assert!(
+            rmp_serde::from_slice::<PushPayload>(golden).is_err(),
+            "an application frame isn't a snapshot"
+        );
+        assert!(
+            application_wire::decode(&snapshot).is_none(),
+            "a snapshot isn't an application frame"
+        );
+        assert!(
+            rmp_serde::from_slice::<PushPayload>(&snapshot).is_ok(),
+            "the snapshot itself decodes"
+        );
     }
 
     #[test]
@@ -1901,6 +2040,264 @@ mod tests {
                 sys.name, "host1",
                 "{name}: renamed to the snapshot's hostname"
             );
+        }
+    }
+
+    mod applications {
+        use super::*;
+        use crate::applications::RoundId;
+        use futures_util::SinkExt;
+        use std::collections::BTreeMap;
+
+        const RUN: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
+        type Report = (String, String, Option<String>, BTreeMap<String, f64>);
+
+        /// Mirrors the agent's application frame: positional, like every push frame.
+        fn application_frame(kind: &str, seq: u64, heap: f64) -> Vec<u8> {
+            let orders: Report = (
+                "orders".into(),
+                "up".into(),
+                Some("2.4.1".into()),
+                BTreeMap::from([("heap_used_bytes".into(), heap)]),
+            );
+            rmp_serde::to_vec(&(kind, RUN, seq, 15u64, vec![orders])).unwrap()
+        }
+
+        fn frame(seq: u64) -> Vec<u8> {
+            application_frame("applications.v1", seq, 300.0)
+        }
+
+        fn up_points(state: &AppState, system: &str) -> Vec<crate::models::MetricPoint> {
+            state
+                .db
+                .get_metrics(system, "app:orders:up", 1000, None)
+                .unwrap()
+        }
+
+        fn shown_seq(state: &AppState, system: &str) -> Option<u64> {
+            let live = state.live_applications.read().unwrap();
+            live.get(system)?
+                .shown
+                .as_ref()
+                .map(|held| held.round.id().seq())
+        }
+
+        fn now_secs() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        }
+
+        async fn send(ws: &mut AgentSocket, bytes: Vec<u8>) {
+            ws.send(WsMessage::Binary(bytes)).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_application_frame_is_stored_at_hub_time_and_shown_beside_snapshots() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            let mut ws = connect_authenticated(addr, "sys-app").await;
+            let before = now_secs();
+            send(&mut ws, frame_bytes("host")).await; // agent clock: 1_700_000_000
+            send(&mut ws, frame(1)).await;
+            wait_until_hub_caught_up(&mut ws).await;
+            let after = now_secs();
+
+            let points = up_points(&state, "sys-app");
+            assert_eq!(points.len(), 1, "one up point");
+            assert!(
+                (before..=after).contains(&points[0].timestamp),
+                "stored at the hub's time, not the agent's: {}",
+                points[0].timestamp
+            );
+            assert_eq!(points[0].value, 1.0);
+            let heap = state
+                .db
+                .get_metrics("sys-app", "app:orders:heap_used_bytes", 10, None)
+                .unwrap();
+            assert_eq!(heap.iter().map(|p| p.value).collect::<Vec<_>>(), [300.0]);
+            assert_eq!(shown_seq(&state, "sys-app"), Some(1));
+            assert!(
+                state.live_metrics.read().unwrap().contains_key("sys-app"),
+                "the snapshot on the same connection is stored too"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reconnect_re_sending_the_same_round_stores_nothing_and_it_stays_shown() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            let mut first = connect_authenticated(addr, "sys-app").await;
+            send(&mut first, frame(1)).await;
+            wait_until_hub_caught_up(&mut first).await;
+            drop(first);
+            let offline = eventually(|| {
+                state.db.get_system("sys-app").unwrap().map(|s| s.status)
+                    == Some(SystemStatus::Offline)
+            })
+            .await;
+            assert!(offline, "the first connection ended");
+            assert_eq!(
+                shown_seq(&state, "sys-app"),
+                Some(1),
+                "a disconnect evicts nothing"
+            );
+
+            let mut second = connect_authenticated(addr, "sys-app").await;
+            send(&mut second, frame(1)).await;
+            send(&mut second, frame(2)).await;
+            wait_until_hub_caught_up(&mut second).await;
+            assert_eq!(
+                up_points(&state, "sys-app").len(),
+                2,
+                "rounds 1 and 2, once each"
+            );
+            assert_eq!(shown_seq(&state, "sys-app"), Some(2));
+        }
+
+        #[tokio::test]
+        async fn a_repeated_id_with_other_content_or_a_lower_seq_is_still_stored() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            // One connection per frame, so pacing can't be what drops one.
+            // (case, frame, heap values stored after it)
+            let cases: [(&str, Vec<u8>, &[f32]); 4] = [
+                (
+                    "seq 5",
+                    application_frame("applications.v1", 5, 300.0),
+                    &[300.0],
+                ),
+                (
+                    "seq 5 again, other content",
+                    application_frame("applications.v1", 5, 301.0),
+                    &[300.0, 301.0],
+                ),
+                (
+                    "a lower seq after it: no seq ordering",
+                    application_frame("applications.v1", 1, 302.0),
+                    &[300.0, 301.0, 302.0],
+                ),
+                (
+                    "an exact re-send of seq 5: the only duplicate",
+                    application_frame("applications.v1", 5, 300.0),
+                    &[300.0, 301.0, 302.0],
+                ),
+            ];
+            for (case, bytes, expected) in cases {
+                let mut ws = connect_authenticated(addr, "sys-app").await;
+                send(&mut ws, bytes).await;
+                wait_until_hub_caught_up(&mut ws).await;
+                drop(ws);
+                let heap: Vec<f32> = state
+                    .db
+                    .get_metrics("sys-app", "app:orders:heap_used_bytes", 10, None)
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.value)
+                    .collect();
+                assert_eq!(heap, expected, "case: {case}");
+            }
+            assert_eq!(
+                shown_seq(&state, "sys-app"),
+                Some(1),
+                "the last stored round is shown"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_connections_pace_refills_one_round_per_8_seconds() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            let mut ws = connect_authenticated(addr, "sys-app").await;
+            for seq in 1..=3 {
+                send(&mut ws, frame(seq)).await;
+            }
+            wait_until_hub_caught_up(&mut ws).await;
+            assert_eq!(up_points(&state, "sys-app").len(), 2, "the burst is two");
+            tokio::time::sleep(Duration::from_millis(8_200)).await;
+            send(&mut ws, frame(4)).await;
+            wait_until_hub_caught_up(&mut ws).await;
+            assert_eq!(
+                up_points(&state, "sys-app").len(),
+                3,
+                "one token refilled after 8 s"
+            );
+            assert_eq!(shown_seq(&state, "sys-app"), Some(4));
+        }
+
+        #[tokio::test]
+        async fn a_third_round_within_8_s_is_dropped_but_another_connections_is_not() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            let mut hostile = connect_authenticated(addr, "sys-app").await;
+            for seq in 1..=3 {
+                send(&mut hostile, frame(seq)).await;
+            }
+            wait_until_hub_caught_up(&mut hostile).await;
+            assert_eq!(up_points(&state, "sys-app").len(), 2, "the burst is two");
+            assert_eq!(shown_seq(&state, "sys-app"), Some(2));
+
+            let mut honest = connect_authenticated(addr, "sys-app").await;
+            send(&mut honest, frame(4)).await;
+            wait_until_hub_caught_up(&mut honest).await;
+            assert_eq!(up_points(&state, "sys-app").len(), 3, "its own pace");
+            assert_eq!(shown_seq(&state, "sys-app"), Some(4));
+            drop(hostile);
+        }
+
+        #[tokio::test]
+        async fn a_refused_application_frame_is_dropped_and_the_connection_goes_on() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            let mut ws = connect_authenticated(addr, "sys-app").await;
+            send(&mut ws, application_frame("applications.v2", 1, 300.0)).await;
+            send(&mut ws, application_frame("applications.v1", 1, f64::NAN)).await;
+            wait_until_hub_caught_up(&mut ws).await;
+            let points = up_points(&state, "sys-app");
+            assert_eq!(points.len(), 1, "only the v1 frame is stored");
+            let heap = state
+                .db
+                .get_metrics("sys-app", "app:orders:heap_used_bytes", 10, None)
+                .unwrap();
+            assert!(heap.is_empty(), "a NaN gauge is skipped, not stored");
+        }
+
+        #[tokio::test]
+        async fn a_round_for_a_deleted_system_ends_the_connection_and_leaves_no_entry() {
+            let (state, _dir) = temp_state();
+            let addr = serve_push(state.clone(), "").await;
+            let mut ws = connect_authenticated(addr, "sys-gone").await;
+            state.db.delete_system("sys-gone").unwrap();
+            send(&mut ws, frame(1)).await;
+            let closed = messages_until_closed(&mut ws, Duration::from_secs(5)).await;
+            assert!(closed.is_some(), "the hub ends the connection");
+            assert!(up_points(&state, "sys-gone").is_empty());
+            assert!(
+                !state
+                    .live_applications
+                    .read()
+                    .unwrap()
+                    .contains_key("sys-gone"),
+                "no entry is recreated for a gone system"
+            );
+        }
+
+        #[test]
+        fn a_connections_first_refused_frame_is_first_and_the_rest_repeat() {
+            use RefusedFrame::{First, Repeat};
+            let mut rounds = ConnectionRounds::new(Instant::now());
+            let refused: Vec<_> = (0..4).map(|_| rounds.note_refusal()).collect();
+            assert_eq!(refused, [First, Repeat, Repeat, Repeat]);
+            assert_eq!(rounds.refusals, 4, "every refusal is counted");
+            let mut another = ConnectionRounds::new(Instant::now());
+            assert_eq!(another.note_refusal(), First, "per connection");
+        }
+
+        #[test]
+        fn the_test_run_id_is_a_uuid() {
+            assert!(RoundId::parse(RUN, 1).is_ok());
         }
     }
 }

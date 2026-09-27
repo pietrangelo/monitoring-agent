@@ -14,10 +14,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+mod applications;
+mod clock;
 mod collector;
 mod db;
 mod models;
 mod push;
+mod retention;
+mod round_intake;
 mod routes;
 mod state;
 
@@ -72,6 +76,7 @@ async fn run() -> Result<(), StartupError> {
 
     // Start background pollers (for HTTP-polled systems)
     collector::start_collectors(app_state.clone());
+    retention::start(app_state.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -80,6 +85,7 @@ async fn run() -> Result<(), StartupError> {
 
     let app = Router::new()
         .merge(routes::api::router(app_state.clone()))
+        .merge(routes::applications::router(app_state.clone()))
         .merge(routes::sse::router(app_state.clone()))
         .merge(push::router(app_state.clone(), push_auth))
         .nest_service("/", ServeDir::new("static"))

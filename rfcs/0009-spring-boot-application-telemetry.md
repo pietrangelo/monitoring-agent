@@ -983,6 +983,44 @@ only a step-based registry. Record the gauges each shows in the change summary.
   5. hub dashboard and `xss.mjs`, the agent dashboard label, and the README and ARCHITECTURE
      updates.
 
+## Implementation notes
+
+Where commit 3 settled a detail this RFC left open, or departed from its text:
+
+- `Database::store_round` takes `points: impl IntoIterator<Item = (String, f32)>` and
+  `on_stored: impl FnOnce(SourcePace)`: the spent pace reaches the source through `on_stored`,
+  which is how a push connection keeps its own bucket.
+- `HeldRound::received_at` is in seconds on the hub's clock, like every stored timestamp; the
+  endpoint's `age_secs` needs no more.
+- The round digest covers the interval and every application in order (name, health,
+  version, each gauge and its `f64` bits). Two rounds listing the same applications in another
+  order are different rounds.
+- A full `SourcePace` banks no time: its clock restarts when a round is taken from a full
+  bucket, so a source never has more than 2 rounds in hand.
+- `SystemApplications` gains `poll_pace` in commit 4, with the poller.
+- The "a reader of `live_applications` isn't blocked for the length of a transaction" test
+  is replaced by `both_closures_run_under_the_database_mutex`, and by the closures' shape:
+  each takes the live lock in a block that ends before the closure returns, and the inserts
+  run outside both closures. No stub can make a barrier test red, so it would be decoration.
+- Admitting and storing a round lives in `system-hub/src/round_intake.rs`, not in `push/`,
+  so the poller (commit 4) calls the same `store_round(app, id, round, pace, Arrival)`.
+- A `metric_retention` row with a negative `retention_secs` (only possible by hand) counts as
+  no row for `app:*` pruning, as `insert_metric` treats a missing row today.
+- `a_connections_pace_refills_one_round_per_8_seconds` sleeps 8.2 s on a real connection. It
+  stays: it is the only test that pins the adapter's source of `now` (a frozen `Instant`
+  would starve every long-lived connection after two rounds).
+- `db.rs` passes 500 lines of non-test code; the application-point functions are its natural
+  split line, left for RFC 0010, which replaces them.
+- Review items no test can pin: one database guard from the existence check to `on_stored`
+  (a gap between `decide` and the insert shows only as a race); each prune batch as its own
+  hold of the mutex; `DELETE /api/systems/:id` evicting the live entry after the row; the
+  push receiver logging a connection's first refused frame at `warn` and the rest at
+  `debug`.
+- Measured on the owner's machine (WSL2, release build), one prune pass over one system's
+  `app:*` range, half of it past 24 h: 190k points, 95k deleted in 0.69 s (19 batches, about
+  36 ms each); 1.9M points, 950k deleted in 12.8 s (190 batches, about 67 ms each). A pass
+  with nothing to delete scans in 4 ms and 53 ms. Each batch is one hold of the mutex.
+
 ## Review
 
 `rfc-adversary`, first pass, on the first draft. Every finding was acted on:

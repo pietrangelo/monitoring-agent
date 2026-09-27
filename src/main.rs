@@ -128,7 +128,7 @@ async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
     tokio::spawn(async move {
         collectors::background_collector(bg_state).await;
     });
-    spawn_push_client();
+    spawn_push_client(app_state.rounds.clone());
 
     serve(router(app_state)).await
 }
@@ -155,8 +155,9 @@ fn start_applications(
     Ok(app_state)
 }
 
-/// Starts the push client if `PUSH_TO` names a hub. It reconnects for the agent's lifetime.
-fn spawn_push_client() {
+/// Starts the push client if `PUSH_TO` names a hub. It reconnects for the agent's lifetime,
+/// sending the scrape loop's rounds too when applications are on.
+fn spawn_push_client(rounds: Option<applications::scrape_loop::RoundReceiver>) {
     let Ok(hub_url) = std::env::var("PUSH_TO") else {
         return;
     };
@@ -166,8 +167,19 @@ fn spawn_push_client() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     tokio::spawn(async move {
+        // Resolved once, off the runtime: it reads files and may shell out to `hostname`.
+        let system_id = match tokio::task::spawn_blocking(push::get_persistent_id).await {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!("Couldn't resolve the push system id: {err}; not pushing");
+                return;
+            }
+        };
+        let mut rounds = rounds;
         loop {
-            if let Err(e) = push::run_push_client(&hub_url, &token, interval).await {
+            let pushed =
+                push::run_push_client(&hub_url, &token, &system_id, interval, &mut rounds).await;
+            if let Err(e) = pushed {
                 tracing::error!("Push client error: {e}, retrying in 5s...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }

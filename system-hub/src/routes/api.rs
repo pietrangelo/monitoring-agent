@@ -140,6 +140,12 @@ async fn delete_system(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     s.db.delete_system(&id)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    // After the row: a store racing this delete then finds the system gone instead of
+    // recreating an entry nothing would evict.
+    s.live_applications
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id);
     s.refresh_cache();
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
@@ -465,6 +471,49 @@ mod tests {
         let json = body_json(res).await;
         assert_eq!(json["enabled"], false);
         assert_eq!(json["name"], "w"); // untouched
+    }
+
+    #[tokio::test]
+    async fn deleting_a_system_forgets_its_applications() {
+        let (state, _dir) = temp_state();
+        let app = router(state.clone());
+        let created = body_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/systems",
+                    serde_json::json!({"name": "w", "url": "http://x"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        for system in [id.as_str(), "other"] {
+            state.live_applications.write().unwrap().insert(
+                system.to_string(),
+                crate::state::SystemApplications::default(),
+            );
+        }
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/systems/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let live = state.live_applications.read().unwrap();
+        assert!(
+            !live.contains_key(&id),
+            "the deleted system's entry is gone"
+        );
+        assert!(live.contains_key("other"), "another system's entry stays");
     }
 
     #[tokio::test]

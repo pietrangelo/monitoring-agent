@@ -14,6 +14,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod api;
-pub mod applications;
-pub mod sse;
+//! The hub's wall clock, read only at the edges: domain code takes `now` as an argument.
+
+/// Seconds since the Unix epoch on the hub's clock; 0 if the clock is before the epoch.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}

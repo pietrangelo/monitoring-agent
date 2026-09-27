@@ -18,12 +18,11 @@
 
 use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::applications::report::{ApplicationHealth, ApplicationReport, ReportedHealth};
-use crate::applications::round::{NamedReport, ScrapeRound};
+use crate::applications::round::ScrapeRound;
 use crate::applications::scrape_loop::RoundReceiver;
+use crate::applications::wire::ApplicationReportDto;
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -51,22 +50,13 @@ struct ApplicationsResponse {
     round: Option<RoundIdDto>,
     interval_secs: Option<u64>,
     scraped_at: Option<u64>,
-    applications: Vec<ApplicationDto>,
+    applications: Vec<ApplicationReportDto>,
 }
 
 #[derive(Debug, Serialize)]
 struct RoundIdDto {
     run: String,
     seq: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct ApplicationDto {
-    name: String,
-    health: &'static str,
-    version: Option<String>,
-    /// Keyed by gauge wire name; a gauge that couldn't be derived is left out.
-    gauges: BTreeMap<&'static str, f64>,
 }
 
 impl From<Option<&ScrapeRound>> for ApplicationsResponse {
@@ -89,42 +79,9 @@ impl From<Option<&ScrapeRound>> for ApplicationsResponse {
             applications: round
                 .applications
                 .iter()
-                .map(ApplicationDto::from)
+                .map(ApplicationReportDto::from)
                 .collect(),
         }
-    }
-}
-
-impl From<&NamedReport> for ApplicationDto {
-    fn from(named: &NamedReport) -> Self {
-        Self {
-            name: named.name.as_str().to_string(),
-            health: health_wire_name(named.report.health()),
-            version: match &named.report {
-                ApplicationReport::Reached { version, .. } => {
-                    version.as_ref().map(|version| version.as_str().to_string())
-                }
-                ApplicationReport::Unreachable(_) => None,
-            },
-            gauges: match &named.report {
-                ApplicationReport::Reached { gauges, .. } => gauges
-                    .iter()
-                    .map(|(gauge, value)| (gauge.wire_name(), value))
-                    .collect(),
-                ApplicationReport::Unreachable(_) => BTreeMap::new(),
-            },
-        }
-    }
-}
-
-/// `health` on the wire. The `ScrapeFailure` behind `unreachable` stays in the agent's log.
-fn health_wire_name(health: ApplicationHealth) -> &'static str {
-    match health {
-        ApplicationHealth::Reported(ReportedHealth::Up) => "up",
-        ApplicationHealth::Reported(ReportedHealth::Down) => "down",
-        ApplicationHealth::Reported(ReportedHealth::OutOfService) => "out_of_service",
-        ApplicationHealth::Reported(ReportedHealth::Unknown) => "unknown",
-        ApplicationHealth::Unreachable(_) => "unreachable",
     }
 }
 
@@ -132,80 +89,15 @@ fn health_wire_name(health: ApplicationHealth) -> &'static str {
 mod tests {
     use super::*;
     use crate::alerts::AgentRun;
-    use crate::applications::config::{Applications, ApplicationsConfig};
-    use crate::applications::report::{
-        MeterValue, Meters, RawScrape, ReachedScrape, ScrapeFailure, ScrapeHistory,
-    };
-    use crate::applications::round::RoundId;
+    use crate::applications::wire::sample_round;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
     use tokio::sync::watch;
     use tower::ServiceExt;
 
-    fn applications_config() -> Applications {
-        let vars = [
-            (
-                "SPRING_BOOT_APPS",
-                "orders=http://127.0.0.1:1,billing=http://127.0.0.1:2",
-            ),
-            // Not the default, so the served interval can't be the default by accident.
-            ("SPRING_BOOT_SCRAPE_INTERVAL", "20"),
-        ];
-        let lookup = move |key: &str| {
-            vars.iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
-                .ok_or(std::env::VarError::NotPresent)
-        };
-        match ApplicationsConfig::parse(lookup) {
-            Ok(ApplicationsConfig::On(apps)) => apps,
-            _ => panic!("the test configuration parses"),
-        }
-    }
-
-    /// `orders` reached, with a version and two gauges; `billing` unreachable.
     fn round() -> ScrapeRound {
-        let apps = applications_config();
-        let meters = Meters {
-            heap_used: MeterValue::Published(300.0),
-            heap_max: MeterValue::NotPublished,
-            cpu_usage: MeterValue::NotPublished,
-            live_threads: MeterValue::NotPublished,
-            gc_pause_seconds: MeterValue::NotPublished,
-            http_requests: MeterValue::NotPublished,
-            http_server_errors: MeterValue::NotPublished,
-            db_connections_active: MeterValue::NotPublished,
-            uptime_seconds: MeterValue::Published(600.5),
-        };
-        let raws = [
-            RawScrape::Reached(ReachedScrape {
-                health: ReportedHealth::Up,
-                version: Some("2.4.1".into()),
-                meters,
-                own_requests: 11,
-            }),
-            RawScrape::Unreachable(ScrapeFailure::Timeout),
-        ];
-        let now = std::time::Instant::now();
-        let applications = apps
-            .targets()
-            .iter()
-            .zip(raws)
-            .map(|(target, raw)| NamedReport {
-                name: target.name().clone(),
-                report: ScrapeHistory::default().advance(raw, now).1,
-            })
-            .collect();
-        ScrapeRound {
-            id: RoundId {
-                run: AgentRun::new(uuid::Uuid::from_u128(0x2a)),
-                seq: 7,
-            },
-            interval: apps.interval(),
-            scraped_at: 1_790_000_000,
-            applications,
-        }
+        sample_round(AgentRun::new(uuid::Uuid::from_u128(0x2a)), 7)
     }
 
     async fn get_applications(state: Arc<AppState>) -> Value {
@@ -274,21 +166,5 @@ mod tests {
             assert_eq!(get_applications(state).await, no_round, "case: {name}");
         }
         drop(waiting);
-    }
-
-    #[test]
-    fn every_application_health_has_its_wire_name() {
-        use ApplicationHealth::{Reported, Unreachable};
-        let cases = [
-            (Reported(ReportedHealth::Up), "up"),
-            (Reported(ReportedHealth::Down), "down"),
-            (Reported(ReportedHealth::OutOfService), "out_of_service"),
-            (Reported(ReportedHealth::Unknown), "unknown"),
-            (Unreachable(ScrapeFailure::Connect), "unreachable"),
-            (Unreachable(ScrapeFailure::Unauthorized), "unreachable"),
-        ];
-        for (health, wire) in cases {
-            assert_eq!(health_wire_name(health), wire, "case: {health:?}");
-        }
     }
 }
