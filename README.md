@@ -262,7 +262,7 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | Endpoint | Description |
 |---|---|
 | `GET /api/health` | Health check + version |
-| `GET /api/system` | Full snapshot — CPU, memory, disk, network, load, processes — plus `collected_at` (unix seconds, the agent's clock, when it was read). Every `/api/system*` route serves the background collector's latest snapshot (at most one 2 s tick old) and answers `503` with `{"error": "stale snapshot"}` when it was read more than 30 s ago |
+| `GET /api/system` | Full snapshot — CPU, memory, disk, network, load, processes — plus `collected_at` (unix seconds, the agent's clock, when it was read) and `environment`: `kind` (`bare_metal` \| `virtual_machine` \| `container` \| `undetermined`), `runtime` (a container's: `docker` \| `podman` \| `kubernetes` \| `lxc` \| `systemd_nspawn`, or `null` when unnamed or not a container), `hypervisor` (a virtual machine's: `kvm` \| `qemu` \| `vmware` \| `hyperv` \| `wsl` \| `xen` \| `virtualbox` \| `amazon_ec2` \| `google_compute` \| `other`, else `null`) and `load_scope` (`host` in a container, else `environment`), classified once at startup. Every `/api/system*` route serves the background collector's latest snapshot (at most one 2 s tick old) and answers `503` with `{"error": "stale snapshot"}` when it was read more than 30 s ago |
 | `GET /api/system/cpu` | CPU model, cores, usage % |
 | `GET /api/system/memory` | RAM + swap |
 | `GET /api/system/disk` | All mounted disks |

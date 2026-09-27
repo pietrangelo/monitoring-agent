@@ -19,6 +19,17 @@ Runs on every monitored Linux host. Responsibilities:
   network, processes (`system.rs`, via `sysinfo`), installed packages (`packages.rs`, shells
   out to `dpkg`/`rpm`/`pacman`/`apk`), systemd units (`services.rs`), Docker containers
   (`containers.rs`), and listening TCP ports (`ports.rs`).
+- Classifies its **execution environment** once at startup, before the first reading (RFC
+  0014 §3): `collectors/environment.rs::gather_evidence` reads the container markers
+  (`/.dockerenv`, `/run/.containerenv`, `/run/systemd/container`, the `container` and
+  `KUBERNETES_SERVICE_HOST` variables) and the virtualisation evidence (the `hypervisor` CPU
+  flag, DMI vendor and product, `/sys/hypervisor/type`, a Microsoft kernel release) off the
+  runtime, and the pure `environment::classify` turns it into bare metal, a virtual machine,
+  a container or undetermined. Only an explicit marker makes a container. A file that can't
+  be read is no evidence. The result is logged once and stamped by the sampler on every
+  snapshot, and `/api/system` serves it as `environment` through a wire DTO
+  (`models.rs::EnvironmentInfo`). It doesn't change any reading yet: cgroup-sourced
+  readings are RFC 0014's next step.
 - Reads the system in exactly one place (RFC 0014 §6). `collectors/sampler.rs::Sampler` owns
   one long-lived `sysinfo::System`, so CPU usage is measured over the time since the previous
   reading. Its first reading only primes it and is never published. `main` primes it, waits
@@ -166,7 +177,7 @@ match those rules (listed under Open architectural questions below).
 
 | Context | Crate | Domain core | Adapters (I/O) | Owns |
 |---|---|---|---|---|
-| **Host Telemetry** | agent | `environment/` (the pure core of RFC 0014; today `usage.rs`: `Percent`, `LoadAverage`), `models.rs`, `snapshot.rs` (`CollectedSnapshot`, `PublishedSnapshot`, `SnapshotSeq`, `Priming` / `PRIMING`, `SnapshotFreshness` / `STALENESS_BOUND`, `StreamState` / `StreamEmit`; no tokio types), `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs); `collectors/sampler.rs` (`Sampler`, `Gather`, `SysinfoSource`); `collectors/mod.rs` (`first_snapshot`, `background_collector`, `monotonic_now`, the snapshot `watch` channel: `SnapshotSender` / `SnapshotReceiver`) | the snapshot of one host and its recent history |
+| **Host Telemetry** | agent | `environment/` (the pure core of RFC 0014: `mod.rs`: `ExecutionEnvironment`, `Hypervisor`, `ContainerRuntime`, `LoadScope`, `classify`; `evidence.rs`: `EnvironmentEvidence`, `ContainerMarker`, `CpuArchitecture` and the evidence parsers; `usage.rs`: `Percent`, `LoadAverage`), `models.rs`, `snapshot.rs` (`CollectedSnapshot`, `PublishedSnapshot`, `SnapshotSeq`, `Priming` / `PRIMING`, `SnapshotFreshness` / `STALENESS_BOUND`, `StreamState` / `StreamEmit`; no tokio types), `state.rs` (`MetricsHistory` ring buffer; `AppState` is wiring, and `AppState::new` mints the agent run) | `collectors/*` (sysinfo; `dpkg`/`rpm`/`pacman`/`apk`, `systemctl`, `docker`, `ss` shell-outs); `collectors/environment.rs` (`gather_evidence`, over a root path and a variable lookup); `collectors/sampler.rs` (`Sampler`, `Gather`, `SysinfoSource`); `collectors/mod.rs` (`first_snapshot`, `background_collector`, `monotonic_now`, the snapshot `watch` channel: `SnapshotSender` / `SnapshotReceiver`) | the snapshot of one host and its recent history |
 | **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `AgentRun`, `IncidentId`, `Readings` / `Reading`, the per-rule `Breach` state, `AlertManager::evaluate` and `replace_rules`) | `routes/api.rs` alert endpoints, `routes/sse.rs` and `routes/ws.rs` alert streams | deciding when a metric breaches a rule, for how long, and cooldown; the identity of each alert incident |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `PushFeed` and `SnapshotCursor`, which sends each published snapshot once, by seq; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
@@ -223,6 +234,10 @@ mixed-version fleet must keep working):
 | **snapshot seq** | the collector's count of published snapshots, from 0 at startup. It only grows, across sampler rebuilds, and never reads the wall clock. It stays inside the agent | `SnapshotSeq` |
 | **stale snapshot** | a published snapshot read more than 30 s ago on the monotonic clock. The agent never serves one. Not *application freshness*, which is the hub's rule for scrape rounds | `SnapshotFreshness`, `STALENESS_BOUND` |
 | **raw readings** | what one collection reads from sysinfo and the OS, before the snapshot's rules (averages, percentages, the top processes) are applied. The OS description is the one field already resolved, since its `lsb_release` fallback runs only when needed. Not *metric readings* | `RawReadings` |
+| **execution environment** | what the agent runs in, classified once at startup: *bare metal*, a *virtual machine* (with its hypervisor when known), a *container* (with its runtime when known) or *undetermined*. Only an explicit container marker makes a container; a cgroup limit or an overlay root never does | `ExecutionEnvironment`, `classify` |
+| **container marker** | an explicit statement that the agent runs in a container: `/.dockerenv`, `/run/.containerenv`, `KUBERNETES_SERVICE_HOST`, or a `container` value (the agent's variable or `/run/systemd/container`) other than `wsl`. The only thing that makes a container | `ContainerMarker` and the marker fields of `EnvironmentEvidence` |
+| **environment evidence** | the observations classification weighs: container markers, the hypervisor CPU flag, DMI, Xen and a WSL kernel, each parsed at the edge. An unreadable source is no evidence | `EnvironmentEvidence` |
+| **load scope** | whose load average the kernel reports to the agent: the host's in a container, which shares the host's run queue, else the execution environment's own | `LoadScope` |
 | **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
 | **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
 | **alert rule** | a metric, an operator, a threshold, a duration and a cooldown | `AlertRule` |

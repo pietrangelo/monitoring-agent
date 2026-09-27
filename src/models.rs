@@ -16,6 +16,128 @@
 
 use serde::Serialize;
 
+use crate::environment::{ContainerRuntime, ExecutionEnvironment, Hypervisor, LoadScope};
+
+// ── Execution environment ───────────────────────────────
+
+/// `/api/system`'s `environment` object (RFC 0014 §7): the wire shape of an
+/// `ExecutionEnvironment`, converted at the edge.
+#[derive(Serialize)]
+pub struct EnvironmentInfo {
+    kind: EnvironmentKind,
+    /// A container's runtime; `null` when unknown or not a container.
+    runtime: Option<RuntimeName>,
+    /// A virtual machine's hypervisor, `other` when unnamed; `null` when not a virtual machine.
+    hypervisor: Option<HypervisorName>,
+    load_scope: LoadScopeName,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EnvironmentKind {
+    BareMetal,
+    VirtualMachine,
+    Container,
+    Undetermined,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeName {
+    Docker,
+    Podman,
+    Kubernetes,
+    Lxc,
+    SystemdNspawn,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HypervisorName {
+    Kvm,
+    Qemu,
+    Vmware,
+    #[serde(rename = "hyperv")]
+    HyperV,
+    Wsl,
+    Xen,
+    #[serde(rename = "virtualbox")]
+    VirtualBox,
+    AmazonEc2,
+    GoogleCompute,
+    Other,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LoadScopeName {
+    Host,
+    Environment,
+}
+
+impl From<&ExecutionEnvironment> for EnvironmentInfo {
+    fn from(environment: &ExecutionEnvironment) -> Self {
+        let (kind, runtime, hypervisor) = match environment {
+            ExecutionEnvironment::BareMetal => (EnvironmentKind::BareMetal, None, None),
+            ExecutionEnvironment::VirtualMachine { hypervisor } => (
+                EnvironmentKind::VirtualMachine,
+                None,
+                Some((*hypervisor).into()),
+            ),
+            ExecutionEnvironment::Container { runtime } => (
+                EnvironmentKind::Container,
+                runtime.map(RuntimeName::from),
+                None,
+            ),
+            ExecutionEnvironment::Undetermined => (EnvironmentKind::Undetermined, None, None),
+        };
+        Self {
+            kind,
+            runtime,
+            hypervisor,
+            load_scope: environment.load_scope().into(),
+        }
+    }
+}
+
+impl From<ContainerRuntime> for RuntimeName {
+    fn from(runtime: ContainerRuntime) -> Self {
+        match runtime {
+            ContainerRuntime::Docker => Self::Docker,
+            ContainerRuntime::Podman => Self::Podman,
+            ContainerRuntime::Kubernetes => Self::Kubernetes,
+            ContainerRuntime::Lxc => Self::Lxc,
+            ContainerRuntime::SystemdNspawn => Self::SystemdNspawn,
+        }
+    }
+}
+
+impl From<Hypervisor> for HypervisorName {
+    fn from(hypervisor: Hypervisor) -> Self {
+        match hypervisor {
+            Hypervisor::Kvm => Self::Kvm,
+            Hypervisor::Qemu => Self::Qemu,
+            Hypervisor::Vmware => Self::Vmware,
+            Hypervisor::HyperV => Self::HyperV,
+            Hypervisor::Wsl => Self::Wsl,
+            Hypervisor::Xen => Self::Xen,
+            Hypervisor::VirtualBox => Self::VirtualBox,
+            Hypervisor::AmazonEc2 => Self::AmazonEc2,
+            Hypervisor::GoogleCompute => Self::GoogleCompute,
+            Hypervisor::Other => Self::Other,
+        }
+    }
+}
+
+impl From<LoadScope> for LoadScopeName {
+    fn from(scope: LoadScope) -> Self {
+        match scope {
+            LoadScope::Host => Self::Host,
+            LoadScope::Environment => Self::Environment,
+        }
+    }
+}
+
 // ── System ──────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -179,4 +301,66 @@ pub struct HistoryResponse {
     pub points: Vec<MetricPoint>,
     pub start_time: u64,
     pub end_time: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn an_environment_goes_on_the_wire_by_its_kind_runtime_and_hypervisor() {
+        use ExecutionEnvironment::*;
+        let vm = |hypervisor| VirtualMachine { hypervisor };
+        let container = |runtime| Container { runtime };
+        let wire = |kind: &str, runtime: Option<&str>, hypervisor: Option<&str>, load: &str| json!({ "kind": kind, "runtime": runtime, "hypervisor": hypervisor, "load_scope": load });
+        let cases = [
+            (BareMetal, wire("bare_metal", None, None, "environment")),
+            (
+                Undetermined,
+                wire("undetermined", None, None, "environment"),
+            ),
+            (container(None), wire("container", None, None, "host")),
+        ]
+        .into_iter()
+        .chain(
+            [
+                (Hypervisor::Kvm, "kvm"),
+                (Hypervisor::Qemu, "qemu"),
+                (Hypervisor::Vmware, "vmware"),
+                (Hypervisor::HyperV, "hyperv"),
+                (Hypervisor::Wsl, "wsl"),
+                (Hypervisor::Xen, "xen"),
+                (Hypervisor::VirtualBox, "virtualbox"),
+                (Hypervisor::AmazonEc2, "amazon_ec2"),
+                (Hypervisor::GoogleCompute, "google_compute"),
+                (Hypervisor::Other, "other"),
+            ]
+            .map(|(h, name)| {
+                (
+                    vm(h),
+                    wire("virtual_machine", None, Some(name), "environment"),
+                )
+            }),
+        )
+        .chain(
+            [
+                (ContainerRuntime::Docker, "docker"),
+                (ContainerRuntime::Podman, "podman"),
+                (ContainerRuntime::Kubernetes, "kubernetes"),
+                (ContainerRuntime::Lxc, "lxc"),
+                (ContainerRuntime::SystemdNspawn, "systemd_nspawn"),
+            ]
+            .map(|(r, name)| {
+                (
+                    container(Some(r)),
+                    wire("container", Some(name), None, "host"),
+                )
+            }),
+        );
+        for (environment, expected) in cases {
+            let got = serde_json::to_value(EnvironmentInfo::from(&environment)).unwrap();
+            assert_eq!(got, expected, "{environment:?}");
+        }
+    }
 }
