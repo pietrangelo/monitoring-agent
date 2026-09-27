@@ -167,4 +167,16 @@ mod tests {
         }
         drop(waiting);
     }
+
+    #[test]
+    fn a_round_serves_the_golden_applications_poll_body() {
+        // Written by hand, the same round as the golden application frame; the hub's poll
+        // test decodes the same file.
+        let golden: Value =
+            serde_json::from_str(include_str!("../../testdata/applications-v1.json")).unwrap();
+        let run = uuid::Uuid::parse_str("6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b").unwrap();
+        let round = crate::applications::wire::sample_round(AgentRun::new(run), 42);
+        let served = serde_json::to_value(ApplicationsResponse::from(Some(&round))).unwrap();
+        assert_eq!(served, golden);
+    }
 }

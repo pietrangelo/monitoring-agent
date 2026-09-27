@@ -1,0 +1,14 @@
+{
+  "round": { "run": "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b", "seq": 42 },
+  "interval_secs": 20,
+  "scraped_at": 1790000000,
+  "applications": [
+    {
+      "name": "orders",
+      "health": "up",
+      "version": "2.4.1",
+      "gauges": { "heap_used_bytes": 300.0, "uptime_seconds": 600.5 }
+    },
+    { "name": "billing", "health": "unreachable", "version": null, "gauges": {} }
+  ]
+}

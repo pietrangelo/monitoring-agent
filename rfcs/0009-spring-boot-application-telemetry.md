@@ -581,8 +581,8 @@ token.
 
 | Answer | Outcome |
 |---|---|
-| 404 | an agent older than this RFC: evict any entry; no error |
-| 200, `round: null` | evict any entry |
+| 404 | an agent older than this RFC: clear the shown round, keep recent rounds and the pace; no error |
+| 200, `round: null` | clear the shown round, keep recent rounds and the pace |
 | 200 with a round that converts | `store_round` in `spawn_blocking` |
 | anything else (other status, body over 256 KiB, bad JSON, refused round) | logged at `debug`; the system's status is left alone, because it describes the agent, not its applications |
 
@@ -1016,6 +1016,27 @@ Where commit 3 settled a detail this RFC left open, or departed from its text:
   hold of the mutex; `DELETE /api/systems/:id` evicting the live entry after the row; the
   push receiver logging a connection's first refused frame at `warn` and the rest at
   `debug`.
+- Commit 4: the wire DTOs moved to `system-hub/src/application_wire.rs`, since both
+  ingestion paths use them. `SystemApplications::poll_pace` is an `Option<SourcePace>`
+  (`None` until the poller's first stored round, a full bucket), written back only when a
+  polled round is stored. The per-system "warn once an hour" for refused polled rounds is kept
+  in the same entry (`poll_refusal_warned_at`), so a refusal creates the entry.
+- The poll's body cap reads chunk by chunk, refusing past 256 KiB whatever `Content-Length`
+  says; a status other than 404 and 2xx, bad JSON and a refused round are each logged and
+  change nothing.
+- The poll path has its own 8.2 s refill test (`a_systems_poll_pace_refills_one_round_per_8_seconds`),
+  for the same reason as push: only a real wait pins the adapter's source of `now`.
+- Review item no test can pin: `refused_poll`'s wiring (the last warning kept per system,
+  and updated when it warns).
+- Hub-time assertions allow 30 s of slack: the owner's WSL2 host stepped its clock mid-suite
+  once. The agent clocks in those tests (`u64::MAX`, 1 700 000 000) stay far outside it.
+- The poll pace is read and spent inside the admission step (`round_intake::store_polled_round`:
+  read in `decide`, written in `on_stored`, both under the database mutex). A tick spawns a
+  poll without waiting for the last one, so without this, overlapping polls of one system
+  would each spend a full bucket.
+- The poller's pace and refusal throttle live on `SystemApplications`, beside Fleet History's
+  shown and recent rounds, rather than in a poller-owned map. It is the cheapest shape; its
+  cost is that a refusal creates the live entry (see ARCHITECTURE § Open questions).
 - Measured on the owner's machine (WSL2, release build), one prune pass over one system's
   `app:*` range, half of it past 24 h: 190k points, 95k deleted in 0.69 s (19 batches, about
   36 ms each); 1.9M points, 950k deleted in 12.8 s (190 batches, about 67 ms each). A pass
