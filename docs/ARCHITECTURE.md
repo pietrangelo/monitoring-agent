@@ -88,7 +88,12 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 - Maintains an in-memory live-metrics cache (`state.rs`) for low-latency dashboard updates
   between DB writes.
 - Exposes a REST API and an SSE summary stream (`routes/`), and serves a static fleet
-  dashboard (`static/index.html`) that updates every 5s via SSE.
+  dashboard (`static/index.html`) that updates every 5s via SSE. The dashboard is served from
+  `HUB_STATIC_DIR` when it is set (it must then be a directory the hub can search, or the
+  hub refuses to start), and from `static` under the working directory otherwise. The container image sets it to
+  `/usr/share/system-hub/static`, outside the `/app` data volume, because a named volume is
+  filled from the image only when it is created and would otherwise pin the dashboard to the
+  volume's first image. `main.rs::app` assembles the served router, so a test can reach it.
 
 ## Data flow
 
@@ -365,9 +370,10 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   check startup configuration no router test can reach: a non-UTF-8 `HUB_PUSH_TOKEN` refuses
   startup before any file is created, and an unopenable database is a logged exit, not a
   panic.
-- Route tests drive each module's `router`, not the production app: `main.rs` assembles
-  that inline (merging the routers, `ServeDir` and CORS), so no test reaches a layer added
-  there.
+- Route tests drive each module's `router`. In the hub, `main.rs::app` assembles the
+  production router (the module routers, `ServeDir` and CORS), and its tests check that the
+  API, applications, SSE and push routes, CORS and the configured dashboard directory all survive the
+  assembly. The agent's `main.rs` still assembles its router without such a test.
 - **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector/`) are
   tested against real (but temporary) SQLite files via the `tempfile` crate — never against the
   real `system-hub.db`. `collector/`'s `poll_system` (including the applications poll and the no-redirect rule) is tested against a small mock
