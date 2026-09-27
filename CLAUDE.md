@@ -25,6 +25,17 @@ sync when endpoints change, but architectural _reasoning_ belongs in `docs/ARCHI
 - Favor sequential execution over wide parallel fan-outs.
 - Before spawning a sub-agent, verify that its target file set does not overlap with existing active agents to prevent merge conflicts.
 
+## Token & Context Optimization Rules
+
+- Command Output Suppression: Always pipe long command outputs or limit their verbosity to prevent context pollution:
+  - Tests: `cargo test -- <test_name> --nocapture` for targeted runs; never run bare full-suite `cargo test` during intermediate TDD steps.
+  - Clippy: `cargo clippy --all-targets --all-features -- -D warnings 2>&1 | head -n 40`
+  - Truncation: If any command output exceeds 40 lines, truncate it. Inspect only the first 2-3 compiler errors, fix them, and re-run.
+- Execution Effort Alignment:
+  - On Medium Effort: Adversarial reviews (`red-test-adversary`, `rosette-auditor`) run in-process as sequential thought checks. Do NOT spawn separate background sub-agents unless explicitly asked.
+  - On High/Ultracode: Cap sub-agents to max 3 (Planner, Implementer, Critic).
+- TDD Build Target: Run `cargo check` and debug `cargo test` during TDD iterations. Reserve `cargo build --release` strictly for the final gate (Phase 5).
+
 ## Toolchain & edition policy
 
 - Target the **latest stable Rust** (`rustup update stable`), currently tracking 1.9x /
@@ -151,44 +162,16 @@ move a module between contexts.
   codebase in one pass, but every file you touch must end with a cleaner domain boundary than
   it started with, never a muddier one.
 
-### The Rosette of Beautiful Code
+### The Rosette of Beautiful Code (Auditing Constraints)
 
-Judge every diff on these eight dimensions: yourself during TDD phase 4 (refactor), and
-the `rosette-auditor` before the change is called done.
-
-1. **Storytelling** — A handler reads top to bottom as the request's story: extract →
-   authorize → parse into domain → decide → respond. A collector reads as gather → parse →
-   snapshot. A domain module reads as the rules it enforces.
-2. **Simplicity** — Low cognitive load matters more than compact syntax. One function, one
-   responsibility, within 30–50 lines of code (comments, blank lines and `#[cfg(test)]`
-   modules don't count). Past that, extract the helper hiding inside the function rather than
-   nesting another `match` or loop. A file nearing 500 lines of non-test code is a smell to
-   investigate, not a quota to fill: never split into `db_part1.rs`/`db_part2.rs`, split only
-   along a boundary that would exist anyway, and leave a cohesive file alone. An
-   `#[allow(clippy::…)]` that silences a complexity lint (`too_many_arguments`,
-   `type_complexity`, `cognitive_complexity`) is a finding, not a fix: introduce the value
-   object it's asking for. Nothing enforces this mechanically yet; you and the auditor do.
-3. **Clarity of Intent** — Model state and absence explicitly: enums instead of boolean flags
-   or combinations of `Option`s, newtypes instead of bare `String`/`f32`/`u64`, and no
-   sentinel values (`""`, `0`, `-1`, `"unknown"`). Make invalid states unrepresentable. Errors
-   are typed enums, not strings.
-4. **Expressiveness** — Idiomatic Rust: iterators where they read better than loops, `?`,
-   `From`/`TryFrom` at boundaries, and exhaustive `match` over domain enums with no `_ =>`
-   catch-all, so a new variant forces every site to decide. Comments explain _why_, never
-   _what_.
-5. **Purity** — Side effects (I/O, clock, env, shell-outs, DB, network, randomness) stay at
-   the edges. Domain functions are deterministic given their arguments, so plain values are
-   enough to test them.
-6. **Sustainability** — Tests are table-driven: a `cases` array of `(name, input, expected)`,
-   iterated, with the case name in the assertion message. Include rows for boundaries
-   (exactly at the threshold), empty and malformed input, and each error variant. Test names
-   state behaviour in the ubiquitous language.
-7. **Durability** — A new capability (collector, alert metric, route, stored metric) attaches
-   by adding a module or an enum variant, not by restructuring core modules. Agents and hub
-   are deployed independently, so assume a mixed-version fleet on the push/poll contract.
-8. **Creativity** — An elegant synthesis within the hard constraints (zero `unsafe`, no
-   blocking on the runtime, OWASP, two independent crates), not the first thing that
-   compiled.
+1. Storytelling: Handlers follow `extract -> auth -> domain_parse -> decide -> respond`. Collectors follow `gather -> parse -> snapshot`.
+2. Simplicity: Max 30-50 LOC per function (excluding tests/comments). Split files nearing 500 LOC only along natural domain boundaries. No `#[allow(clippy::...)]` for complexity; introduce Value Objects instead.
+3. Clarity: Enums over booleans/nested Options; newtypes over primitive strings/floats/integers. Zero sentinel values (`""`, `-1`, `"unknown"`). Make invalid states unrepresentable.
+4. Expressiveness: Iterators over loops, `?` operator, `TryFrom` at borders. Exhaustive `match` on domain enums (NO wildcard `_ =>`).
+5. Purity: Pure domain cores taking/returning plain values. Pass clocks (`now`) and configs as parameters. Zero I/O/Tokio in domain logic.
+6. Sustainability: Table-driven tests: `cases = [(name, input, expected)]`. Cover edge bounds, malformed inputs, and all error variants.
+7. Durability: Open-Closed Principle. Assume mixed-version fleet on WebSocket push/poll contracts.
+8. Creativity: Zero `unsafe`, no blocking calls on Tokio runtime, absolute OWASP compliance.
 
 ### Test-Driven Development
 
@@ -213,6 +196,11 @@ All production code is written test-first, in a closed loop per behaviour:
 5. **Gate.** Run the toolchain sequence above in every touched crate, then run the
    `rosette-auditor` on the diff. Fix whatever the compiler, clippy or tests report; never
    report a change done while the gate is red.
+
+**Circuit breaker:** if a test failure persists after 2 compilation/implementation attempts
+(phases 3–4), STOP immediately. Revert dirty changes (`git checkout -- <files>`), state the
+exact blocker, and ask the user for guidance rather than burning context in trial-and-error
+loops.
 
 Cases where red-first works differently:
 
@@ -244,8 +232,14 @@ directory, and must never edit the repository. Running them is required:
 - Don't re-run `rfc-adversary` on wording or factual corrections you just made to satisfy
   it; a second pass on your own fixes is theatre. Do re-run it if an amendment changes the
   design itself. `red-test-adversary` _is_ re-run after a `DECORATION` or `WEAK-RED` rewrite.
-- If a subagent can't be launched in the current environment, say so in your summary. Never
-  substitute your own self-review and present it as the adversary's verdict.
+- **At medium effort** (see Token & Context Optimization Rules), `red-test-adversary` and
+  `rosette-auditor` run in-process as sequential checks instead of subagents, unless the user
+  asks for the subagent. Apply the same criteria and verdict vocabulary as the agent files in
+  `.claude/agents/`, and label the result in the summary as an **in-process check**, not as
+  the adversary's verdict. `rfc-adversary` always runs as a subagent.
+- If a subagent can't be launched in the current environment, say so in your summary.
+  Outside the medium-effort case above, never substitute your own self-review, and never
+  present a self-review as the adversary's verdict.
 
 Report each adversary's verdict in the change summary, next to the OWASP findings.
 
