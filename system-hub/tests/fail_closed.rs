@@ -22,6 +22,7 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -41,8 +42,7 @@ async fn run_hub(dir: &std::path::Path, token: &OsStr) -> Run {
 }
 
 /// Runs the hub in `dir` with `vars` set and `RUST_LOG`, `HUB_PUSH_TOKEN` and
-/// `HUB_STATIC_DIR` removed otherwise, under
-/// the same 10 s limit as `run_hub`.
+/// `HUB_STATIC_DIR` removed otherwise, under the same 10 s limit as `run_hub`.
 async fn run_hub_with(dir: &std::path::Path, vars: &[(&str, &OsStr)]) -> Run {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_system-hub"));
     command
@@ -166,18 +166,27 @@ async fn an_accepted_push_token_reaches_the_database_and_an_unopenable_one_is_a_
     }
 }
 
-/// A `HUB_STATIC_DIR` that names no directory would serve an empty dashboard, so it refuses
-/// startup before anything is created. One that names a directory, or a symlink to one, or
-/// none at all (unset or empty keep the default `static`, unchecked), gets as far as the
-/// database, which a directory in its place makes fail.
-/// Sets a directory's permissions, and gives them back on drop, so the temporary directory
-/// can be removed even when an assertion fails first.
-struct Locked<'a>(&'a std::path::Path);
+/// A directory whose permissions are set, and given back on drop, so the temporary
+/// directory can be removed even when an assertion fails first.
+struct Locked(PathBuf);
 
-impl<'a> Locked<'a> {
-    fn new(path: &'a std::path::Path, mode: u32) -> Self {
-        std::fs::set_permissions(path, PermissionsExt::from_mode(mode)).unwrap();
+impl Locked {
+    /// Sets the permissions of the existing directory `path`.
+    fn new(path: PathBuf, mode: u32) -> Self {
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(mode)).unwrap();
         Self(path)
+    }
+
+    /// Creates `parent/name` holding a dashboard page, and sets its permissions.
+    fn dashboard(parent: &Path, name: &str, mode: u32) -> Self {
+        let path = parent.join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("index.html"), "unreachable").unwrap();
+        Self::new(path, mode)
+    }
+
+    fn path(&self) -> &OsStr {
+        self.0.as_os_str()
     }
 
     /// Whether the lock binds this process: it doesn't for root, who can look inside anyway.
@@ -186,12 +195,14 @@ impl<'a> Locked<'a> {
     }
 }
 
-impl Drop for Locked<'_> {
+impl Drop for Locked {
     fn drop(&mut self) {
-        let _ = std::fs::set_permissions(self.0, PermissionsExt::from_mode(0o700));
+        let _ = std::fs::set_permissions(&self.0, PermissionsExt::from_mode(0o700));
     }
 }
 
+/// A `HUB_STATIC_DIR` that names no directory, or one the hub can't look inside, would serve
+/// an empty dashboard, so it refuses startup before anything is created.
 #[tokio::test]
 async fn a_static_dir_that_is_not_a_directory_refuses_startup_before_touching_the_database() {
     let outside = tempfile::tempdir().unwrap();
@@ -200,26 +211,16 @@ async fn a_static_dir_that_is_not_a_directory_refuses_startup_before_touching_th
     let missing = outside.path().join("missing");
     // A missing path that isn't UTF-8 must still be read as configured, not as unset.
     let missing_not_utf8 = outside.path().join(OsStr::from_bytes(b"miss\xffing"));
-    // A directory the hub can't look inside: its parent has no permissions at all.
-    let locked = outside.path().join("locked");
-    let behind_lock = locked.join("static");
+    // A directory behind a parent with no permissions at all.
+    let behind_lock = outside.path().join("locked/static");
     std::fs::create_dir_all(&behind_lock).unwrap();
-    let locked = Locked::new(&locked, 0o000);
-    // A directory the hub may list but not look inside, so it would serve nothing: `ServeDir`
-    // needs search permission, not read.
-    let unsearchable = outside.path().join("unsearchable");
-    std::fs::create_dir(&unsearchable).unwrap();
-    std::fs::write(unsearchable.join("index.html"), "unreachable").unwrap();
-    let unsearchable = Locked::new(&unsearchable, 0o400);
-    // No permissions at all on the directory itself, and none for its owner while everyone
-    // else may search it: what counts is whether the hub can look inside, not the mode bits.
-    let closed = outside.path().join("closed");
-    std::fs::create_dir(&closed).unwrap();
-    std::fs::write(closed.join("index.html"), "unreachable").unwrap();
-    let closed = Locked::new(&closed, 0o000);
-    let owner_shut_out = outside.path().join("owner-shut-out");
-    std::fs::create_dir(&owner_shut_out).unwrap();
-    let owner_shut_out = Locked::new(&owner_shut_out, 0o077);
+    let parent_locked = Locked::new(outside.path().join("locked"), 0o000);
+    // `ServeDir` needs search permission, not read, so a directory the hub may list but not
+    // search serves nothing. What counts is whether the hub can look inside, not the mode
+    // bits: its owner may be shut out while everyone else may search.
+    let unsearchable = Locked::dashboard(outside.path(), "unsearchable", 0o400);
+    let closed = Locked::dashboard(outside.path(), "closed", 0o000);
+    let owner_shut_out = Locked::dashboard(outside.path(), "owner-shut-out", 0o077);
     // (case, HUB_STATIC_DIR, what the refusal says)
     let mut cases = vec![
         ("a missing path", missing.as_os_str(), "does not exist"),
@@ -230,28 +231,30 @@ async fn a_static_dir_that_is_not_a_directory_refuses_startup_before_touching_th
         ),
         ("a file", a_file.as_os_str(), "is not a directory"),
     ];
-    let locks = [&locked, &unsearchable, &closed, &owner_shut_out];
-    if locks.iter().all(|lock| lock.holds()) {
-        cases.push((
+    let locked_cases = [
+        (
             "a path the hub can't read",
             behind_lock.as_os_str(),
-            "cannot be read",
-        ));
-        cases.push((
+            &parent_locked,
+        ),
+        (
             "a directory the hub can list but not search",
-            unsearchable.0.as_os_str(),
-            "cannot be read",
-        ));
-        cases.push((
-            "a directory with no permissions",
-            closed.0.as_os_str(),
-            "cannot be read",
-        ));
-        cases.push((
+            unsearchable.path(),
+            &unsearchable,
+        ),
+        ("a directory with no permissions", closed.path(), &closed),
+        (
             "a directory its owner may not search",
-            owner_shut_out.0.as_os_str(),
-            "cannot be read",
-        ));
+            owner_shut_out.path(),
+            &owner_shut_out,
+        ),
+    ];
+    if locked_cases.iter().all(|(_, _, lock)| lock.holds()) {
+        cases.extend(
+            locked_cases
+                .iter()
+                .map(|&(name, path, _)| (name, path, "cannot be read")),
+        );
     } else {
         eprintln!("permissions don't bind this user (root?): the unreadable rows are skipped");
     }
@@ -284,6 +287,9 @@ async fn a_static_dir_that_is_not_a_directory_refuses_startup_before_touching_th
     }
 }
 
+/// One that names a directory the hub can look inside, or a symlink to one, or none at all
+/// (unset or empty keep the default `static`, unchecked), gets as far as the database, which
+/// a directory in its place makes fail.
 #[tokio::test]
 async fn a_directory_or_no_static_dir_at_all_gets_past_the_check() {
     let web = tempfile::tempdir().unwrap();
@@ -293,12 +299,8 @@ async fn a_directory_or_no_static_dir_at_all_gets_past_the_check() {
     let not_utf8 = link_parent.path().join(OsStr::from_bytes(b"we\xffb"));
     std::fs::create_dir(&not_utf8).unwrap();
     // Search without read is all `ServeDir` needs, so it is served.
-    let search_only = link_parent.path().join("search-only");
-    std::fs::create_dir(&search_only).unwrap();
-    let _search_only = Locked::new(&search_only, 0o100);
-    let no_read = link_parent.path().join("no-read");
-    std::fs::create_dir(&no_read).unwrap();
-    let _no_read = Locked::new(&no_read, 0o300);
+    let search_only = Locked::dashboard(link_parent.path(), "search-only", 0o100);
+    let no_read = Locked::dashboard(link_parent.path(), "no-read", 0o300);
     // (case, HUB_STATIC_DIR if set, whether the working directory has a static/ of its own)
     let cases: [(&str, Option<&OsStr>, bool); 9] = [
         (
@@ -315,12 +317,12 @@ async fn a_directory_or_no_static_dir_at_all_gets_past_the_check() {
         ),
         (
             "a directory the hub may search but not list",
-            Some(search_only.as_os_str()),
+            Some(search_only.path()),
             false,
         ),
         (
             "a directory the hub may search and write but not list",
-            Some(no_read.as_os_str()),
+            Some(no_read.path()),
             false,
         ),
         (
@@ -362,10 +364,14 @@ async fn a_directory_or_no_static_dir_at_all_gets_past_the_check() {
 
 /// What `run` serves, end to end: the dashboard from `HUB_STATIC_DIR`, never the working
 /// directory's own `static/`, behind the full router (API, applications, SSE, push) with
-/// CORS. The hub binds its fixed port,
-/// so this fails, saying why, while another hub holds 9091.
+/// CORS. The hub binds its fixed port, so this fails, saying why, while something else holds
+/// 9091, rather than asking that process instead.
 #[tokio::test]
 async fn the_running_hub_serves_the_configured_dashboard_and_the_full_router() {
+    assert!(
+        std::net::TcpListener::bind("0.0.0.0:9091").is_ok(),
+        "port 9091 is already in use, so the hub under test could not bind it"
+    );
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("static")).unwrap();
     std::fs::write(dir.path().join("static/index.html"), "default-marker").unwrap();
