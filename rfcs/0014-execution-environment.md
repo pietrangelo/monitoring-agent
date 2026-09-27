@@ -1,6 +1,6 @@
 # RFC 0014: Execution Environment — the Agent Monitors What It Runs In
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-27
 - Affects: `system-agent` (collection, API, push loop); `system-hub` only in how its registry
@@ -499,7 +499,8 @@ rather than serde derives on `ExecutionEnvironment`: the first step, for the typ
 the anti-corruption layer `docs/ARCHITECTURE.md` lists as missing.
 
 The agent dashboard shows the environment in its header, via `textContent`, and labels its
-cores figure "host cores" in a container, since it no longer matches the CPU % next to it.
+cores figure "host cores" in a container, since with a readable cgroup it no longer matches
+the CPU % next to it; a container whose cgroup is unreadable says so in the header.
 
 ### 8. Push frame and hub
 
@@ -802,12 +803,24 @@ Test-first per behaviour, table-driven, per `CLAUDE.md`.
   `Reading<Percent>` / `LoadAverage` and the skip and clear rules; (4) `environment/` classification and the `environment` field;
   (5) cgroup location, capacity and container sourcing; (6) steal time; (7) the hub registry
   refresh and the "Memory" labels; (8) docs, README and the agent dashboard.
-  Steps 1–7 have landed. Step 7 put the refresh rule in the hub's domain
+  All eight steps have landed. Step 7 put the refresh rule in the hub's domain
   (`registry.rs::memory_capacity_refresh`, over a `MemoryCapacity` that holds the bytes and
   the display together); the adapters write it through `db.rs::update_memory_capacity`.
   That the adapters call the refresh rule, rather than writing every frame, isn't visible to
   a test (only as one redundant write per frame), so it is a review rule. So is the static
   "Memory" label beside the dashboard's memory total, which `xss.mjs` doesn't read.
+  Step 8 found the README, `docker-compose.yml` and `docs/ARCHITECTURE.md` already brought up
+  to date by the steps before it, and the agent dashboard's `stale` handling and `fetchJSON`
+  check already in place from step 2; it added the environment to the dashboard's header and
+  the "Host cores" label.
+- Manual check (2026-09-27, Docker 29.7.2, cgroup v2, on the owner's WSL2 machine): the agent
+  on the host reports `virtual_machine (wsl)`. In `docker run --cpus=1.5 --memory=512m` it
+  reports `container (docker)`, `cgroup: v2`, capacity 1.5 CPUs and 512 MiB; with two
+  burner threads `docker stats` shows 149 % and the agent 100 %, and a CPU rule at 80 % fires;
+  with a 400 MiB allocation both show 509.6 MiB of 512 MiB, swap sourced from the cgroup. At
+  `--cpus=0.1` with four burner threads the agent reports 100 % over 0.1 CPUs and answered
+  200 on all 30 requests over 60 s, never stale. **Podman wasn't checked**: it isn't installed
+  on that machine, so rootful and rootless Podman stay unverified.
 
 ## Review
 

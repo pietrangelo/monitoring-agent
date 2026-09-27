@@ -84,7 +84,11 @@ Runs on every monitored Linux host. Responsibilities:
   one alert incident with a stable incident id (agent run + sequence), so the hub can store
   one record per incident.
 - Exposes a REST API, SSE streams, and a WebSocket endpoint (`routes/`) for local/direct
-  consumption, plus serves a static single-file dashboard (`static/index.html`).
+  consumption, plus serves a static single-file dashboard (`static/index.html`). Its header
+  shows the execution environment from `/api/system`'s closed enums (adding "cgroup
+  unreadable" for a container that reports the kernel's figures). Its core count is always
+  the host's, so in a container it reads "Host cores": with a readable cgroup the CPU %
+  beside it is over the container's capacity instead.
 - Optionally authenticates inbound API requests via a shared bearer/API-key/query-param token
   (`auth.rs`, `SYSTEM_AGENT_TOKEN`). Auth is opt-in: if the env var is unset, the API is open.
 - Optionally pushes periodic snapshots to a `system-hub` instance over WebSocket, MessagePack-
@@ -531,6 +535,8 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   alert_readings`), not from the domain's reading groups: a CPU group with no usage reaches
   the rules as a NaN in the DTO that parses as unavailable. Building `Readings` from
   `SourcedReadings` in the sampler would keep the wire shape out of the alert decision.
+- Podman (rootful and rootless) is covered only by fixture trees: the manual check ran under
+  Docker alone, so where crun's systemd driver writes the limits is unverified on a real host.
 - A container with an init under `--cgroupns=host` is measured by the agent's own service
   cgroup, not the container's: not detected (RFC 0014 §4).
 - Limits the cgroup namespace hides aren't seen: Kubernetes pod-level limits with no

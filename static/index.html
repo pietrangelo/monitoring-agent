@@ -366,6 +366,7 @@
             <div class="header-right">
                 <span id="hostname">—</span><span>•</span>
                 <span id="osInfo">—</span><span>•</span>
+                <span id="environment">—</span><span>•</span>
                 <span id="uptime">—</span>
                 <span
                     class="refresh-indicator"
@@ -431,7 +432,8 @@
                         </div>
                         <div style="flex: 1">
                             <div class="metric-row">
-                                <span class="metric-label">Cores</span
+                                <span class="metric-label" id="cpuCoresLabel"
+                                    >Cores</span
                                 ><span class="metric-value" id="cpuCores"
                                     >—</span
                                 >
@@ -876,9 +878,64 @@
                 }
             }
 
+            // /api/system's closed enums (RFC 0014 §7) as header text. A value this page
+            // doesn't know yet (a newer agent) is shown as sent, still through textContent.
+            var ENVIRONMENT_KINDS = {
+                bare_metal: "bare metal",
+                virtual_machine: "virtual machine",
+                container: "container",
+                undetermined: "environment undetermined",
+            };
+            var RUNTIME_NAMES = {
+                docker: "Docker",
+                podman: "Podman",
+                kubernetes: "Kubernetes",
+                lxc: "LXC",
+                systemd_nspawn: "systemd-nspawn",
+            };
+            var HYPERVISOR_NAMES = {
+                kvm: "KVM",
+                qemu: "QEMU",
+                vmware: "VMware",
+                hyperv: "Hyper-V",
+                wsl: "WSL",
+                xen: "Xen",
+                virtualbox: "VirtualBox",
+                amazon_ec2: "Amazon EC2",
+                google_compute: "Google Compute Engine",
+                other: "unnamed hypervisor",
+            };
+
+            function lookupLabel(table, value) {
+                return Object.prototype.hasOwnProperty.call(table, value)
+                    ? table[value]
+                    : String(value);
+            }
+
+            // A container whose cgroup is unreadable reports the kernel's figures, so the
+            // header says so: its CPU % is then host-wide.
+            function environmentLabel(env) {
+                var label = lookupLabel(ENVIRONMENT_KINDS, env.kind);
+                if (env.runtime) label += " (" + lookupLabel(RUNTIME_NAMES, env.runtime) + ")";
+                if (env.hypervisor)
+                    label += " (" + lookupLabel(HYPERVISOR_NAMES, env.hypervisor) + ")";
+                if (env.cgroup === "unreadable") label += ", cgroup unreadable";
+                return label;
+            }
+
+            function showEnvironment(env) {
+                if (!env) return;
+                document.getElementById("environment").textContent =
+                    environmentLabel(env);
+                // The core count is always the host's; in a container that is worth saying.
+                document.getElementById("cpuCoresLabel").textContent =
+                    env.kind === "container" ? "Host cores" : "Cores";
+            }
+
             async function loadStaticData() {
                 var sys = await fetchJSON("/api/system");
                 if (sys) {
+                    showEnvironment(sys.environment);
                     document.getElementById("hostname").textContent =
                         sys.hostname;
                     document.getElementById("osInfo").textContent =
