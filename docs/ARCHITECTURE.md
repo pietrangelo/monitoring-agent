@@ -84,7 +84,10 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 - Holds each system's latest accepted scrape round in memory (`live_applications` in
   `state.rs`) with the ids it accepted recently; a push disconnect keeps both, and deleting
   the system forgets them. `GET /api/systems/:id/applications` serves it with its age and
-  freshness, computed on the hub.
+  freshness, computed on the hub. The dashboard's system detail shows it as an
+  Applications section, re-read on each SSE summary and dimmed when stale, and draws an
+  application's heap and request-rate history from its `app:*` series when its row is
+  opened.
 - Maintains an in-memory live-metrics cache (`state.rs`) for low-latency dashboard updates
   between DB writes.
 - Exposes a REST API and an SSE summary stream (`routes/`), and serves a static fleet
@@ -302,8 +305,11 @@ mixed-version fleet must keep working):
   fixed allowlist: an unknown system status renders as `unknown`, and an unknown severity
   gets no severity class. Numbers are type-checked before formatting or use in styles: a
   card metric or disk percentage that isn't a number renders as `—`, and a core count that
-  isn't one is left out. The hub serves no Content-Security-Policy yet, so this rendering
-  rule is the only XSS control. `system-hub/dashboard-tests/xss.mjs` checks it (see Testing
+  isn't one is left out. Applications (RFC 0009 §10) follow the same rule: names, versions
+  and gauges render as text, a health outside the five known values renders as `unknown`, a
+  gauge or chart point that isn't a number renders as `—` or is left out of the chart, and
+  an application's name reaches the metric query only through `encodeURIComponent`. The hub
+  serves no Content-Security-Policy yet, so this rendering rule is the only XSS control. `system-hub/dashboard-tests/xss.mjs` checks it (see Testing
   architecture).
 
 ## Storage
@@ -390,17 +396,25 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   attributes and raw-text elements (statuses and severities are hostile only where they test
   the allowlists' fallback); ids also break out of inline JS; system urls are hostile
   both as markup and as `javascript:` URLs; the opened system has no hostname yet; and
-  numbers arrive as strings or out of range. On a desktop-sized, hover-capable page it opens
-  a system, takes a live refresh, acknowledges an alert record, and declines then accepts
-  each delete. It then opens an offline system and takes a changed summary, in which that
+  numbers arrive as strings or out of range. Each system's applications are hostile the same
+  way: names break out of markup and of the metric query string, healths test the
+  allowlist, entries that aren't objects are mixed in, and gauges and chart series arrive as
+  strings; a stubbed canvas records each chart's axis labels, so its scale can be read. On a
+  desktop-sized, hover-capable page it opens a system, opens one of its applications, takes
+  a detail refresh, opens another application, takes a live refresh with it open and a
+  detail refresh whose round has dropped it, takes a live refresh, and acknowledges an alert
+  record. With an application open again, it switches to a system whose round has an
+  application of the same name, then declines and accepts each delete. It then opens an
+  offline system and takes a changed summary, in which that
   system has no live metrics and changes status, and a system and an alert record arrive.
   Last, it fires pointer, mouse (with each button and with modifiers), focus, key and form
   events at every element (shadow roots included), plus window and document events, and lets
   two minutes of virtual time pass for timers. It checks that no
   script ran, no element outside the dashboard's own tags was added, no handler attribute was
   added or changed against the page's own markup, no `javascript:` URL appeared or was
-  opened, and the class allowlists held. Opening a system, acknowledging an alert record and
-  each delete must make exactly their expected requests, and every request must go to a
+  opened, and the class allowlists held. Opening a system, opening an application, a detail
+  or live refresh, acknowledging an alert record and each delete must make exactly their
+  expected requests, and every request must go to a
   known route, whose keys carry ids percent-encoded. It exits 0 on pass, 1 on a failed check or a
   Chromium failure, and 2 when no Chromium is found. `cargo test` does not run it; `CLAUDE.md`
   makes a passing run part of the gate for every change to the hub dashboard or to the test,

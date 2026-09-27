@@ -1,6 +1,6 @@
 # RFC 0009: Spring Boot Application Telemetry
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-26
 - Affects: both
@@ -1041,6 +1041,24 @@ Where commit 3 settled a detail this RFC left open, or departed from its text:
   `app:*` range, half of it past 24 h: 190k points, 95k deleted in 0.69 s (19 batches, about
   36 ms each); 1.9M points, 950k deleted in 12.8 s (190 batches, about 67 ms each). A pass
   with nothing to delete scans in 4 ms and 53 ms. Each batch is one hold of the mutex.
+- Commit 5: the heap gauge shows `used / max MiB`, just `used MiB` when the max is missing,
+  and `—` without a used value. Uptime reads as `1d 1h`, `1h 2m` or `59m`. The header's age
+  is left out when `age_secs` isn't a non-negative number, so a stale round with no age reads only
+  "stale". Entries of `applications` that aren't objects are skipped. A chart with no numeric
+  point hides its canvas and says "No data yet", like the CPU and memory charts. Opening
+  another system clears the selected application and hides its charts. A detail refresh
+  redraws them while the application is still in the round, and drops the selection when it
+  isn't.
+- The section is also re-read on each SSE summary (every 5 s) while a system is open, so the
+  age and the stale dimming stay current without a click; §10 only says "on each detail
+  refresh". The charts are redrawn only by a detail refresh. A resize is a detail refresh, as
+  it is for the CPU and memory charts, and isn't debounced.
+- The `xss.mjs` extension records each canvas's `fillText` calls since its last `clearRect`,
+  and asserts every axis label, so the computed `maxVal` is pinned on both sides: a series
+  peaking at 0.3 must still scale to 1, and one peaking at 20 to 22.
+- Not pinned by a test: the guards that discard an applications or series response arriving
+  after the user opened another system or application. The stubbed `fetch` answers in order,
+  so no ordering can be staged without a delaying stub, which the smoke test doesn't have.
 
 ## Review
 
