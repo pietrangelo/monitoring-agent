@@ -31,6 +31,7 @@ use applications::scraper::{Scraper, Timeouts};
 use axum::{Router, middleware};
 use collectors::SnapshotReceiver;
 use collectors::sampler::SysinfoSource;
+use environment::cgroup::MonitoredCgroup;
 use snapshot::SnapshotSeq;
 use std::fmt;
 use std::net::SocketAddr;
@@ -128,9 +129,9 @@ fn announce(applications: &ApplicationsConfig) {
 }
 
 /// The system collector's source: sysinfo, and the files under `/` (the OS release file and,
-/// later, `/proc` and `/sys`).
-fn system_source() -> SysinfoSource {
-    SysinfoSource::new(PathBuf::from("/"))
+/// in a container, the monitored cgroup's files under `/sys/fs/cgroup`).
+fn system_source(cgroup: Option<MonitoredCgroup>) -> SysinfoSource {
+    SysinfoSource::new(PathBuf::from("/"), cgroup)
 }
 
 /// The agent's execution environment, classified once from the evidence under `/` and the
@@ -152,12 +153,19 @@ async fn execution_environment() -> Result<environment::ExecutionEnvironment, St
 
 async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
     let environment = execution_environment().await?;
+    let cgroup = environment.monitored_cgroup().cloned();
     // The startup snapshot is read before anything can ask for one, so none ever waits.
-    let (sampler, first) = collectors::first_snapshot(system_source(), environment)
+    let (sampler, first) = collectors::first_snapshot(system_source(cgroup.clone()), environment)
         .await
         .map_err(StartupError::Collector)?;
+    let system = &first.snapshot.system;
+    tracing::info!(
+        "resource capacity: {} CPUs, {} of memory",
+        system.cpu.capacity_cpus,
+        system.memory.total_display
+    );
     let (publisher, snapshots) =
-        tokio::sync::watch::channel(Arc::new(first.published(SnapshotSeq::FIRST)));
+        tokio::sync::watch::channel(Arc::new(first.snapshot.published(SnapshotSeq::FIRST)));
     let app_state = start_applications(applications, snapshots.clone())?;
 
     if auth::configured_token().is_some() {
@@ -170,7 +178,8 @@ async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
         app_state.clone(),
         publisher,
         sampler,
-        system_source,
+        first.history,
+        move || system_source(cgroup.clone()),
     ));
     // The collector runs for the agent's lifetime; if it ends, say so once, where operators look.
     tokio::spawn(async move {

@@ -17,6 +17,7 @@
 //! What the agent observed about where it runs, parsed from the files and variables that
 //! show it (RFC 0014 §3). The parsers are pure; `collectors/environment.rs` reads the inputs.
 
+use super::cgroup::CgroupEvidence;
 use super::{ContainerRuntime, Hypervisor};
 
 /// Every observation `classify` weighs, as plain values.
@@ -42,6 +43,8 @@ pub struct EnvironmentEvidence {
     pub xen: bool,
     /// The kernel release names Microsoft: a WSL kernel.
     pub wsl: bool,
+    /// Where the agent's cgroup is, weighed only for a container.
+    pub cgroup: CgroupEvidence,
 }
 
 impl EnvironmentEvidence {

@@ -476,7 +476,8 @@ mod tests {
     }
 
     use crate::models::{
-        CpuInfo, DiskInfo, LoadAverage, MemoryInfo, OsInfo, ProcessInfo, SwapInfo,
+        CpuInfo, DiskInfo, LimitInfo, LoadAverage, MemoryInfo, OsInfo, ProcessInfo,
+        ReadingSourceName, SwapInfo,
     };
 
     /// A snapshot whose same-typed fields all hold different values, so a frame that moves
@@ -504,6 +505,9 @@ mod tests {
                 logical_cores: 8,
                 usage_percent: 12.5,
                 frequency_mhz: 2400,
+                // Not on the frame: its shape doesn't change (RFC 0014 §8).
+                capacity_cpus: 1.5,
+                source: ReadingSourceName::Cgroup,
             },
             memory: MemoryInfo {
                 total_bytes: 2222,
@@ -513,6 +517,8 @@ mod tests {
                 total_display: "mem-total".into(),
                 used_display: "mem-used".into(),
                 usage_percent: 33.25,
+                limit: Some(LimitInfo::Bounded(3333)),
+                source: ReadingSourceName::Cgroup,
             },
             swap: SwapInfo {
                 total_bytes: 777,
@@ -521,6 +527,8 @@ mod tests {
                 total_display: "swap-total".into(),
                 used_display: "swap-used".into(),
                 usage_percent: 7.75,
+                limit: Some(LimitInfo::Unbounded),
+                source: ReadingSourceName::Unavailable,
             },
             disks: vec![
                 DiskInfo {

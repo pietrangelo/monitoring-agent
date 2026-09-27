@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 960 640" width="960" height="640" role="img" aria-labelledby="title desc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="title">System Agent and System Hub architecture</title>
+  <desc id="desc">One System Hub on port 9091 aggregates many System Agents on port 9090. The hub's poller reads some agents over HTTP; other agents push snapshots to the hub's push receiver over WebSocket and MessagePack. Inside each agent the execution environment is classified at startup, a single background collector reads the system every 2 seconds and publishes one snapshot, and the REST API, the live streams, the alert engine and the push client all read that snapshot.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .frame { fill: #f6f8fa; stroke: #d0d7de; }
+    .box { fill: #ffffff; stroke: #8c959f; }
+    .off { fill: #f6f8fa; stroke: #8c959f; stroke-dasharray: 4 3; }
+    .core { fill: #ddf4ff; stroke: #0969da; }
+    .store { fill: #fff8c5; stroke: #bf8700; }
+    .title { fill: #1f2328; font-size: 17px; font-weight: 700; }
+    .label { fill: #1f2328; font-size: 13px; font-weight: 600; }
+    .small { font-size: 12px; }
+    .note { fill: #57606a; font-size: 11.5px; }
+    .edge { stroke: #57606a; stroke-width: 1.6; fill: none; }
+    .poll { stroke: #1a7f37; stroke-width: 2.4; fill: none; }
+    .push { stroke: #8250df; stroke-width: 2.4; fill: none; }
+    .poll-text { fill: #1a7f37; font-size: 12.5px; font-weight: 600; }
+    .push-text { fill: #8250df; font-size: 12.5px; font-weight: 600; }
+    .head { fill: #57606a; }
+    .head-poll { fill: #1a7f37; }
+    .head-push { fill: #8250df; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .frame { fill: #161b22; stroke: #30363d; }
+      .box { fill: #0d1117; stroke: #6e7681; }
+      .off { fill: #161b22; stroke: #6e7681; }
+      .core { fill: #0c2d6b; stroke: #4493f8; }
+      .store { fill: #3b2e00; stroke: #d29922; }
+      .title, .label { fill: #e6edf3; }
+      .note { fill: #9198a1; }
+      .edge { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+      .poll { stroke: #3fb950; } .poll-text { fill: #3fb950; } .head-poll { fill: #3fb950; }
+      .push { stroke: #ab7df8; } .push-text { fill: #ab7df8; } .head-push { fill: #ab7df8; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+    <marker id="arrow-poll" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-poll"/></marker>
+    <marker id="arrow-push" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-push"/></marker>
+
+    <!-- What every agent has, drawn at the agent frame's origin. -->
+    <g id="agent-core">
+      <rect class="frame" x="0" y="0" width="440" height="306" rx="10"/>
+      <text class="title" x="20" y="28">System Agent  :9090</text>
+
+      <rect class="box" x="20" y="44" width="94" height="52" rx="6"/>
+      <text class="label" x="32" y="67">REST API</text>
+      <text class="note" x="32" y="85">/api/*</text>
+
+      <rect class="box" x="122" y="44" width="94" height="52" rx="6"/>
+      <text class="label" x="134" y="67">SSE / WS</text>
+      <text class="note" x="134" y="85">live streams</text>
+
+      <rect class="box" x="224" y="44" width="94" height="52" rx="6"/>
+      <text class="label small" x="232" y="67">Alert engine</text>
+      <text class="note" x="232" y="85">rules, incidents</text>
+
+      <rect class="core" x="20" y="128" width="400" height="58" rx="6"/>
+      <text class="label" x="36" y="151">Background collector, every 2 s, off the runtime</text>
+      <text class="note" x="36" y="170">sysinfo + cgroup files → chosen readings → one snapshot</text>
+
+      <rect class="box" x="20" y="214" width="400" height="52" rx="6"/>
+      <text class="label" x="36" y="236">Execution environment, classified once at startup</text>
+      <text class="note" x="36" y="254">bare metal · VM · container (cgroup v2) · undetermined</text>
+
+      <text class="note" x="20" y="290">The local dashboard reads the REST API and the streams.</text>
+
+      <path class="edge" d="M 220 214 V 188" marker-end="url(#arrow)"/>
+      <path class="edge" d="M 67 128 V 98" marker-end="url(#arrow)"/>
+      <path class="edge" d="M 169 128 V 98" marker-end="url(#arrow)"/>
+      <path class="edge" d="M 271 128 V 98" marker-end="url(#arrow)"/>
+      <path class="edge" d="M 373 128 V 98" marker-end="url(#arrow)"/>
+    </g>
+  </defs>
+  <rect class="bg" width="960" height="640"/>
+
+  <!-- Hub -->
+  <rect class="frame" x="20" y="16" width="920" height="232" rx="10"/>
+  <text class="title" x="40" y="44">System Hub  :9091</text>
+
+  <rect class="box" x="40" y="60" width="260" height="58" rx="6"/>
+  <text class="label" x="56" y="84">REST API</text>
+  <text class="note" x="56" y="103">/api/* · access control</text>
+
+  <rect class="box" x="320" y="60" width="320" height="58" rx="6"/>
+  <text class="label" x="336" y="84">SSE and web dashboard</text>
+  <text class="note" x="336" y="103">/api/stream/summary · static/index.html</text>
+
+  <rect class="store" x="660" y="60" width="260" height="58" rx="6"/>
+  <text class="label" x="676" y="84">SQLite</text>
+  <text class="note" x="676" y="103">systems · metrics · alerts · retention</text>
+
+  <rect class="box" x="40" y="138" width="880" height="36" rx="6"/>
+  <text class="label" x="56" y="161">Live metrics cache</text>
+
+  <rect class="box" x="40" y="194" width="400" height="40" rx="6"/>
+  <text class="label" x="56" y="219">Poller</text>
+  <text class="note" x="112" y="219">GET /api/system, /api/alerts, /api/applications</text>
+
+  <rect class="box" x="520" y="194" width="400" height="40" rx="6"/>
+  <text class="label" x="536" y="219">Push receiver</text>
+  <text class="note" x="652" y="219">WS /api/push · per-system frames</text>
+
+  <path class="edge" d="M 240 194 V 176" marker-end="url(#arrow)"/>
+  <path class="edge" d="M 720 194 V 176" marker-end="url(#arrow)"/>
+  <path class="edge" d="M 170 138 V 120" marker-end="url(#arrow)"/>
+  <path class="edge" d="M 480 138 V 120" marker-end="url(#arrow)"/>
+  <path class="edge" d="M 790 138 V 120" marker-end="url(#arrow)"/>
+
+  <!-- Agent polled by the hub: no push client configured. -->
+  <use href="#agent-core" xlink:href="#agent-core" x="20" y="318"/>
+  <text class="note" x="440" y="346" text-anchor="end">polled by the hub</text>
+  <rect class="off" x="346" y="362" width="94" height="52" rx="6"/>
+  <text class="label small" x="354" y="385">Push client</text>
+  <text class="note" x="354" y="403">not configured</text>
+
+  <!-- Agent pushing to the hub. -->
+  <use href="#agent-core" xlink:href="#agent-core" x="500" y="318"/>
+  <text class="note" x="860" y="346" text-anchor="end">pushes to the hub</text>
+  <rect class="box" x="826" y="362" width="94" height="52" rx="6"/>
+  <text class="label small" x="834" y="385">Push client</text>
+  <text class="note" x="834" y="403">PUSH_TO</text>
+
+  <!-- Poll: the hub's poller reads the agent's REST API. -->
+  <path class="poll" d="M 87 236 V 358" marker-end="url(#arrow-poll)"/>
+  <text class="poll-text" x="98" y="292">HTTP poll · REST + JSON</text>
+
+  <!-- Push: the agent's push client connects out to the push receiver. -->
+  <path class="push" d="M 873 360 V 238" marker-end="url(#arrow-push)"/>
+  <text class="push-text" x="862" y="292" text-anchor="end">WS push · MessagePack</text>
+</svg>

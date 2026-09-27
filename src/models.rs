@@ -16,6 +16,8 @@
 
 use serde::Serialize;
 
+use crate::environment::cgroup::{Bytes, CgroupAccess, ResourceLimit};
+use crate::environment::sourcing::ReadingSource;
 use crate::environment::{ContainerRuntime, ExecutionEnvironment, Hypervisor, LoadScope};
 
 // ── Execution environment ───────────────────────────────
@@ -29,7 +31,16 @@ pub struct EnvironmentInfo {
     runtime: Option<RuntimeName>,
     /// A virtual machine's hypervisor, `other` when unnamed; `null` when not a virtual machine.
     hypervisor: Option<HypervisorName>,
+    /// A container's cgroup: `v2` or `unreadable`; `null` when not a container.
+    cgroup: Option<CgroupName>,
     load_scope: LoadScopeName,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CgroupName {
+    V2,
+    Unreadable,
 }
 
 #[derive(Serialize)]
@@ -77,25 +88,37 @@ enum LoadScopeName {
 
 impl From<&ExecutionEnvironment> for EnvironmentInfo {
     fn from(environment: &ExecutionEnvironment) -> Self {
-        let (kind, runtime, hypervisor) = match environment {
-            ExecutionEnvironment::BareMetal => (EnvironmentKind::BareMetal, None, None),
+        let (kind, runtime, hypervisor, cgroup) = match environment {
+            ExecutionEnvironment::BareMetal => (EnvironmentKind::BareMetal, None, None, None),
             ExecutionEnvironment::VirtualMachine { hypervisor } => (
                 EnvironmentKind::VirtualMachine,
                 None,
                 Some((*hypervisor).into()),
+                None,
             ),
-            ExecutionEnvironment::Container { runtime } => (
+            ExecutionEnvironment::Container { runtime, cgroup } => (
                 EnvironmentKind::Container,
                 runtime.map(RuntimeName::from),
                 None,
+                Some(cgroup.into()),
             ),
-            ExecutionEnvironment::Undetermined => (EnvironmentKind::Undetermined, None, None),
+            ExecutionEnvironment::Undetermined => (EnvironmentKind::Undetermined, None, None, None),
         };
         Self {
             kind,
             runtime,
             hypervisor,
+            cgroup,
             load_scope: environment.load_scope().into(),
+        }
+    }
+}
+
+impl From<&CgroupAccess> for CgroupName {
+    fn from(access: &CgroupAccess) -> Self {
+        match access {
+            CgroupAccess::V2 { .. } => Self::V2,
+            CgroupAccess::Unreadable(_) => Self::Unreadable,
         }
     }
 }
@@ -178,6 +201,45 @@ pub struct CpuInfo {
     pub logical_cores: usize,
     pub usage_percent: f32,
     pub frequency_mhz: u64,
+    /// CPUs the monitored environment may use: the host's cores outside a container.
+    pub capacity_cpus: f64,
+    pub source: ReadingSourceName,
+}
+
+/// Where a reading group's values came from, as the API names it (RFC 0014 §7).
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadingSourceName {
+    Cgroup,
+    Kernel,
+    Unavailable,
+}
+
+/// A cgroup's memory or swap limit on the wire: `{"bounded": <bytes>}` or `"unbounded"`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitInfo {
+    Bounded(u64),
+    Unbounded,
+}
+
+impl From<ReadingSource> for ReadingSourceName {
+    fn from(source: ReadingSource) -> Self {
+        match source {
+            ReadingSource::Cgroup => Self::Cgroup,
+            ReadingSource::Kernel => Self::Kernel,
+            ReadingSource::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl From<ResourceLimit<Bytes>> for LimitInfo {
+    fn from(limit: ResourceLimit<Bytes>) -> Self {
+        match limit {
+            ResourceLimit::Bounded(bytes) => Self::Bounded(bytes.get()),
+            ResourceLimit::Unbounded => Self::Unbounded,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -189,6 +251,10 @@ pub struct MemoryInfo {
     pub total_display: String,
     pub used_display: String,
     pub usage_percent: f32,
+    /// The monitored cgroup's tightest limit; absent outside a container's cgroup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitInfo>,
+    pub source: ReadingSourceName,
 }
 
 #[derive(Serialize)]
@@ -199,6 +265,9 @@ pub struct SwapInfo {
     pub total_display: String,
     pub used_display: String,
     pub usage_percent: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitInfo>,
+    pub source: ReadingSourceName,
 }
 
 #[derive(Serialize)]
@@ -309,18 +378,79 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sources_and_limits_are_named_on_the_wire() {
+        let sources = [
+            (ReadingSource::Cgroup, json!("cgroup")),
+            (ReadingSource::Kernel, json!("kernel")),
+            (ReadingSource::Unavailable, json!("unavailable")),
+        ];
+        for (source, expected) in sources {
+            let got = serde_json::to_value(ReadingSourceName::from(source)).unwrap();
+            assert_eq!(got, expected, "{source:?}");
+        }
+        let limits = [
+            (
+                ResourceLimit::Bounded(Bytes::new(536_870_912)),
+                json!({ "bounded": 536_870_912 }),
+            ),
+            (
+                ResourceLimit::Bounded(Bytes::new(0)),
+                json!({ "bounded": 0 }),
+            ),
+            (ResourceLimit::Unbounded, json!("unbounded")),
+        ];
+        for (limit, expected) in limits {
+            let got = serde_json::to_value(LimitInfo::from(limit)).unwrap();
+            assert_eq!(got, expected, "{limit:?}");
+        }
+    }
+
+    #[test]
     fn an_environment_goes_on_the_wire_by_its_kind_runtime_and_hypervisor() {
         use ExecutionEnvironment::*;
         let vm = |hypervisor| VirtualMachine { hypervisor };
-        let container = |runtime| Container { runtime };
-        let wire = |kind: &str, runtime: Option<&str>, hypervisor: Option<&str>, load: &str| json!({ "kind": kind, "runtime": runtime, "hypervisor": hypervisor, "load_scope": load });
+        use crate::environment::cgroup::{
+            Cgroup2Mount, CgroupAccess, CgroupEvidence, CgroupPath, CgroupUnreadable, cgroup_access,
+        };
+        let unreadable = CgroupAccess::Unreadable(CgroupUnreadable::OutsideMountRoot);
+        let container = |runtime| Container {
+            runtime,
+            cgroup: unreadable.clone(),
+        };
+        let v2 = cgroup_access(&CgroupEvidence {
+            self_cgroup: Ok(CgroupPath::ROOT),
+            mount: Some(Cgroup2Mount {
+                point: "/sys/fs/cgroup".into(),
+                root: CgroupPath::ROOT,
+            }),
+            namespace_root_typed: true,
+            pid1_cgroup: Some(CgroupPath::ROOT),
+        });
+        let wire = |kind: &str,
+                    runtime: Option<&str>,
+                    hypervisor: Option<&str>,
+                    cgroup: Option<&str>,
+                    load: &str| json!({ "kind": kind, "runtime": runtime, "hypervisor": hypervisor, "cgroup": cgroup, "load_scope": load });
         let cases = [
-            (BareMetal, wire("bare_metal", None, None, "environment")),
+            (
+                BareMetal,
+                wire("bare_metal", None, None, None, "environment"),
+            ),
             (
                 Undetermined,
-                wire("undetermined", None, None, "environment"),
+                wire("undetermined", None, None, None, "environment"),
             ),
-            (container(None), wire("container", None, None, "host")),
+            (
+                container(None),
+                wire("container", None, None, Some("unreadable"), "host"),
+            ),
+            (
+                Container {
+                    runtime: None,
+                    cgroup: v2,
+                },
+                wire("container", None, None, Some("v2"), "host"),
+            ),
         ]
         .into_iter()
         .chain(
@@ -339,7 +469,7 @@ mod tests {
             .map(|(h, name)| {
                 (
                     vm(h),
-                    wire("virtual_machine", None, Some(name), "environment"),
+                    wire("virtual_machine", None, Some(name), None, "environment"),
                 )
             }),
         )
@@ -354,7 +484,7 @@ mod tests {
             .map(|(r, name)| {
                 (
                     container(Some(r)),
-                    wire("container", Some(name), None, "host"),
+                    wire("container", Some(name), None, Some("unreadable"), "host"),
                 )
             }),
         );

@@ -16,6 +16,10 @@
 
 //! Usage values and the rules that derive them.
 
+use std::time::{Duration, Instant};
+
+use super::cgroup::CpuCount;
+
 /// A share of a resource capacity, from 0 to 100 inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Percent(f32);
@@ -47,9 +51,112 @@ impl LoadAverage {
     }
 }
 
+/// The least wall time a CPU usage is measured over: a shorter interval says more about
+/// scheduling jitter than about the workload.
+pub const MIN_USAGE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A cgroup's cumulative CPU time (`cpu.stat`'s `usage_usec`), and when it was read on the
+/// monotonic clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuCounters {
+    pub usage: Duration,
+    pub read_at: Instant,
+}
+
+/// The share of `capacity` the cgroup used between two readings (RFC 0014 §5), held to 0–100:
+/// a `cpu.max.burst` can briefly run over the quota. `None` when the readings are under
+/// `MIN_USAGE_INTERVAL` apart, or a counter went backwards (a cgroup recreated).
+pub fn cpu_usage(prev: &CpuCounters, cur: &CpuCounters, capacity: CpuCount) -> Option<Percent> {
+    let wall = cur.read_at.checked_duration_since(prev.read_at)?;
+    let used = cur.usage.checked_sub(prev.usage)?;
+    if wall < MIN_USAGE_INTERVAL {
+        return None;
+    }
+    let share = used.as_secs_f64() / (wall.as_secs_f64() * capacity.get());
+    Percent::saturating((share * 100.0) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_usage_is_cpu_time_over_wall_time_times_capacity() {
+        let start = Instant::now();
+        let at = |ms: u64, usage_ms: u64| CpuCounters {
+            usage: Duration::from_millis(usage_ms),
+            read_at: start + Duration::from_millis(ms),
+        };
+        let cap = |n: f64| CpuCount::new(n).expect("positive");
+        // (name, prev, cur, capacity, expected)
+        let cases = [
+            (
+                "half of one cpu",
+                at(0, 0),
+                at(2_000, 1_000),
+                cap(1.0),
+                Some(50.0),
+            ),
+            (
+                "a quarter of a fractional capacity",
+                at(0, 1_000),
+                at(2_000, 1_750),
+                cap(1.5),
+                Some(25.0),
+            ),
+            (
+                "exactly all of it",
+                at(0, 0),
+                at(2_000, 3_000),
+                cap(1.5),
+                Some(100.0),
+            ),
+            (
+                "a burst over the quota is clamped",
+                at(0, 0),
+                at(2_000, 5_000),
+                cap(1.5),
+                Some(100.0),
+            ),
+            ("idle", at(0, 700), at(2_000, 700), cap(4.0), Some(0.0)),
+            (
+                "exactly the least interval",
+                at(0, 0),
+                at(500, 250),
+                cap(1.0),
+                Some(50.0),
+            ),
+            (
+                "just under the least interval",
+                at(0, 0),
+                at(499, 250),
+                cap(1.0),
+                None,
+            ),
+            ("no time passed", at(1_000, 0), at(1_000, 0), cap(1.0), None),
+            (
+                "the clock order reversed",
+                at(2_000, 0),
+                at(0, 500),
+                cap(1.0),
+                None,
+            ),
+            (
+                "the counter went backwards",
+                at(0, 9_000),
+                at(2_000, 100),
+                cap(1.0),
+                None,
+            ),
+        ];
+        for (name, prev, cur, capacity, expected) in cases {
+            assert_eq!(
+                cpu_usage(&prev, &cur, capacity).map(Percent::get),
+                expected,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn a_percent_is_held_to_zero_through_one_hundred() {

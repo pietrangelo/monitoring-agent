@@ -24,11 +24,11 @@ pub mod system;
 
 use crate::alerts::{Reading, Readings};
 use crate::environment::ExecutionEnvironment;
+use crate::environment::sourcing::{Origin, SourcingHistory};
 use crate::environment::usage::{LoadAverage, Percent};
-use crate::models::SystemSnapshot;
 use crate::snapshot::{CollectedSnapshot, PRIMING, PublishedSnapshot, STALENESS_BOUND};
 use crate::state::AppState;
-use sampler::{Gather, Sampler};
+use sampler::{Gather, Sampled, Sampler};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::{JoinError, spawn_blocking};
@@ -52,12 +52,12 @@ pub const COLLECT_PERIOD: Duration = Duration::from_secs(2);
 pub async fn first_snapshot<G: Gather>(
     source: G,
     environment: ExecutionEnvironment,
-) -> Result<(Sampler<G>, CollectedSnapshot), JoinError> {
+) -> Result<(Sampler<G>, Sampled), JoinError> {
     let mut sampler = spawn_blocking(move || Sampler::prime(source, environment)).await?;
     loop {
         tokio::time::sleep(PRIMING).await;
-        match read_off_runtime(sampler).await? {
-            (sampler, Some(collected)) => return Ok((sampler, collected)),
+        match read_off_runtime(sampler, SourcingHistory::new()).await? {
+            (sampler, Some(sampled)) => return Ok((sampler, sampled)),
             (early, None) => sampler = early,
         }
     }
@@ -73,11 +73,13 @@ enum Slot<G> {
 /// snapshot, records it in history and evaluates alerts on it. The first tick is a full
 /// period after the startup snapshot `publisher` already holds. A panic in a tick rebuilds
 /// the sampler from `rebuild`, in the startup snapshot's environment; the published snapshot
-/// stays the previous one meanwhile.
+/// stays the previous one meanwhile. The sourcing `history` lives here, not in the sampler,
+/// so a rebuilt sampler inherits every group's lineage and carry.
 pub async fn background_collector<G, F>(
     state: Arc<AppState>,
     publisher: SnapshotSender,
     sampler: Sampler<G>,
+    mut history: SourcingHistory,
     rebuild: F,
 ) where
     G: Gather,
@@ -94,10 +96,11 @@ pub async fn background_collector<G, F>(
         slot = match slot {
             Slot::Ready(sampler) => {
                 let stale_at = Instant::from_std(publisher.borrow().read_at + STALENESS_BOUND);
-                match watched(read_off_runtime(sampler), stale_at).await {
-                    Ok((sampler, collected)) => {
-                        if let Some(collected) = collected {
-                            publish(&state, &publisher, collected);
+                match watched(read_off_runtime(sampler, history.clone()), stale_at).await {
+                    Ok((sampler, sampled)) => {
+                        if let Some(sampled) = sampled {
+                            history = sampled.history;
+                            publish(&state, &publisher, sampled.snapshot);
                         }
                         Slot::Ready(sampler)
                     }
@@ -174,12 +177,14 @@ where
     }
 }
 
+/// One reading off the runtime, its groups chosen against `history`.
 async fn read_off_runtime<G: Gather>(
     mut sampler: Sampler<G>,
-) -> Result<(Sampler<G>, Option<CollectedSnapshot>), JoinError> {
+    history: SourcingHistory,
+) -> Result<(Sampler<G>, Option<Sampled>), JoinError> {
     spawn_blocking(move || {
-        let collected = sampler.read();
-        (sampler, collected)
+        let sampled = sampler.read(&history);
+        (sampler, sampled)
     })
     .await
 }
@@ -210,19 +215,20 @@ fn record(state: &AppState, snapshot: &PublishedSnapshot) {
     let new_alerts = state
         .alert_manager
         .write()
-        .evaluate(&alert_readings(snap), now);
+        .evaluate(&alert_readings(snapshot), now);
     for alert in &new_alerts {
         tracing::warn!("🚨 ALERT: {}", alert.message);
     }
 }
 
-/// The readings the alert rules see in `snap`. Every one was measured on the snapshot's tick.
-fn alert_readings(snap: &SystemSnapshot) -> Readings {
+/// The readings the alert rules see in `snapshot`: each group's as its origin says.
+fn alert_readings(snapshot: &PublishedSnapshot) -> Readings {
+    let (snap, origins) = (&snapshot.system, &snapshot.origins);
     let load = |value: f64| LoadAverage::new(value as f32);
     Readings {
-        cpu: percent_reading(snap.cpu.usage_percent),
-        memory: percent_reading(snap.memory.usage_percent),
-        swap: percent_reading(snap.swap.usage_percent),
+        cpu: group_reading(origins.cpu, snap.cpu.usage_percent),
+        memory: group_reading(origins.memory, snap.memory.usage_percent),
+        swap: group_reading(origins.swap, snap.swap.usage_percent),
         disk_usages: snap
             .disks
             .iter()
@@ -232,6 +238,16 @@ fn alert_readings(snap: &SystemSnapshot) -> Readings {
         load5: load(snap.load_average.five),
         load15: load(snap.load_average.fifteen),
         cpu_cores: snap.cpu.logical_cores,
+    }
+}
+
+/// A group's percentage as its origin makes it: measured when read on the tick, else
+/// carried or unavailable.
+fn group_reading(origin: Origin, value: f32) -> Reading<Percent> {
+    match origin {
+        Origin::Cgroup | Origin::Kernel => percent_reading(value),
+        Origin::Carried => Reading::Carried,
+        Origin::Unavailable => Reading::Unavailable,
     }
 }
 
@@ -263,7 +279,13 @@ mod tests {
             watch::channel(Arc::new(fixtures::published()));
         let state = AppState::new(snapshots.clone());
         let start = Instant::now();
-        let collector = tokio::spawn(background_collector(state, publisher, sampler, rebuild));
+        let collector = tokio::spawn(background_collector(
+            state,
+            publisher,
+            sampler,
+            SourcingHistory::new(),
+            rebuild,
+        ));
         let mut publishes = Vec::new();
         while let Ok(Ok(())) = tokio::time::timeout_at(start + until, snapshots.changed()).await {
             let snap = snapshots.borrow_and_update().clone();
@@ -282,7 +304,8 @@ mod tests {
 
     #[test]
     fn alert_readings_carry_each_snapshot_value_to_its_metric() {
-        let mut snap = fixtures::published().system;
+        let mut published = fixtures::published();
+        let snap = &mut published.system;
         snap.cpu.usage_percent = 11.5;
         snap.memory.usage_percent = 22.5;
         snap.swap.usage_percent = 33.5;
@@ -303,7 +326,7 @@ mod tests {
             })
             .into();
 
-        let readings = alert_readings(&snap);
+        let readings = alert_readings(&published);
         let percent = |v| Reading::Measured(Percent::saturating(v).expect("a number"));
         assert_eq!(readings.cpu, percent(11.5), "cpu");
         assert_eq!(readings.memory, percent(22.5), "memory");
@@ -399,6 +422,7 @@ mod tests {
             state,
             publisher,
             sampler,
+            SourcingHistory::new(),
             FakeSource::new,
         ));
         let mut environments = Vec::new();
@@ -412,6 +436,85 @@ mod tests {
             environments,
             [1, 2, 3].map(|n| (seq(n), fixtures::ENVIRONMENT)),
             "before the panic and after the rebuild"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuilt_sampler_inherits_every_groups_lineage() {
+        use super::sampler::fakes::{CgroupSource, v2_container};
+        let (publisher, mut snapshots) = fixtures::channel(fixtures::published());
+        let state = AppState::new(snapshots.clone());
+        let sampler = Sampler::prime(CgroupSource::panicking_on(3), v2_container());
+        tokio::time::advance(PRIMING).await;
+        // The rebuilt sampler's memory.stat is malformed from its first reading.
+        let rebuild = || CgroupSource::memory_failing_from(1);
+        let collector = tokio::spawn(background_collector(
+            state,
+            publisher,
+            sampler,
+            SourcingHistory::new(),
+            rebuild,
+        ));
+        let mut memory = Vec::new();
+        let until = Instant::now() + secs(9);
+        while let Ok(Ok(())) = tokio::time::timeout_at(until, snapshots.changed()).await {
+            let snap = snapshots.borrow_and_update().clone();
+            memory.push((
+                snap.seq,
+                snap.origins.memory,
+                snap.system.memory.total_bytes,
+            ));
+        }
+        collector.abort();
+        assert_eq!(
+            memory,
+            [
+                (seq(1), Origin::Cgroup, 1000),
+                (seq(2), Origin::Carried, 1000),
+                (seq(3), Origin::Carried, 1000),
+            ],
+            "carried after the rebuild, never the kernel's 4096"
+        );
+    }
+
+    #[test]
+    fn alert_readings_follow_each_groups_origin() {
+        use crate::environment::sourcing::ReadingOrigins;
+        let mut published = fixtures::published();
+        published.system.cpu.usage_percent = 11.5;
+        published.system.memory.usage_percent = 22.5;
+        published.system.swap.usage_percent = 33.5;
+        let measured = |v| Reading::Measured(Percent::saturating(v).expect("a number"));
+        // (name, origin, expected cpu reading)
+        let cases = [
+            ("from the cgroup", Origin::Cgroup, measured(11.5)),
+            ("from the kernel", Origin::Kernel, measured(11.5)),
+            ("carried", Origin::Carried, Reading::Carried),
+            ("unavailable", Origin::Unavailable, Reading::Unavailable),
+        ];
+        for (name, origin, expected) in cases {
+            published.origins = ReadingOrigins {
+                cpu: origin,
+                memory: origin,
+                swap: origin,
+            };
+            let readings = alert_readings(&published);
+            let expect = |v| match expected {
+                Reading::Measured(_) => measured(v),
+                Reading::Carried => Reading::Carried,
+                Reading::Unavailable => Reading::Unavailable,
+            };
+            assert_eq!(readings.cpu, expect(11.5), "{name}: cpu");
+            assert_eq!(readings.memory, expect(22.5), "{name}: memory");
+            assert_eq!(readings.swap, expect(33.5), "{name}: swap");
+        }
+        published.origins.memory = Origin::Carried;
+        published.origins.cpu = Origin::Cgroup;
+        let mixed = alert_readings(&published);
+        assert_eq!(
+            (mixed.cpu, mixed.memory),
+            (measured(11.5), Reading::Carried),
+            "per group"
         );
     }
 
@@ -452,7 +555,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_first_snapshot_is_read_a_priming_interval_after_priming() {
         let start = monotonic_now();
-        let (_, first) = first_snapshot(FakeSource::new(), fixtures::ENVIRONMENT)
+        let (
+            _,
+            Sampled {
+                snapshot: first, ..
+            },
+        ) = first_snapshot(FakeSource::new(), fixtures::ENVIRONMENT)
             .await
             .expect("no panic");
         assert_eq!(

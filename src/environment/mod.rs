@@ -17,11 +17,15 @@
 //! The agent's execution environment (RFC 0014): the pure domain core of Host Telemetry that
 //! decides what the agent's readings are measured against. No I/O lives here.
 
+pub mod cgroup;
 pub mod evidence;
+pub mod sourcing;
 pub mod usage;
 
+use cgroup::{CgroupAccess, CgroupUnreadable, MonitoredCgroup, Pid1Placement};
 pub use evidence::EnvironmentEvidence;
 use evidence::{ContainerMarker, CpuArchitecture};
+use sourcing::ProcessView;
 
 use std::fmt;
 
@@ -34,6 +38,8 @@ pub enum ExecutionEnvironment {
     },
     Container {
         runtime: Option<ContainerRuntime>,
+        /// Whether the agent found a cgroup v2 hierarchy to measure the container by.
+        cgroup: CgroupAccess,
     },
     /// No rule matched: an ARM host with no DMI, for example.
     Undetermined,
@@ -83,6 +89,42 @@ impl ExecutionEnvironment {
             }
         }
     }
+
+    /// The cgroup whose files the agent reads each tick: a container's, when it has a
+    /// readable cgroup v2 hierarchy.
+    pub fn monitored_cgroup(&self) -> Option<&MonitoredCgroup> {
+        match self {
+            Self::Container {
+                cgroup: CgroupAccess::V2 { monitored },
+                ..
+            } => Some(monitored),
+            Self::Container {
+                cgroup: CgroupAccess::Unreadable(_),
+                ..
+            }
+            | Self::BareMetal
+            | Self::VirtualMachine { .. }
+            | Self::Undetermined => None,
+        }
+    }
+
+    /// Whose processes the agent lists here.
+    pub fn process_view(&self) -> ProcessView {
+        match self {
+            Self::Container {
+                cgroup: CgroupAccess::V2 { monitored },
+                ..
+            } => match monitored.pid1() {
+                Pid1Placement::Inside => ProcessView::Workload,
+                Pid1Placement::Outside => ProcessView::SharedNamespace,
+            },
+            Self::Container {
+                cgroup: CgroupAccess::Unreadable(_),
+                ..
+            } => ProcessView::UnmeasuredContainer,
+            Self::BareMetal | Self::VirtualMachine { .. } | Self::Undetermined => ProcessView::Host,
+        }
+    }
 }
 
 /// The execution environment `evidence` shows, by the first rule that matches (RFC 0014 §3):
@@ -93,6 +135,7 @@ pub fn classify(evidence: &EnvironmentEvidence) -> ExecutionEnvironment {
     if evidence.shows_container() {
         Container {
             runtime: container_runtime(evidence),
+            cgroup: cgroup::cgroup_access(&evidence.cgroup),
         }
     } else if let Some(hypervisor) = hypervisor(evidence) {
         VirtualMachine { hypervisor }
@@ -145,11 +188,36 @@ impl fmt::Display for ExecutionEnvironment {
             Self::VirtualMachine { hypervisor } => {
                 write!(f, "virtual machine ({})", hypervisor.name())
             }
-            Self::Container { runtime: None } => f.write_str("container"),
+            Self::Container {
+                runtime: None,
+                cgroup,
+            } => write!(f, "container, {cgroup}"),
             Self::Container {
                 runtime: Some(runtime),
-            } => write!(f, "container ({})", runtime.name()),
+                cgroup,
+            } => write!(f, "container ({}), {cgroup}", runtime.name()),
             Self::Undetermined => f.write_str("undetermined"),
+        }
+    }
+}
+
+impl fmt::Display for CgroupAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V2 { monitored } => write!(f, "cgroup v2 at {}", monitored.path_display()),
+            Self::Unreadable(why) => write!(f, "cgroup unreadable: {}", why.reason()),
+        }
+    }
+}
+
+impl CgroupUnreadable {
+    /// Why, as a log line says it.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::V1Only => "cgroup v1 only",
+            Self::NoCgroupMount => "no cgroup2 mount",
+            Self::SelfCgroupMissing => "/proc/self/cgroup unreadable",
+            Self::OutsideMountRoot => "outside the cgroup2 mount",
         }
     }
 }
@@ -188,6 +256,7 @@ impl ContainerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::cgroup::{Cgroup2Mount, CgroupEvidence, CgroupPath};
     use ContainerRuntime::*;
     use ExecutionEnvironment::*;
 
@@ -204,11 +273,25 @@ mod tests {
             dmi_hypervisor: None,
             xen: false,
             wsl: false,
+            cgroup: no_cgroup(),
+        }
+    }
+
+    /// Cgroup evidence that finds nothing.
+    fn no_cgroup() -> CgroupEvidence {
+        CgroupEvidence {
+            self_cgroup: Err(CgroupUnreadable::SelfCgroupMissing),
+            mount: None,
+            namespace_root_typed: false,
+            pid1_cgroup: None,
         }
     }
 
     fn container(runtime: Option<ContainerRuntime>) -> ExecutionEnvironment {
-        Container { runtime }
+        Container {
+            runtime,
+            cgroup: CgroupAccess::Unreadable(CgroupUnreadable::SelfCgroupMissing),
+        }
     }
 
     fn vm(hypervisor: Hypervisor) -> ExecutionEnvironment {
@@ -494,6 +577,138 @@ mod tests {
         }
     }
 
+    /// Cgroup evidence of a Docker container: the agent at the root of a private namespace.
+    fn docker_cgroup() -> CgroupEvidence {
+        CgroupEvidence {
+            self_cgroup: Ok(CgroupPath::ROOT),
+            mount: Some(Cgroup2Mount {
+                point: "/sys/fs/cgroup".into(),
+                root: CgroupPath::ROOT,
+            }),
+            namespace_root_typed: true,
+            pid1_cgroup: Some(CgroupPath::ROOT),
+        }
+    }
+
+    #[test]
+    fn only_a_container_is_measured_by_its_cgroup() {
+        let marked = EnvironmentEvidence {
+            dockerenv: true,
+            cgroup: docker_cgroup(),
+            ..nothing()
+        };
+        let Container { cgroup, .. } = classify(&marked) else {
+            panic!("a marker makes a container");
+        };
+        assert_eq!(
+            cgroup,
+            cgroup::cgroup_access(&docker_cgroup()),
+            "the evidence's access"
+        );
+        assert!(
+            matches!(cgroup, CgroupAccess::V2 { .. }),
+            "a readable v2 hierarchy"
+        );
+
+        // A MemoryMax service: a real, limited cgroup, and no marker. It is monitoring the
+        // host, so no cgroup is ever read.
+        let service = EnvironmentEvidence {
+            cgroup: CgroupEvidence {
+                self_cgroup: Ok(CgroupPath::parse("/system.slice/system-agent.service").unwrap()),
+                namespace_root_typed: false,
+                ..docker_cgroup()
+            },
+            ..nothing()
+        };
+        assert_eq!(classify(&service), BareMetal);
+        assert_eq!(classify(&service).monitored_cgroup(), None);
+        assert!(classify(&marked).monitored_cgroup().is_some());
+    }
+
+    #[test]
+    fn a_containers_log_line_names_its_cgroup() {
+        let with = |cgroup| Container {
+            runtime: Some(Docker),
+            cgroup,
+        };
+        let v2 = cgroup::cgroup_access(&docker_cgroup());
+        let nested = cgroup::cgroup_access(&CgroupEvidence {
+            self_cgroup: Ok(CgroupPath::parse("/system.slice/docker-abc.scope").unwrap()),
+            namespace_root_typed: false,
+            ..docker_cgroup()
+        });
+        let stripped = cgroup::cgroup_access(&CgroupEvidence {
+            self_cgroup: Ok(CgroupPath::parse("/docker/abc").unwrap()),
+            mount: Some(Cgroup2Mount {
+                point: "/sys/fs/cgroup".into(),
+                root: CgroupPath::parse("/docker/abc").unwrap(),
+            }),
+            namespace_root_typed: false,
+            pid1_cgroup: None,
+        });
+        let cases = [
+            (with(v2), "container (docker), cgroup v2 at /"),
+            (
+                with(stripped),
+                "container (docker), cgroup v2 at /docker/abc",
+            ),
+            (
+                with(nested),
+                "container (docker), cgroup v2 at /system.slice/docker-abc.scope",
+            ),
+            (
+                with(CgroupAccess::Unreadable(CgroupUnreadable::V1Only)),
+                "container (docker), cgroup unreadable: cgroup v1 only",
+            ),
+            (
+                with(CgroupAccess::Unreadable(CgroupUnreadable::NoCgroupMount)),
+                "container (docker), cgroup unreadable: no cgroup2 mount",
+            ),
+            (
+                with(CgroupAccess::Unreadable(CgroupUnreadable::OutsideMountRoot)),
+                "container (docker), cgroup unreadable: outside the cgroup2 mount",
+            ),
+        ];
+        for (environment, expected) in cases {
+            assert_eq!(environment.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn whose_processes_the_agent_lists() {
+        let with = |cgroup| Container {
+            runtime: None,
+            cgroup,
+        };
+        let shared = cgroup::cgroup_access(&CgroupEvidence {
+            pid1_cgroup: None,
+            ..docker_cgroup()
+        });
+        let cases = [
+            ("bare metal", BareMetal, ProcessView::Host),
+            ("a vm", vm(Hypervisor::Kvm), ProcessView::Host),
+            ("undetermined", Undetermined, ProcessView::Host),
+            (
+                "a container with no v2 hierarchy",
+                container(Some(Docker)),
+                ProcessView::UnmeasuredContainer,
+            ),
+            (
+                "a container whose pid 1 is inside",
+                with(cgroup::cgroup_access(&docker_cgroup())),
+                ProcessView::Workload,
+            ),
+            (
+                "a container sharing the host's pid namespace",
+                with(shared),
+                ProcessView::SharedNamespace,
+            ),
+        ];
+        for (name, environment, expected) in cases {
+            assert_eq!(environment.process_view(), expected, "{name}");
+        }
+    }
+
     #[test]
     fn only_a_container_reports_the_hosts_load() {
         let cases = [
@@ -523,12 +738,30 @@ mod tests {
             (vm(AmazonEc2), "virtual machine (amazon ec2)"),
             (vm(GoogleCompute), "virtual machine (google compute engine)"),
             (vm(Other), "virtual machine (unnamed hypervisor)"),
-            (container(Some(Docker)), "container (docker)"),
-            (container(Some(Podman)), "container (podman)"),
-            (container(Some(Kubernetes)), "container (kubernetes)"),
-            (container(Some(Lxc)), "container (lxc)"),
-            (container(Some(SystemdNspawn)), "container (systemd-nspawn)"),
-            (container(None), "container"),
+            (
+                container(Some(Docker)),
+                "container (docker), cgroup unreadable: /proc/self/cgroup unreadable",
+            ),
+            (
+                container(Some(Podman)),
+                "container (podman), cgroup unreadable: /proc/self/cgroup unreadable",
+            ),
+            (
+                container(Some(Kubernetes)),
+                "container (kubernetes), cgroup unreadable: /proc/self/cgroup unreadable",
+            ),
+            (
+                container(Some(Lxc)),
+                "container (lxc), cgroup unreadable: /proc/self/cgroup unreadable",
+            ),
+            (
+                container(Some(SystemdNspawn)),
+                "container (systemd-nspawn), cgroup unreadable: /proc/self/cgroup unreadable",
+            ),
+            (
+                container(None),
+                "container, cgroup unreadable: /proc/self/cgroup unreadable",
+            ),
             (Undetermined, "undetermined"),
         ];
         for (environment, expected) in cases {

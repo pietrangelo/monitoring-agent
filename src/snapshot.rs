@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::environment::ExecutionEnvironment;
+use crate::environment::sourcing::ReadingOrigins;
 use crate::models::SystemSnapshot;
 
 /// The collector's count of published snapshots. It only grows, across sampler rebuilds, and
@@ -68,6 +69,8 @@ pub struct CollectedSnapshot {
     pub system: SystemSnapshot,
     /// What the reading was taken in: the sampler's, found once at startup.
     pub environment: ExecutionEnvironment,
+    /// Where the CPU, memory and swap groups came from on this reading.
+    pub origins: ReadingOrigins,
     /// Unix seconds on the agent's clock, when the reading started.
     pub collected_at: u64,
     /// When the reading started, on the runtime's monotonic clock.
@@ -80,6 +83,7 @@ impl CollectedSnapshot {
         PublishedSnapshot {
             system: self.system,
             environment: self.environment,
+            origins: self.origins,
             collected_at: self.collected_at,
             read_at: self.read_at,
             seq,
@@ -91,6 +95,7 @@ impl CollectedSnapshot {
 pub struct PublishedSnapshot {
     pub system: SystemSnapshot,
     pub environment: ExecutionEnvironment,
+    pub origins: ReadingOrigins,
     pub collected_at: u64,
     pub read_at: Instant,
     pub seq: SnapshotSeq,
@@ -161,9 +166,10 @@ impl StreamState {
 #[cfg(test)]
 pub mod fixtures {
     use super::*;
-    use crate::collectors::system::fixtures::{process, raw};
-    use crate::collectors::system::{RawDisk, RawNetwork, RawReadings, snapshot_from};
+    use crate::collectors::system::fixtures::{kernel_snapshot, process, raw};
+    use crate::collectors::system::{RawDisk, RawNetwork, RawReadings};
     use crate::collectors::{SnapshotReceiver, SnapshotSender};
+    use crate::environment::sourcing::Origin;
     use tokio::sync::watch;
 
     /// The fixture snapshot's `collected_at`.
@@ -172,6 +178,16 @@ pub mod fixtures {
     /// The fixture snapshot's execution environment.
     pub const ENVIRONMENT: ExecutionEnvironment = ExecutionEnvironment::Container {
         runtime: Some(crate::environment::ContainerRuntime::Podman),
+        cgroup: crate::environment::cgroup::CgroupAccess::Unreadable(
+            crate::environment::cgroup::CgroupUnreadable::V1Only,
+        ),
+    };
+
+    /// Every group read from the kernel.
+    pub const KERNEL_ORIGINS: ReadingOrigins = ReadingOrigins {
+        cpu: Origin::Kernel,
+        memory: Origin::Kernel,
+        swap: Origin::Kernel,
     };
 
     /// `system::fixtures::raw()` with a disk, a network and processes, so no real system's
@@ -203,9 +219,13 @@ pub mod fixtures {
 
     /// `published()`, published under `seq`.
     pub fn published_as(seq: SnapshotSeq) -> PublishedSnapshot {
+        let mut system = kernel_snapshot(readings());
+        // A fractional capacity, so no route can pass the core count off as it.
+        system.cpu.capacity_cpus = 1.5;
         CollectedSnapshot {
-            system: snapshot_from(readings()),
+            system,
             environment: ENVIRONMENT,
+            origins: KERNEL_ORIGINS,
             collected_at: COLLECTED_AT,
             read_at: Instant::now(),
         }

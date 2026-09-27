@@ -325,10 +325,6 @@ impl RuleState {
 pub enum Reading<T> {
     Measured(T),
     /// The tick couldn't measure the metric, and the last measured value still stands.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "produced by RFC 0014's choose_readings, step 5")
-    )]
     Carried,
     /// The metric has no value the agent can stand behind.
     Unavailable,

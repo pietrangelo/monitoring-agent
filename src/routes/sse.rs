@@ -80,6 +80,7 @@ fn system_event(published: &PublishedSnapshot) -> Event {
         "collected_at": published.collected_at,
         "cpu_percent": snap.cpu.usage_percent,
         "cpu_logical_cores": snap.cpu.logical_cores,
+        "cpu_capacity_cpus": snap.cpu.capacity_cpus,
         "memory_percent": snap.memory.usage_percent,
         "memory_used_display": snap.memory.used_display,
         "memory_total_display": snap.memory.total_display,
@@ -249,6 +250,10 @@ mod tests {
         let system = first_event("/api/stream/system").await;
         assert_eq!(system["collected_at"], fixture.collected_at);
         assert_eq!(system["cpu_percent"], fixture.system.cpu.usage_percent);
+        assert_eq!(
+            system["cpu_capacity_cpus"],
+            fixture.system.cpu.capacity_cpus
+        );
         assert_eq!(
             system["memory_used_bytes"],
             fixture.system.memory.used_bytes
