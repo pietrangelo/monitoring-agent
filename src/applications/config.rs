@@ -94,10 +94,6 @@ impl ActuatorBaseUrl {
         Ok(Self(url))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the actuator adapter, RFC 0009 commit 2")
-    )]
     pub fn as_url(&self) -> &url::Url {
         &self.0
     }
@@ -123,15 +119,7 @@ fn is_loopback(host: Option<url::Host<&str>>) -> bool {
 /// No `Debug`, `Display` or `Serialize`: the only way out is the Basic header the actuator
 /// adapter builds.
 pub struct BasicCredentials {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the actuator adapter, RFC 0009 commit 2")
-    )]
     username: String,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the actuator adapter, RFC 0009 commit 2")
-    )]
     password: String,
 }
 
@@ -159,6 +147,11 @@ impl BasicCredentials {
         }
         Ok(Self { username, password })
     }
+
+    /// The username and password, for the actuator adapter's Basic header and nothing else.
+    pub(super) fn basic(&self) -> (&str, &str) {
+        (&self.username, &self.password)
+    }
 }
 
 fn has_control_character(value: &str) -> bool {
@@ -168,13 +161,7 @@ fn has_control_character(value: &str) -> bool {
 /// How the agent authenticates to one application's Actuator.
 pub enum ActuatorCredentials {
     None,
-    Basic(
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "read by the actuator adapter, RFC 0009 commit 2")
-        )]
-        BasicCredentials,
-    ),
+    Basic(BasicCredentials),
 }
 
 impl ActuatorCredentials {
@@ -246,18 +233,10 @@ impl ApplicationTarget {
         &self.name
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the actuator adapter, RFC 0009 commit 2")
-    )]
     pub fn base_url(&self) -> &ActuatorBaseUrl {
         &self.base_url
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the actuator adapter, RFC 0009 commit 2")
-    )]
     pub fn credentials(&self) -> &ActuatorCredentials {
         &self.credentials
     }
@@ -310,13 +289,6 @@ impl Applications {
     }
 
     /// The targets, for the scrape loop to own.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "taken by the scrape loop, RFC 0009 commit 2 step 3"
-        )
-    )]
     pub fn into_targets(self) -> Vec<ApplicationTarget> {
         self.targets
     }

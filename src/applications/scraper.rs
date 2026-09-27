@@ -17,10 +17,15 @@
 //! The HTTP half of the actuator adapter (RFC 0009 §4): one scrape of one application over
 //! HTTP. Requests reach only the configured host: no redirects, no proxies, bodies capped.
 
+use std::fmt;
 use std::time::Duration;
 
-use super::config::ApplicationTarget;
-use super::report::RawScrape;
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
+use reqwest::redirect::Policy;
+
+use super::actuator::{self, ActuatorResponse, Answer, TransportFailure};
+use super::config::{ActuatorCredentials, ApplicationTarget};
+use super::report::{Meters, RawScrape, ReachedScrape, ReportedHealth};
 
 /// How long a scrape waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,22 +45,265 @@ impl Timeouts {
 /// The longest Actuator body read; a longer one is never parsed.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// One Actuator endpoint, relative to the application's base URL, with its `tag` filter.
+#[derive(Debug, Clone, Copy)]
+struct Endpoint {
+    path: &'static str,
+    tag: Option<&'static str>,
+}
+
+impl Endpoint {
+    const fn at(path: &'static str) -> Self {
+        Self { path, tag: None }
+    }
+
+    const fn tagged(path: &'static str, tag: &'static str) -> Self {
+        Self {
+            path,
+            tag: Some(tag),
+        }
+    }
+
+    const HEALTH: Self = Self::at("health");
+    const INFO: Self = Self::at("info");
+    const HEAP_USED: Self = Self::tagged("metrics/jvm.memory.used", "area:heap");
+    const HEAP_MAX: Self = Self::tagged("metrics/jvm.memory.max", "area:heap");
+    const CPU_USAGE: Self = Self::at("metrics/process.cpu.usage");
+    const LIVE_THREADS: Self = Self::at("metrics/jvm.threads.live");
+    const GC_PAUSE: Self = Self::at("metrics/jvm.gc.pause");
+    const HTTP_REQUESTS: Self = Self::at("metrics/http.server.requests");
+    const HTTP_SERVER_ERRORS: Self =
+        Self::tagged("metrics/http.server.requests", "outcome:SERVER_ERROR");
+    const DB_CONNECTIONS_ACTIVE: Self = Self::at("metrics/hikaricp.connections.active");
+    const UPTIME: Self = Self::at("metrics/process.uptime");
+
+    /// This endpoint under `target`'s base URL, which ends in `/`, so the join keeps its path.
+    fn url(self, target: &ApplicationTarget) -> Option<url::Url> {
+        let mut url = target.base_url().as_url().join(self.path).ok()?;
+        if let Some(tag) = self.tag {
+            url.query_pairs_mut().append_pair("tag", tag);
+        }
+        Some(url)
+    }
+}
+
+/// Whether Actuator answered, and so counted the request in `http.server.requests`: an
+/// over-cap body was still served. A failure after the headers arrived counts as no answer,
+/// which undercounts by at most that request.
+fn was_answered(answer: &Answer) -> bool {
+    match answer {
+        Ok(_) | Err(TransportFailure::BodyTooLarge) => true,
+        Err(TransportFailure::Connect | TransportFailure::Timeout) => false,
+    }
+}
+
+/// Info and the nine curated meters, as answered.
+struct Answers {
+    info: Answer,
+    heap_used: Answer,
+    heap_max: Answer,
+    cpu_usage: Answer,
+    live_threads: Answer,
+    gc_pause: Answer,
+    http_requests: Answer,
+    http_server_errors: Answer,
+    db_connections_active: Answer,
+    uptime: Answer,
+}
+
+impl Answers {
+    /// The scrape these answers make, after a health request that was answered. Destructured
+    /// in full, so a new endpoint can't be left out of the agent's own request count.
+    fn into_scrape(self, health: ReportedHealth) -> ReachedScrape {
+        let Self {
+            info,
+            heap_used,
+            heap_max,
+            cpu_usage,
+            live_threads,
+            gc_pause,
+            http_requests,
+            http_server_errors,
+            db_connections_active,
+            uptime,
+        } = self;
+        let answered: u32 = [
+            &info,
+            &heap_used,
+            &heap_max,
+            &cpu_usage,
+            &live_threads,
+            &gc_pause,
+            &http_requests,
+            &http_server_errors,
+            &db_connections_active,
+            &uptime,
+        ]
+        .into_iter()
+        .map(|answer| u32::from(was_answered(answer)))
+        .sum();
+        ReachedScrape {
+            health,
+            version: actuator::version_of(info),
+            meters: Meters {
+                heap_used: actuator::reading_of(heap_used),
+                heap_max: actuator::reading_of(heap_max),
+                cpu_usage: actuator::reading_of(cpu_usage),
+                live_threads: actuator::reading_of(live_threads),
+                gc_pause_seconds: actuator::total_time_of(gc_pause),
+                http_requests: actuator::timer_of(http_requests),
+                http_server_errors: actuator::count_of(http_server_errors),
+                db_connections_active: actuator::reading_of(db_connections_active),
+                uptime_seconds: actuator::reading_of(uptime),
+            },
+            // Health was answered too.
+            own_requests: answered + 1,
+        }
+    }
+}
+
 /// Scrapes applications over one shared HTTP client.
-pub struct Scraper {}
+pub struct Scraper {
+    client: reqwest::Client,
+}
 
 /// Why the scraper's HTTP client couldn't be built.
 #[derive(Debug)]
 pub struct ScraperError(reqwest::Error);
 
+impl fmt::Display for ScraperError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cannot build the actuator HTTP client: {}", self.0)
+    }
+}
+
+#[cfg(test)]
+impl ScraperError {
+    /// A real `reqwest` error, for tests that need a `ScraperError` without a failing build.
+    pub fn for_test() -> Self {
+        match reqwest::Client::new().get("not a url").build() {
+            Err(err) => Self(err),
+            Ok(_) => panic!("a relative URL is refused"),
+        }
+    }
+}
+
+impl std::error::Error for ScraperError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 impl Scraper {
-    pub fn new(_timeouts: Timeouts) -> Result<Self, ScraperError> {
-        Ok(Self {})
+    /// Redirects and proxies are off, so a request and its credentials reach only the
+    /// configured host.
+    pub fn new(timeouts: Timeouts) -> Result<Self, ScraperError> {
+        let headers =
+            HeaderMap::from_iter([(ACCEPT, HeaderValue::from_static("application/json"))]);
+        let client = reqwest::Client::builder()
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.request)
+            .redirect(Policy::none())
+            .no_proxy()
+            .default_headers(headers)
+            .build()
+            .map_err(ScraperError)?;
+        Ok(Self { client })
     }
 
     /// Reads one application: its health first; if it answered, its info and the curated
     /// meters, concurrently.
-    pub async fn scrape(&self, _target: &ApplicationTarget) -> RawScrape {
-        RawScrape::Unreachable(super::report::ScrapeFailure::BadBody)
+    pub async fn scrape(&self, target: &ApplicationTarget) -> RawScrape {
+        let health = match actuator::health_of(self.get(target, Endpoint::HEALTH).await) {
+            Ok(health) => health,
+            Err(failure) => return RawScrape::Unreachable(failure),
+        };
+        RawScrape::Reached(self.rest(target).await.into_scrape(health))
+    }
+
+    /// Everything but health, all in flight at once.
+    async fn rest(&self, target: &ApplicationTarget) -> Answers {
+        let get = |endpoint| self.get(target, endpoint);
+        let (
+            info,
+            heap_used,
+            heap_max,
+            cpu_usage,
+            live_threads,
+            gc_pause,
+            http_requests,
+            http_server_errors,
+            db_connections_active,
+            uptime,
+        ) = tokio::join!(
+            get(Endpoint::INFO),
+            get(Endpoint::HEAP_USED),
+            get(Endpoint::HEAP_MAX),
+            get(Endpoint::CPU_USAGE),
+            get(Endpoint::LIVE_THREADS),
+            get(Endpoint::GC_PAUSE),
+            get(Endpoint::HTTP_REQUESTS),
+            get(Endpoint::HTTP_SERVER_ERRORS),
+            get(Endpoint::DB_CONNECTIONS_ACTIVE),
+            get(Endpoint::UPTIME),
+        );
+        Answers {
+            info,
+            heap_used,
+            heap_max,
+            cpu_usage,
+            live_threads,
+            gc_pause,
+            http_requests,
+            http_server_errors,
+            db_connections_active,
+            uptime,
+        }
+    }
+
+    /// One GET, with the application's credentials, its body read up to the cap.
+    async fn get(&self, target: &ApplicationTarget, endpoint: Endpoint) -> Answer {
+        // The base URL is a valid http(s) URL ending in `/`, and every path is a fixed
+        // relative one, so the join can't fail; if it did, no request was made.
+        let url = endpoint.url(target).ok_or(TransportFailure::Connect)?;
+        let request = match target.credentials() {
+            ActuatorCredentials::None => self.client.get(url),
+            ActuatorCredentials::Basic(credentials) => {
+                let (username, password) = credentials.basic();
+                self.client.get(url).basic_auth(username, Some(password))
+            }
+        };
+        let response = request.send().await.map_err(transport_failure)?;
+        let status = response.status().as_u16();
+        let body = read_capped(response).await?;
+        Ok(ActuatorResponse { status, body })
+    }
+}
+
+/// The body, chunk by chunk, refused as soon as it passes `MAX_BODY_BYTES`: a body with no
+/// length, or one that never ends, costs at most the cap.
+async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, TransportFailure> {
+    let too_large = |len: u64| len > MAX_BODY_BYTES as u64;
+    if response.content_length().is_some_and(too_large) {
+        return Err(TransportFailure::BodyTooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport_failure)? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(TransportFailure::BodyTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// A timeout, at connect or anywhere in the request, is `Timeout`; every other failure to
+/// get an answer (refused, reset, dropped mid-body) is `Connect`.
+fn transport_failure(error: reqwest::Error) -> TransportFailure {
+    if error.is_timeout() {
+        TransportFailure::Timeout
+    } else {
+        TransportFailure::Connect
     }
 }
 
@@ -96,9 +344,15 @@ mod tests {
 
     /// Everything the mock saw: each request's URI and headers, and how many were in flight
     /// at once.
+    /// One request as the mock saw it.
+    struct SeenRequest {
+        uri: String,
+        headers: Vec<(String, String)>,
+    }
+
     #[derive(Default)]
     struct Seen {
-        requests: parking_lot::Mutex<Vec<(String, Vec<(String, String)>)>>,
+        requests: parking_lot::Mutex<Vec<SeenRequest>>,
         in_flight: AtomicUsize,
         peak_in_flight: AtomicUsize,
     }
@@ -112,8 +366,9 @@ mod tests {
             self.requests
                 .lock()
                 .iter()
-                .map(|(_, headers)| {
-                    headers
+                .map(|request| {
+                    request
+                        .headers
                         .iter()
                         .find(|(k, _)| k == name)
                         .map(|(_, v)| v.clone())
@@ -137,7 +392,10 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            seen.requests.lock().push((uri.to_string(), headers));
+            seen.requests.lock().push(SeenRequest {
+                uri: uri.to_string(),
+                headers,
+            });
             let now = seen.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             seen.peak_in_flight.fetch_max(now, Ordering::SeqCst);
             let tag = uri
@@ -355,13 +613,14 @@ mod tests {
             // The credentials are in no URI and no other header, in any encoding: the only
             // query is the `tag` filter, and no other header carries the password or the
             // Basic value.
-            for (uri, headers) in seen.requests.lock().iter() {
-                let query = uri.split_once('?').map(|(_, q)| q);
+            for request in seen.requests.lock().iter() {
+                let query = request.uri.split_once('?').map(|(_, q)| q);
                 assert!(
                     query.is_none_or(|q| q.starts_with("tag=") && !q.contains('&')),
-                    "{user}: an unexpected query in {uri}"
+                    "{user}: an unexpected query in {}",
+                    request.uri
                 );
-                for (name, value) in headers {
+                for (name, value) in &request.headers {
                     if name != "authorization" {
                         assert!(
                             !value.contains(pass) && !value.contains(header),
@@ -549,10 +808,10 @@ mod tests {
     async fn an_applications_meters_are_requested_concurrently() {
         let mut answers = healthy();
         for (key, reply) in answers.iter_mut() {
-            if key.contains("/metrics/") || key.ends_with("/info") {
-                if let Reply::Fixed(_, body) = reply {
-                    *reply = Reply::Slow(Duration::from_millis(150), body.clone());
-                }
+            if (key.contains("/metrics/") || key.ends_with("/info"))
+                && let Reply::Fixed(_, body) = reply
+            {
+                *reply = Reply::Slow(Duration::from_millis(150), body.clone());
             }
         }
         let (addr, seen) = serve(answers).await;
@@ -636,18 +895,43 @@ mod tests {
 
     #[tokio::test]
     async fn the_request_timeout_is_the_longer_one_and_the_connect_timeout_the_shorter() {
-        // A 400 ms answer fits a 1 s request timeout, and would not fit a swapped 100 ms one.
+        // A 2.2 s answer fits the configured 3 s request timeout. It would not fit a swapped
+        // 100 ms one, nor any fixed timeout under the 2 s the slow-health test above allows.
         let answers = healthy_with(
             "/manage/health",
-            Reply::Slow(Duration::from_millis(400), r#"{"status":"UP"}"#.into()),
+            Reply::Slow(Duration::from_millis(2200), r#"{"status":"UP"}"#.into()),
         );
         let (addr, _) = serve(answers).await;
         let timeouts = Timeouts {
             connect: Duration::from_millis(100),
-            request: Duration::from_secs(1),
+            request: Duration::from_secs(3),
         };
         let raw = scrape_with(timeouts, addr, None).await;
         assert!(matches!(raw, RawScrape::Reached(_)), "{raw:?}");
+    }
+
+    #[tokio::test]
+    async fn an_endless_body_is_given_up_at_the_cap_not_read_until_the_timeout() {
+        // With a 5 s request timeout, a read that buffers until the timeout takes 5 s; one
+        // that stops at 64 KiB is done at once.
+        let generous = Timeouts {
+            connect: Duration::from_secs(1),
+            request: Duration::from_secs(5),
+        };
+        let cases = [
+            ("health", "/manage/health"),
+            ("a meter", "/manage/metrics/jvm.threads.live"),
+        ];
+        for (name, key) in cases {
+            let (addr, _) = serve(healthy_with(key, Reply::Endless)).await;
+            let started = std::time::Instant::now();
+            scrape_with(generous, addr, None).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "case {name}: gave up after {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     /// Set only in the child process `environment_proxies_are_never_used` starts.

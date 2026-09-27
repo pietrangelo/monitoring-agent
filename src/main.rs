@@ -24,6 +24,8 @@ mod routes;
 mod state;
 
 use applications::config::ApplicationsConfig;
+use applications::scrape_loop::scrape_loop;
+use applications::scraper::{Scraper, Timeouts};
 use axum::{Router, middleware};
 use std::fmt;
 use std::net::SocketAddr;
@@ -41,6 +43,7 @@ const LISTEN: SocketAddr =
 enum StartupError {
     Config(applications::config::ApplicationsConfigError),
     Runtime(std::io::Error),
+    Scraper(applications::scraper::ScraperError),
     Bind(SocketAddr, std::io::Error),
     Serve(std::io::Error),
 }
@@ -51,7 +54,7 @@ impl StartupError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) => 78,
-            Self::Runtime(_) | Self::Bind(..) | Self::Serve(_) => 1,
+            Self::Runtime(_) | Self::Scraper(_) | Self::Bind(..) | Self::Serve(_) => 1,
         }
     }
 }
@@ -61,6 +64,7 @@ impl fmt::Display for StartupError {
         match self {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
             Self::Runtime(err) => write!(f, "Failed to start the async runtime: {err}"),
+            Self::Scraper(err) => write!(f, "Failed to start scraping applications: {err}"),
             Self::Bind(addr, err) => write!(f, "Failed to bind {addr}: {err}"),
             Self::Serve(err) => write!(f, "Server failed: {err}"),
         }
@@ -88,7 +92,7 @@ fn start() -> Result<(), StartupError> {
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    runtime.block_on(run())
+    runtime.block_on(run(applications))
 }
 
 /// Logs what the applications configuration asks for, and warns about credentials that would
@@ -111,8 +115,8 @@ fn announce(applications: &ApplicationsConfig) {
     }
 }
 
-async fn run() -> Result<(), StartupError> {
-    let app_state = state::AppState::new();
+async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
+    let app_state = start_applications(applications)?;
 
     if auth::configured_token().is_some() {
         tracing::info!("🔐 API authentication enabled (SYSTEM_AGENT_TOKEN set)");
@@ -127,6 +131,28 @@ async fn run() -> Result<(), StartupError> {
     spawn_push_client();
 
     serve(router(app_state)).await
+}
+
+/// Starts the scrape loop when applications are configured, and returns the state that serves
+/// its rounds. With applications off, no loop runs and the state has no rounds.
+fn start_applications(
+    applications: ApplicationsConfig,
+) -> Result<Arc<state::AppState>, StartupError> {
+    let ApplicationsConfig::On(applications) = applications else {
+        return Ok(state::AppState::new());
+    };
+    let scraper = Scraper::new(Timeouts::PRODUCTION).map_err(StartupError::Scraper)?;
+    let (rounds, receiver) = tokio::sync::watch::channel(None);
+    let app_state = state::AppState::with_rounds(receiver);
+    let scraping = tokio::spawn(scrape_loop(scraper, applications, app_state.run, rounds));
+    // The loop runs for the agent's lifetime; if it ends, say so once, where operators look.
+    tokio::spawn(async move {
+        match scraping.await {
+            Ok(()) => tracing::error!("The application scrape loop ended; no more rounds"),
+            Err(err) => tracing::error!("The application scrape loop failed: {err}"),
+        }
+    });
+    Ok(app_state)
 }
 
 /// Starts the push client if `PUSH_TO` names a hub. It reconnects for the agent's lifetime.
@@ -157,6 +183,7 @@ fn router(app_state: Arc<state::AppState>) -> Router {
 
     Router::new()
         .merge(routes::api::router(app_state.clone()))
+        .merge(routes::applications::router(app_state.clone()))
         .merge(routes::sse::router(app_state.clone()))
         .merge(routes::ws::router(app_state))
         .nest_service("/", ServeDir::new("static"))
@@ -191,6 +218,11 @@ mod tests {
                 78,
             ),
             ("no runtime", StartupError::Runtime(io()), 1),
+            (
+                "no HTTP client",
+                StartupError::Scraper(applications::scraper::ScraperError::for_test()),
+                1,
+            ),
             ("a busy port", StartupError::Bind(addr, io()), 1),
             ("a failed server", StartupError::Serve(io()), 1),
         ];

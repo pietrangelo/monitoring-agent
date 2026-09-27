@@ -15,5 +15,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 pub mod api;
+pub mod applications;
 pub mod sse;
 pub mod ws;

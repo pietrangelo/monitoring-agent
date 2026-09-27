@@ -34,8 +34,15 @@ Runs on every monitored Linux host. Responsibilities:
   variables (`applications/config.rs`, RFC 0009). `main` is synchronous: it parses this
   configuration before it builds the Tokio runtime, so a malformed value refuses startup
   (exit code 78, `EX_CONFIG`, used for nothing else) before any task, bind or connection
-  exists. Every other startup failure is a typed `StartupError` that exits 1. Scraping the
-  applications is not implemented yet.
+  exists. Every other startup failure is a typed `StartupError` that exits 1.
+- Scrapes those applications' Actuators (`applications/`): a scrape loop runs a scrape round
+  over every application concurrently, publishes it on a `watch` channel that `AppState`
+  holds the receiver of, then sleeps a full scrape interval, so two rounds are always at least
+  one interval apart. Requests reach only the configured host: one shared HTTP client with
+  redirects and environment proxies off, a 2 s connect and 5 s whole-request timeout, and
+  bodies read chunk by chunk up to 64 KiB. `GET /api/applications` serves the latest round,
+  and nothing once the loop has ended. Health changes are logged when an application becomes
+  unreachable and when it recovers, naming the application and the failure, never a URL.
 
 ### `system-hub` (`system-hub/`)
 
@@ -103,7 +110,7 @@ match those rules (listed under Open architectural questions below).
 | **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `AgentRun`, `IncidentId`, the per-rule `Breach` state, `AlertManager::evaluate` and `replace_rules`) | `routes/api.rs` alert endpoints, `routes/sse.rs` and `routes/ws.rs` alert streams | deciding when a metric breaches a rule, for how long, and cooldown; the identity of each alert incident |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
-| **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
+| **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`); `applications/round.rs` (`RoundId`, `RoundSequence`, `ScrapeRound`, `NamedReport`, `health_change`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version); `applications/scraper.rs` (the HTTP client: `Scraper`, `Timeouts`, the body cap); `applications/scrape_loop.rs` (`scrape_loop`, the round `watch` channel); `routes/applications.rs` (`GET /api/applications` and its JSON) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`; `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables, `state.rs` live cache, `routes/*` | stored time series, alert history, retention |
@@ -168,6 +175,9 @@ mixed-version fleet must keep working):
 | **application health** | what Actuator's `/actuator/health` reported (up, down, out of service, unknown), or that the application was unreachable | `ApplicationHealth` |
 | **application report** | the result of one scrape of one application: unreachable, or its health, version (≤ 64 chars) and gauges | `ApplicationReport`, `ApplicationVersion` |
 | **scrape history** | an application's baseline for rates: the counters of its previous reachable scrape, when they were read, and how many requests the agent itself made then. Cleared by an unreachable scrape | `ScrapeHistory` |
+| **scrape round** | every application report from one pass over the configured applications, published as one unit | `ScrapeRound` |
+| **round id** | identifies a scrape round: the **agent run** and a sequence counting the run's rounds from 1, never rewinding | `RoundId`, `RoundSequence` |
+| **health change** | an application becoming unreachable, or recovering; a change among reported healths (up to down) is not one. The agent logs each: `warn` naming the scrape failure, `info` on recovery | `HealthChange`, `health_change` |
 | **application restart** | any counter of an application going down, uptime included, between two scrapes. It resets every counter: the scrape that sees it becomes the new baseline and reports no rates | `ScrapeHistory::advance` |
 
 ## Trust boundaries & auth

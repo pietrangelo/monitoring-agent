@@ -225,8 +225,9 @@ For push-mode agents, they appear automatically — no manual registration neede
 
 The agent parses the `SPRING_BOOT_*` variables before it starts anything. If one is
 malformed, it logs which variable is wrong (never its value) and exits with code **78**
-(`EX_CONFIG`); no other failure uses that code. (RFC 0009 is being implemented: today the
-agent validates this configuration; scraping and sending application data follow.)
+(`EX_CONFIG`); no other failure uses that code. With applications configured, the agent
+scrapes each one's Actuator every interval and serves the result on `GET /api/applications`.
+(RFC 0009 is being implemented: sending application data to the hub follows.)
 
 ### System Hub — environment variables
 
@@ -254,6 +255,7 @@ agent validates this configuration; scraping and sending application data follow
 | `GET /api/alerts/config` | Current alert rules |
 | `POST /api/alerts/config` | Replace alert rules (JSON body) |
 | `GET /api/{packages,services,containers,ports}` | Installed packages, services, Docker, ports |
+| `GET /api/applications` | Latest scrape round of the Spring Boot applications: round id (`run`, `seq`), `interval_secs`, `scraped_at`, and per application its `name`, `health` (`up`, `down`, `out_of_service`, `unknown`, `unreachable`), `version` and `gauges`. `round`, `interval_secs` and `scraped_at` are `null` (and `applications` is `[]`) before the first round and whenever no scrape loop runs |
 | `GET /api/stream/system` | **SSE** — CPU/mem/load every 2s |
 | `GET /api/stream/processes` | **SSE** — Top processes every 3s |
 | `GET /api/stream/alerts` | **SSE** — Active alerts every 3s |
