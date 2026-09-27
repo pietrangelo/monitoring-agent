@@ -18,6 +18,7 @@ mod alerts;
 mod applications;
 mod auth;
 mod collectors;
+mod environment;
 mod models;
 mod push;
 mod routes;

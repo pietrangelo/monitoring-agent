@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::environment::usage::{LoadAverage, Percent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -150,12 +151,12 @@ enum Breach {
     #[default]
     Clear,
     /// Breaching, but not yet for the rule's duration.
-    Pending {
-        since: u64,
-    },
+    Pending { since: u64 },
+    /// `value` is the reading of the last tick that measured the metric.
     Active {
         since: u64,
         incident: Incident,
+        value: f32,
     },
 }
 
@@ -165,28 +166,33 @@ impl Breach {
     /// stalling until the clock catches up.
     fn advance(
         self,
-        breached: bool,
+        observed: Observation,
         duration_secs: u64,
         now: u64,
         incidents: &mut IncidentSequence,
     ) -> Self {
-        if !breached {
+        if !observed.breached {
             return Breach::Clear;
         }
+        let since = match &self {
+            Breach::Clear => now,
+            Breach::Pending { since } | Breach::Active { since, .. } => (*since).min(now),
+        };
         match self {
-            Breach::Clear => Self::pending_or_active(now, duration_secs, now, incidents),
-            Breach::Pending { since } => {
-                Self::pending_or_active(since.min(now), duration_secs, now, incidents)
+            Breach::Clear | Breach::Pending { .. } => {
+                Self::pending_or_active(since, observed.value, duration_secs, now, incidents)
             }
-            Breach::Active { since, incident } => Breach::Active {
-                since: since.min(now),
+            Breach::Active { incident, .. } => Breach::Active {
+                since,
                 incident,
+                value: observed.value,
             },
         }
     }
 
     fn pending_or_active(
         since: u64,
+        value: f32,
         duration_secs: u64,
         now: u64,
         incidents: &mut IncidentSequence,
@@ -198,15 +204,37 @@ impl Breach {
             id: incidents.mint(),
             activated_at: now,
         };
-        Breach::Active { since, incident }
-    }
-
-    fn active_incident(&self) -> Option<(u64, &Incident)> {
-        match self {
-            Breach::Clear | Breach::Pending { .. } => None,
-            Breach::Active { since, incident } => Some((*since, incident)),
+        Breach::Active {
+            since,
+            incident,
+            value,
         }
     }
+
+    /// The active alert of this breach's incident at `now`, if an incident is active.
+    fn active_alert(&self, rule: &AlertRule, threshold: f32, now: u64) -> Option<ActiveAlert> {
+        match self {
+            Breach::Clear | Breach::Pending { .. } => None,
+            Breach::Active {
+                since,
+                incident,
+                value,
+            } => Some(ActiveAlert {
+                id: incident.id.to_string(),
+                rule: rule.clone(),
+                current_value: *value,
+                fired_at: unix_to_iso8601(incident.activated_at),
+                message: alert_message(rule, *value, threshold, now.saturating_sub(*since)),
+            }),
+        }
+    }
+}
+
+/// One tick's measured value of a rule's metric, and whether it breaches the rule.
+#[derive(Debug, Clone, Copy)]
+struct Observation {
+    value: f32,
+    breached: bool,
 }
 
 /// What the manager remembers about one rule between ticks. The cooldown spans incidents,
@@ -228,26 +256,46 @@ impl RuleState {
     fn tick(
         &mut self,
         rule: &AlertRule,
-        readings: &Readings<'_>,
+        readings: &Readings,
         now: u64,
         incidents: &mut IncidentSequence,
     ) -> Option<Report> {
-        let value = readings.value_for(rule);
         let threshold = readings.threshold_for(rule);
-        let breached = is_breached(&rule.operator, value, threshold);
+        match readings.value_for(rule) {
+            Reading::Measured(value) => {
+                let observed = Observation {
+                    value,
+                    breached: is_breached(&rule.operator, value, threshold),
+                };
+                self.measure(rule, observed, threshold, now, incidents)
+            }
+            // Skipped: the breach stands as it was, and nothing notifies.
+            Reading::Carried => self
+                .breach
+                .active_alert(rule, threshold, now)
+                .map(Report::Quiet),
+            // Cleared, as the last measured value no longer stands. The cooldown is kept.
+            Reading::Unavailable => {
+                self.breach = Breach::Clear;
+                None
+            }
+        }
+    }
+
+    /// Advances the breach on a measured value, and notifies if the cooldown allows.
+    fn measure(
+        &mut self,
+        rule: &AlertRule,
+        observed: Observation,
+        threshold: f32,
+        now: u64,
+        incidents: &mut IncidentSequence,
+    ) -> Option<Report> {
         // Like the breach start, a last notification later than `now` moves back to `now`.
         self.last_notified = self.last_notified.map(|last| last.min(now));
         self.breach =
-            std::mem::take(&mut self.breach).advance(breached, rule.duration_secs, now, incidents);
-
-        let (since, incident) = self.breach.active_incident()?;
-        let alert = ActiveAlert {
-            id: incident.id.to_string(),
-            rule: rule.clone(),
-            current_value: value,
-            fired_at: unix_to_iso8601(incident.activated_at),
-            message: alert_message(rule, value, threshold, now.saturating_sub(since)),
-        };
+            std::mem::take(&mut self.breach).advance(observed, rule.duration_secs, now, incidents);
+        let alert = self.breach.active_alert(rule, threshold, now)?;
         Some(if self.take_notification(rule.cooldown_secs, now) {
             Report::Notify(alert)
         } else {
@@ -271,31 +319,60 @@ impl RuleState {
 
 // ── Manager ────────────────────────────────────────────
 
-/// The metric readings of one tick, as `evaluate` receives them.
-struct Readings<'a> {
-    cpu_percent: f32,
-    mem_percent: f32,
-    swap_percent: f32,
-    disk_usages: &'a HashMap<String, f32>,
-    load1: f32,
-    load5: f32,
-    load15: f32,
-    cpu_cores: usize,
+/// One metric's reading on a tick: measured on it, carried over from an earlier tick whose
+/// value still stands, or unavailable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Reading<T> {
+    Measured(T),
+    /// The tick couldn't measure the metric, and the last measured value still stands.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "produced by RFC 0014's choose_readings, step 5")
+    )]
+    Carried,
+    /// The metric has no value the agent can stand behind.
+    Unavailable,
 }
 
-impl Readings<'_> {
-    fn value_for(&self, rule: &AlertRule) -> f32 {
+impl<T> Reading<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Reading<U> {
+        match self {
+            Reading::Measured(value) => Reading::Measured(f(value)),
+            Reading::Carried => Reading::Carried,
+            Reading::Unavailable => Reading::Unavailable,
+        }
+    }
+}
+
+/// The metric readings of one tick, as `evaluate` receives them.
+#[derive(Debug, Clone)]
+pub struct Readings {
+    pub cpu: Reading<Percent>,
+    pub memory: Reading<Percent>,
+    pub swap: Reading<Percent>,
+    /// Usage percent per mount point.
+    pub disk_usages: HashMap<String, f32>,
+    pub load1: LoadAverage,
+    pub load5: LoadAverage,
+    pub load15: LoadAverage,
+    pub cpu_cores: usize,
+}
+
+impl Readings {
+    fn value_for(&self, rule: &AlertRule) -> Reading<f32> {
         match &rule.metric {
-            AlertMetric::Cpu => self.cpu_percent,
-            AlertMetric::Memory => self.mem_percent,
-            AlertMetric::Swap => self.swap_percent,
-            AlertMetric::Disk => match &rule.mount_point {
+            AlertMetric::Cpu => self.cpu.map(Percent::get),
+            AlertMetric::Memory => self.memory.map(Percent::get),
+            AlertMetric::Swap => self.swap.map(Percent::get),
+            // Disks stay outside RFC 0014's three-state readings: a missing mount still reads
+            // 0.0, as before (see docs/ARCHITECTURE.md, Open architectural questions).
+            AlertMetric::Disk => Reading::Measured(match &rule.mount_point {
                 Some(mount_point) => self.disk_usages.get(mount_point).copied().unwrap_or(0.0),
                 None => self.disk_usages.values().copied().fold(0.0, f32::max),
-            },
-            AlertMetric::Load1 => self.load1,
-            AlertMetric::Load5 => self.load5,
-            AlertMetric::Load15 => self.load15,
+            }),
+            AlertMetric::Load1 => Reading::Measured(self.load1.get()),
+            AlertMetric::Load5 => Reading::Measured(self.load5.get()),
+            AlertMetric::Load15 => Reading::Measured(self.load15.get()),
         }
     }
 
@@ -425,30 +502,9 @@ impl AlertManager {
         )
     }
 
-    /// Evaluate all rules against current data. Returns the alerts that notify on this tick.
-    #[allow(clippy::too_many_arguments)]
-    pub fn evaluate(
-        &mut self,
-        cpu_percent: f32,
-        mem_percent: f32,
-        swap_percent: f32,
-        disk_usages: &HashMap<String, f32>,
-        load1: f32,
-        load5: f32,
-        load15: f32,
-        cpu_cores: usize,
-        now_secs: u64,
-    ) -> Vec<ActiveAlert> {
-        let readings = Readings {
-            cpu_percent,
-            mem_percent,
-            swap_percent,
-            disk_usages,
-            load1,
-            load5,
-            load15,
-            cpu_cores,
-        };
+    /// Evaluate all rules against one tick's readings. Returns the alerts that notify on this
+    /// tick.
+    pub fn evaluate(&mut self, readings: &Readings, now_secs: u64) -> Vec<ActiveAlert> {
         let mut notifications = Vec::new();
         let mut active = Vec::new();
 
@@ -459,7 +515,7 @@ impl AlertManager {
             .filter(|(_, rule)| rule.enabled)
         {
             let state = self.states.entry(index).or_default();
-            match state.tick(rule, &readings, now_secs, &mut self.incidents) {
+            match state.tick(rule, readings, now_secs, &mut self.incidents) {
                 None => {}
                 Some(Report::Quiet(alert)) => active.push(alert),
                 Some(Report::Notify(alert)) => {
@@ -571,8 +627,42 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
+/// Readings for tests elsewhere in the crate.
+#[cfg(test)]
+pub mod fixtures {
+    use super::*;
+
+    /// A measured percentage.
+    pub fn measured(percent: f32) -> Reading<Percent> {
+        Reading::Measured(Percent::saturating(percent).expect("a percentage, not NaN"))
+    }
+
+    /// Every metric measured at 0 on a 4-core host with no disks.
+    pub fn idle() -> Readings {
+        Readings {
+            cpu: measured(0.0),
+            memory: measured(0.0),
+            swap: measured(0.0),
+            disk_usages: HashMap::new(),
+            load1: LoadAverage::new(0.0),
+            load5: LoadAverage::new(0.0),
+            load15: LoadAverage::new(0.0),
+            cpu_cores: 4,
+        }
+    }
+
+    /// `idle`, but with CPU measured at `percent`.
+    pub fn cpu_at(percent: f32) -> Readings {
+        Readings {
+            cpu: measured(percent),
+            ..idle()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{cpu_at, idle, measured};
     use super::*;
 
     /// Evaluation ticks as (cpu percent, now).
@@ -597,17 +687,7 @@ mod tests {
 
     /// One evaluation tick with only the CPU reading set.
     fn tick_cpu(mgr: &mut AlertManager, cpu_percent: f32, now_secs: u64) -> Vec<ActiveAlert> {
-        mgr.evaluate(
-            cpu_percent,
-            0.0,
-            0.0,
-            &HashMap::new(),
-            0.0,
-            0.0,
-            0.0,
-            4,
-            now_secs,
-        )
+        mgr.evaluate(&cpu_at(cpu_percent), now_secs)
     }
 
     fn test_run(n: u128) -> AgentRun {
@@ -971,14 +1051,16 @@ mod tests {
             | AlertMetric::Load15 => HashMap::new(),
         };
         mgr.evaluate(
-            slot(AlertMetric::Cpu),
-            slot(AlertMetric::Memory),
-            slot(AlertMetric::Swap),
-            &disks,
-            slot(AlertMetric::Load1),
-            slot(AlertMetric::Load5),
-            slot(AlertMetric::Load15),
-            4,
+            &Readings {
+                cpu: measured(slot(AlertMetric::Cpu)),
+                memory: measured(slot(AlertMetric::Memory)),
+                swap: measured(slot(AlertMetric::Swap)),
+                disk_usages: disks.clone(),
+                load1: LoadAverage::new(slot(AlertMetric::Load1)),
+                load5: LoadAverage::new(slot(AlertMetric::Load5)),
+                load15: LoadAverage::new(slot(AlertMetric::Load15)),
+                ..idle()
+            },
             now,
         );
     }
@@ -1076,6 +1158,228 @@ mod tests {
                 message.contains(expected),
                 "{name}: {message:?} lacks {expected:?}"
             );
+        }
+    }
+
+    /// The metrics whose reading can be carried or unavailable.
+    const PERCENT_METRICS: [AlertMetric; 3] =
+        [AlertMetric::Cpu, AlertMetric::Memory, AlertMetric::Swap];
+
+    /// One tick where `metric` reads `reading` and every other metric is idle.
+    fn tick_reading(
+        mgr: &mut AlertManager,
+        metric: &AlertMetric,
+        reading: Reading<Percent>,
+        now: u64,
+    ) -> Vec<ActiveAlert> {
+        let mut readings = idle();
+        match metric {
+            AlertMetric::Cpu => readings.cpu = reading,
+            AlertMetric::Memory => readings.memory = reading,
+            AlertMetric::Swap => readings.swap = reading,
+            AlertMetric::Disk | AlertMetric::Load1 | AlertMetric::Load5 | AlertMetric::Load15 => {
+                panic!("{metric:?} has no three-state reading")
+            }
+        }
+        mgr.evaluate(&readings, now)
+    }
+
+    /// A manager with one `> 90` rule on `metric`.
+    fn rule_on(metric: &AlertMetric, duration_secs: u64, cooldown_secs: u64) -> AlertManager {
+        manager(vec![AlertRule {
+            metric: metric.clone(),
+            ..cpu_rule(90.0, duration_secs, cooldown_secs)
+        }])
+    }
+
+    #[test]
+    fn a_carried_tick_keeps_an_active_incident_quiet_with_its_last_measured_value() {
+        for metric in PERCENT_METRICS {
+            // The breach starts at 1000 and the incident activates at 1060.
+            let mut mgr = rule_on(&metric, 60, 10);
+            for (reading, now) in [(95.0, 1000), (95.0, 1060), (97.0, 1062)] {
+                tick_reading(&mut mgr, &metric, measured(reading), now);
+            }
+            let id = active_id(&mgr);
+
+            // The cooldown has passed by 1080, and still nothing notifies on a carried tick.
+            let carried = tick_reading(&mut mgr, &metric, Reading::Carried, 1080);
+            assert!(carried.is_empty(), "{metric:?}: a carried tick notified");
+            assert_eq!(active_id(&mgr), id, "{metric:?}: incident kept");
+            let alert = &mgr.active_alerts[0];
+            assert_eq!(alert.current_value, 97.0, "{metric:?}: last measured value");
+            assert_eq!(
+                alert.fired_at,
+                unix_to_iso8601(1060),
+                "{metric:?}: fired_at"
+            );
+            for expected in ["97.0%", "(threshold: 90.0%)", "for 80s"] {
+                assert!(
+                    alert.message.contains(expected),
+                    "{metric:?}: {:?} lacks {expected:?}",
+                    alert.message
+                );
+            }
+
+            // The cooldown elapsed during the skip: the next measured tick notifies.
+            let next = tick_reading(&mut mgr, &metric, measured(96.0), 1082);
+            assert_eq!(next.len(), 1, "{metric:?}: notifies after the skip");
+            assert_eq!(
+                active_id(&mgr),
+                id,
+                "{metric:?}: same incident after the skip"
+            );
+
+            // A carried tick on a clock stepped back before the breach start.
+            let stepped = tick_reading(&mut mgr, &metric, Reading::Carried, 900);
+            assert!(stepped.is_empty(), "{metric:?}: notified after the step");
+            let message = &mgr.active_alerts[0].message;
+            assert!(message.contains("for 0s"), "{metric:?}: {message:?}");
+
+            // The carried tick left the breach start where it was, at 1000.
+            tick_reading(&mut mgr, &metric, measured(95.0), 1100);
+            let message = &mgr.active_alerts[0].message;
+            assert!(message.contains("for 100s"), "{metric:?}: {message:?}");
+        }
+    }
+
+    #[test]
+    fn a_carried_tick_starts_no_breach() {
+        for metric in PERCENT_METRICS {
+            let mut mgr = rule_on(&metric, 60, 0);
+            tick_reading(&mut mgr, &metric, Reading::Carried, 1000);
+            tick_reading(&mut mgr, &metric, measured(95.0), 1030);
+            tick_reading(&mut mgr, &metric, measured(95.0), 1070);
+            assert_eq!(
+                active_id(&mgr),
+                None,
+                "{metric:?}: counted from the carried tick"
+            );
+            tick_reading(&mut mgr, &metric, measured(95.0), 1090);
+            assert!(active_id(&mgr).is_some(), "{metric:?}: never activated");
+        }
+    }
+
+    #[test]
+    fn a_carried_tick_neither_activates_nor_restarts_a_pending_breach() {
+        for metric in PERCENT_METRICS {
+            let mut mgr = rule_on(&metric, 60, 0);
+            tick_reading(&mut mgr, &metric, measured(95.0), 1000);
+
+            // The duration has passed by 1070, but a carried tick activates nothing.
+            let carried = tick_reading(&mut mgr, &metric, Reading::Carried, 1070);
+            assert!(carried.is_empty(), "{metric:?}: a carried tick notified");
+            assert_eq!(
+                active_id(&mgr),
+                None,
+                "{metric:?}: activated on a carried tick"
+            );
+
+            // The skipped seconds counted: the next measured breach activates at once.
+            let next = tick_reading(&mut mgr, &metric, measured(95.0), 1072);
+            assert_eq!(
+                next.len(),
+                1,
+                "{metric:?}: activates on the next measured tick"
+            );
+            let alert = &mgr.active_alerts[0];
+            assert_eq!(
+                alert.fired_at,
+                unix_to_iso8601(1072),
+                "{metric:?}: fired_at"
+            );
+            assert!(
+                alert.message.contains("for 72s"),
+                "{metric:?}: {:?} doesn't count from the breach start",
+                alert.message
+            );
+        }
+    }
+
+    #[test]
+    fn an_unavailable_tick_ends_the_incident_and_the_next_breach_is_a_new_one() {
+        for metric in PERCENT_METRICS {
+            let mut mgr = rule_on(&metric, 0, 300);
+            tick_reading(&mut mgr, &metric, measured(95.0), 1000);
+            let first = active_id(&mgr).unwrap_or_else(|| panic!("{metric:?}: no incident"));
+
+            for now in [1002, 1004] {
+                let alerts = tick_reading(&mut mgr, &metric, Reading::Unavailable, now);
+                assert!(alerts.is_empty(), "{metric:?} at {now}: notified");
+                assert_eq!(active_id(&mgr), None, "{metric:?} at {now}: incident kept");
+            }
+
+            let next = tick_reading(&mut mgr, &metric, measured(95.0), 1006);
+            let second = active_id(&mgr).unwrap_or_else(|| panic!("{metric:?}: no incident"));
+            assert_ne!(
+                second, first,
+                "{metric:?}: the new breach reused the incident id"
+            );
+            assert_eq!(
+                mgr.active_alerts[0].fired_at,
+                unix_to_iso8601(1006),
+                "{metric:?}: fired_at"
+            );
+            // The cooldown spans incidents, across the unavailable ticks too.
+            assert!(next.is_empty(), "{metric:?}: notified inside the cooldown");
+        }
+    }
+
+    #[test]
+    fn an_unavailable_tick_drops_a_pending_breach() {
+        for metric in PERCENT_METRICS {
+            let mut mgr = rule_on(&metric, 60, 0);
+            tick_reading(&mut mgr, &metric, measured(95.0), 1000);
+            tick_reading(&mut mgr, &metric, Reading::Unavailable, 1030);
+
+            // The duration restarts from the first measured breach after the gap, at 1062.
+            tick_reading(&mut mgr, &metric, measured(95.0), 1062);
+            assert_eq!(active_id(&mgr), None, "{metric:?}: counted from 1000");
+            tick_reading(&mut mgr, &metric, measured(95.0), 1121);
+            assert_eq!(active_id(&mgr), None, "{metric:?}: activated early");
+            tick_reading(&mut mgr, &metric, measured(95.0), 1122);
+            assert!(active_id(&mgr).is_some(), "{metric:?}: never activated");
+        }
+    }
+
+    #[test]
+    fn a_load_average_is_not_held_to_one_hundred() {
+        let load = LoadAverage::new(1000.0);
+        // (name, metric, readings with that load set)
+        let cases = [
+            (
+                "load1",
+                AlertMetric::Load1,
+                Readings {
+                    load1: load,
+                    ..idle()
+                },
+            ),
+            (
+                "load5",
+                AlertMetric::Load5,
+                Readings {
+                    load5: load,
+                    ..idle()
+                },
+            ),
+            (
+                "load15",
+                AlertMetric::Load15,
+                Readings {
+                    load15: load,
+                    ..idle()
+                },
+            ),
+        ];
+        for (name, metric, readings) in cases {
+            let mut mgr = manager(vec![AlertRule {
+                metric,
+                ..cpu_rule(100.0, 0, 0)
+            }]);
+            mgr.evaluate(&readings, 1000);
+            assert_eq!(mgr.active_alerts.len(), 1, "{name}: 1000 breaches 100");
+            assert_eq!(mgr.active_alerts[0].current_value, 1000.0, "{name}");
         }
     }
 
@@ -1195,7 +1499,15 @@ mod tests {
     #[test]
     fn evaluate_no_rules_returns_nothing() {
         let mut mgr = manager(vec![]);
-        let alerts = mgr.evaluate(99.0, 99.0, 99.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 100);
+        let alerts = mgr.evaluate(
+            &Readings {
+                cpu: measured(99.0),
+                memory: measured(99.0),
+                swap: measured(99.0),
+                ..idle()
+            },
+            100,
+        );
         assert!(alerts.is_empty());
         assert!(mgr.active_alerts.is_empty());
     }
@@ -1213,7 +1525,7 @@ mod tests {
             enabled: false,
         };
         let mut mgr = manager(vec![rule]);
-        let alerts = mgr.evaluate(99.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 100);
+        let alerts = mgr.evaluate(&cpu_at(99.0), 100);
         assert!(alerts.is_empty());
         assert!(mgr.active_alerts.is_empty());
     }
@@ -1231,7 +1543,7 @@ mod tests {
             enabled: true,
         };
         let mut mgr = manager(vec![rule]);
-        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        let alerts = mgr.evaluate(&cpu_at(95.0), 1000);
         assert_eq!(alerts.len(), 1);
         assert_eq!(mgr.active_alerts.len(), 1);
         assert!(alerts[0].message.contains("WARNING"));
@@ -1253,16 +1565,16 @@ mod tests {
         };
         let mut mgr = manager(vec![rule]);
         // First breach at t=1000: not enough duration yet.
-        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        let alerts = mgr.evaluate(&cpu_at(95.0), 1000);
         assert!(alerts.is_empty());
         assert!(mgr.active_alerts.is_empty());
 
         // 30s later: still under duration.
-        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1030);
+        let alerts = mgr.evaluate(&cpu_at(95.0), 1030);
         assert!(alerts.is_empty());
 
         // 60s after the initial breach: duration satisfied, fires.
-        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1060);
+        let alerts = mgr.evaluate(&cpu_at(95.0), 1060);
         assert_eq!(alerts.len(), 1);
         assert_eq!(mgr.active_alerts.len(), 1);
     }
@@ -1280,11 +1592,11 @@ mod tests {
             enabled: true,
         };
         let mut mgr = manager(vec![rule]);
-        let first = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        let first = mgr.evaluate(&cpu_at(95.0), 1000);
         assert_eq!(first.len(), 1);
 
         // Still breached 100s later, within cooldown: no new alert, but still "active" (ongoing).
-        let second = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1100);
+        let second = mgr.evaluate(&cpu_at(95.0), 1100);
         assert!(second.is_empty());
         assert_eq!(mgr.active_alerts.len(), 1);
         assert_eq!(
@@ -1293,7 +1605,7 @@ mod tests {
         );
 
         // After the cooldown elapses, it renotifies.
-        let third = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1301);
+        let third = mgr.evaluate(&cpu_at(95.0), 1301);
         assert_eq!(third.len(), 1);
     }
 
@@ -1310,14 +1622,14 @@ mod tests {
             enabled: true,
         };
         let mut mgr = manager(vec![rule]);
-        mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1000);
+        mgr.evaluate(&cpu_at(95.0), 1000);
         // Drops below threshold before duration elapses: breach resets.
-        let alerts = mgr.evaluate(10.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1010);
+        let alerts = mgr.evaluate(&cpu_at(10.0), 1010);
         assert!(alerts.is_empty());
         assert!(mgr.active_alerts.is_empty());
 
         // Breaches again: duration timer restarted, not enough time elapsed yet.
-        let alerts = mgr.evaluate(95.0, 0.0, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1011);
+        let alerts = mgr.evaluate(&cpu_at(95.0), 1011);
         assert!(alerts.is_empty());
     }
 
@@ -1342,7 +1654,13 @@ mod tests {
                 enabled: true,
             };
             let mut mgr = manager(vec![rule]);
-            let alerts = mgr.evaluate(0.0, value, 0.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1);
+            let alerts = mgr.evaluate(
+                &Readings {
+                    memory: measured(value),
+                    ..idle()
+                },
+                1,
+            );
             assert_eq!(
                 !alerts.is_empty(),
                 expect_breach,
@@ -1366,11 +1684,23 @@ mod tests {
         let mut mgr = manager(vec![rule]);
         let disks = disk_map(&[("/", 99.0), ("/data", 50.0)]);
         // /data is under threshold even though / is over: mount-specific check wins.
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 1);
+        let alerts = mgr.evaluate(
+            &Readings {
+                disk_usages: disks.clone(),
+                ..idle()
+            },
+            1,
+        );
         assert!(alerts.is_empty());
 
         let disks = disk_map(&[("/", 10.0), ("/data", 90.0)]);
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 2);
+        let alerts = mgr.evaluate(
+            &Readings {
+                disk_usages: disks.clone(),
+                ..idle()
+            },
+            2,
+        );
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("on /data"));
     }
@@ -1389,7 +1719,13 @@ mod tests {
         };
         let mut mgr = manager(vec![rule]);
         let disks = disk_map(&[("/", 10.0), ("/data", 90.0)]);
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 1);
+        let alerts = mgr.evaluate(
+            &Readings {
+                disk_usages: disks.clone(),
+                ..idle()
+            },
+            1,
+        );
         assert_eq!(alerts.len(), 1);
         assert!(!alerts[0].message.contains(" on "));
     }
@@ -1408,7 +1744,13 @@ mod tests {
         };
         let mut mgr = manager(vec![rule]);
         let disks = disk_map(&[("/", 99.0)]);
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &disks, 0.0, 0.0, 0.0, 4, 1);
+        let alerts = mgr.evaluate(
+            &Readings {
+                disk_usages: disks.clone(),
+                ..idle()
+            },
+            1,
+        );
         assert!(alerts.is_empty());
     }
 
@@ -1426,11 +1768,23 @@ mod tests {
         };
         let mut mgr = manager(vec![rule]);
         // load5 = 3.0, cpu_cores = 4 -> threshold becomes 4.0, not breached.
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &HashMap::new(), 0.0, 3.0, 0.0, 4, 1);
+        let alerts = mgr.evaluate(
+            &Readings {
+                load5: LoadAverage::new(3.0),
+                ..idle()
+            },
+            1,
+        );
         assert!(alerts.is_empty());
 
         // load5 = 5.0 > 4 cores -> breached.
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &HashMap::new(), 0.0, 5.0, 0.0, 4, 2);
+        let alerts = mgr.evaluate(
+            &Readings {
+                load5: LoadAverage::new(5.0),
+                ..idle()
+            },
+            2,
+        );
         assert_eq!(alerts.len(), 1);
     }
 
@@ -1448,7 +1802,14 @@ mod tests {
         };
         let mut mgr = manager(vec![rule]);
         // load1 = 3.0 > explicit threshold 2.0 (would NOT breach if auto-threshold with 8 cores).
-        let alerts = mgr.evaluate(0.0, 0.0, 0.0, &HashMap::new(), 3.0, 0.0, 0.0, 8, 1);
+        let alerts = mgr.evaluate(
+            &Readings {
+                load1: LoadAverage::new(3.0),
+                cpu_cores: 8,
+                ..idle()
+            },
+            1,
+        );
         assert_eq!(alerts.len(), 1);
     }
 
@@ -1465,7 +1826,13 @@ mod tests {
             enabled: true,
         };
         let mut mgr = manager(vec![rule]);
-        let alerts = mgr.evaluate(0.0, 0.0, 60.0, &HashMap::new(), 0.0, 0.0, 0.0, 4, 1);
+        let alerts = mgr.evaluate(
+            &Readings {
+                swap: measured(60.0),
+                ..idle()
+            },
+            1,
+        );
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("Swap"));
     }
