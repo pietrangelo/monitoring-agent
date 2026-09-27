@@ -14,7 +14,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod api;
-pub mod applications;
-pub mod sse;
-pub mod ws;
+//! Application Telemetry: the Spring Boot applications the operator asked this agent to
+//! watch, and what it saw of them (RFC 0009).
+
+pub mod actuator;
+pub mod config;
+pub mod report;
+pub mod round;
+pub mod scrape_loop;
+pub mod scraper;

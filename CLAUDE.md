@@ -16,8 +16,14 @@ Two independent Rust binaries, **not** a Cargo workspace (each has its own `Carg
   persists it to SQLite, and serves a fleet dashboard.
 
 Both are Axum services. Full endpoint/protocol reference lives in `README.md` — keep it in
-sync when endpoints change, but architectural *reasoning* belongs in `docs/ARCHITECTURE.md`
+sync when endpoints change, but architectural _reasoning_ belongs in `docs/ARCHITECTURE.md`
 (see below), not the README.
+
+## Agent Orchestration Rules
+
+- When running in high-effort or dynamic workflow modes (Ultracode), strictly limit concurrent sub-agents to a maximum of 3.
+- Favor sequential execution over wide parallel fan-outs.
+- Before spawning a sub-agent, verify that its target file set does not overlap with existing active agents to prevent merge conflicts.
 
 ## Toolchain & edition policy
 
@@ -108,8 +114,8 @@ move a module between contexts.
 
 - **Use the ubiquitous language.** Types, functions, test names and API fields use the
   glossary's terms. A new concept gets a glossary entry before it gets a type. Never coin a
-  synonym for an existing term (e.g. `node`/`machine`/`target` for *system*, `sample` for
-  *metric point*).
+  synonym for an existing term (e.g. `node`/`machine`/`target` for _system_, `sample` for
+  _metric point_).
 - **Keep the domain core pure.** Domain logic (alert evaluation and threshold/duration/cooldown
   rules, system status derivation, retention policy, snapshot → metric mapping) takes values
   and returns values. It contains no Axum types, `rusqlite`, `tokio`, `std::process`, `std::fs`,
@@ -133,7 +139,7 @@ move a module between contexts.
 - **The push frame is a published contract between two contexts,** defined independently on
   each side (`src/push.rs` and `system-hub/src/push/mod.rs` each declare their own
   `PushPayload`). The agent encodes it with `rmp_serde::to_vec`, which is **positional**:
-  structs become MessagePack arrays with no field names, so field *order* is the contract.
+  structs become MessagePack arrays with no field names, so field _order_ is the contract.
   Renaming a field is harmless on the wire. Reordering, removing, or inserting a field
   anywhere but the end shifts every later value. `#[serde(default)]` only rescues a field
   that is missing at the very end, and an old hub may reject a frame with extra trailing
@@ -168,8 +174,8 @@ the `rosette-auditor` before the change is called done.
    are typed enums, not strings.
 4. **Expressiveness** — Idiomatic Rust: iterators where they read better than loops, `?`,
    `From`/`TryFrom` at boundaries, and exhaustive `match` over domain enums with no `_ =>`
-   catch-all, so a new variant forces every site to decide. Comments explain *why*, never
-   *what*.
+   catch-all, so a new variant forces every site to decide. Comments explain _why_, never
+   _what_.
 5. **Purity** — Side effects (I/O, clock, env, shell-outs, DB, network, randomness) stay at
    the edges. Domain functions are deterministic given their arguments, so plain values are
    enough to test them.
@@ -210,7 +216,7 @@ All production code is written test-first, in a closed loop per behaviour:
 
 Cases where red-first works differently:
 
-- **Bug fixes** start with a test that reproduces the bug and fails *because of* the bug.
+- **Bug fixes** start with a test that reproduces the bug and fails _because of_ the bug.
 - **Characterisation tests** (backfilling tests for existing untested behaviour) pass on the
   first run by design: they pin current behaviour, so red-first doesn't apply. Instead,
   `red-test-adversary` attacks them in mutation mode: it breaks the behaviour in a temp copy
@@ -225,11 +231,11 @@ The author doesn't grade their own work. Three adversary subagents live in `.cla
 They are read-only: they may run read-only commands and throwaway experiments in a temp
 directory, and must never edit the repository. Running them is required:
 
-| Adversary | When | Blocks the change on |
-|---|---|---|
-| `red-test-adversary` | after every new red test, before implementing (TDD phase 2), and on characterisation tests and `xss.mjs` extensions (mutation mode) | `DECORATION` |
-| `rfc-adversary` | after drafting or materially amending an RFC, before it becomes `Accepted` | any unaddressed `CONFIRMED` |
-| `rosette-auditor` | before reporting any non-trivial change done (TDD phase 5) | any `VIOLATED` |
+| Adversary            | When                                                                                                                                | Blocks the change on        |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| `red-test-adversary` | after every new red test, before implementing (TDD phase 2), and on characterisation tests and `xss.mjs` extensions (mutation mode) | `DECORATION`                |
+| `rfc-adversary`      | after drafting or materially amending an RFC, before it becomes `Accepted`                                                          | any unaddressed `CONFIRMED` |
+| `rosette-auditor`    | before reporting any non-trivial change done (TDD phase 5)                                                                          | any `VIOLATED`              |
 
 - `CONFIRMED` / `VIOLATED`: fix it, by amending the RFC or changing the code.
 - `PLAUSIBLE` / `AT-RISK`: decide, and write the decision down (in the RFC, or in your
@@ -237,7 +243,7 @@ directory, and must never edit the repository. Running them is required:
 - Clean pass: say so in one line and name the attack that came closest.
 - Don't re-run `rfc-adversary` on wording or factual corrections you just made to satisfy
   it; a second pass on your own fixes is theatre. Do re-run it if an amendment changes the
-  design itself. `red-test-adversary` *is* re-run after a `DECORATION` or `WEAK-RED` rewrite.
+  design itself. `red-test-adversary` _is_ re-run after a `DECORATION` or `WEAK-RED` rewrite.
 - If a subagent can't be launched in the current environment, say so in your summary. Never
   substitute your own self-review and present it as the adversary's verdict.
 
@@ -275,10 +281,10 @@ flag/fix them if a change touches the surrounding code:
   needs validation (block loopback/link-local/metadata-endpoint targets unless that's an
   intentional feature for this deployment model — ask the user if unsure).
 - **Dynamic SQL string assembly** in `system-hub/src/db.rs` (`format!("UPDATE systems SET {}
-  WHERE id = ?", sets.join(", "))` and the `WHERE {}` conditions builder) — values are bound
+WHERE id = ?", sets.join(", "))` and the `WHERE {}` conditions builder) — values are bound
   as parameters so this isn't classic SQL injection today, but column/clause names are
   string-joined. Never let user input reach the joined fragment itself, only bound
-  `?`-parameters; if a change adds a new dynamic field, keep the field *name* from a fixed
+  `?`-parameters; if a change adds a new dynamic field, keep the field _name_ from a fixed
   Rust-side allowlist, never from request data.
 - **Secrets in env vars** (`SYSTEM_AGENT_TOKEN`, `PUSH_TOKEN`, `HUB_PUSH_TOKEN`): never log
   them, never echo them back in API responses/error messages, never write them into
@@ -310,6 +316,7 @@ the README table current) · API10 Unsafe Consumption of APIs (the hub consuming
 responses, and vice versa for push frames).
 
 If `cargo-audit` or `cargo-deny` are available, run them when dependencies change:
+
 ```sh
 cargo audit
 ```
@@ -323,7 +330,7 @@ suite must cover.
   No exceptions for "just a small fix."
 - **When you touch a file that has no tests, add tests for the existing untested behavior in
   that file first (or in the same commit), not just for your new lines.** The goal is
-  monotonically increasing coverage — every file you touch should leave the repo with *more*
+  monotonically increasing coverage — every file you touch should leave the repo with _more_
   tested surface than it found, never the same or less. You don't have to backfill the entire
   codebase in one pass; backfill what you touch, and prioritize `alerts.rs`, `auth.rs`,
   `collectors/*`, `routes/*`, and `system-hub/src/db.rs` first since they hold the actual
@@ -361,7 +368,7 @@ storage schema, trust boundaries, and the rationale behind them.
 - **Update it in the same change** whenever you: add/remove/rename a component, module, or
   route group; change the push/poll protocol or the MessagePack frame shape; change the SQLite
   schema; change auth/trust boundaries; or make a decision an RFC (below) covers.
-- Keep it a *description of current reality*, not a changelog — don't append "as of 2026-07-26
+- Keep it a _description of current reality_, not a changelog — don't append "as of 2026-07-26
   we changed X"; edit the relevant section in place so it always reads as "this is how the
   system works today." History belongs in git log and RFCs, not in this file.
 - If a change has no architectural effect (bug fix, refactor with identical external behavior,

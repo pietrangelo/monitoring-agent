@@ -99,6 +99,10 @@ impl AgentRun {
     pub fn new(id: Uuid) -> Self {
         Self(id)
     }
+
+    pub fn as_uuid(self) -> Uuid {
+        self.0
+    }
 }
 
 /// Identifies one alert incident: the agent run that saw it and its place in that run's

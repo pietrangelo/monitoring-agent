@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::alerts::{AgentRun, AlertManager};
+use crate::applications::scrape_loop::RoundReceiver;
 use crate::models::MetricPoint;
 
 /// Maximum data points stored per metric (e.g., 1 hour at 2s intervals = 1800 points).
@@ -28,15 +29,31 @@ const MAX_HISTORY: usize = 3600;
 pub struct AppState {
     pub history: RwLock<MetricsHistory>,
     pub alert_manager: RwLock<AlertManager>,
+    /// This process's agent run, minted once: incident ids and round ids both start with it.
+    pub run: AgentRun,
+    /// The scrape loop's latest round: `None` when applications are off. A closed channel
+    /// means the loop ended, whatever round it last held.
+    pub rounds: Option<RoundReceiver>,
 }
 
 impl AppState {
+    /// A state with no scrape loop: applications are off.
     pub fn new() -> Arc<Self> {
+        Self::build(None)
+    }
+
+    /// A state whose applications come from the scrape loop publishing to `rounds`.
+    pub fn with_rounds(rounds: RoundReceiver) -> Arc<Self> {
+        Self::build(Some(rounds))
+    }
+
+    fn build(rounds: Option<RoundReceiver>) -> Arc<Self> {
+        let run = AgentRun::new(uuid::Uuid::new_v4());
         Arc::new(Self {
             history: RwLock::new(MetricsHistory::new()),
-            alert_manager: RwLock::new(AlertManager::with_defaults(AgentRun::new(
-                uuid::Uuid::new_v4(),
-            ))),
+            alert_manager: RwLock::new(AlertManager::with_defaults(run)),
+            run,
+            rounds,
         })
     }
 }

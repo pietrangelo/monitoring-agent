@@ -219,6 +219,15 @@ For push-mode agents, they appear automatically — no manual registration neede
 | `PUSH_TO` | *(none)* | Hub WebSocket URL, e.g. `ws://hub:9091` |
 | `PUSH_TOKEN` | *(none)* | Shared secret for hub authentication |
 | `PUSH_INTERVAL` | `2` | Seconds between push snapshots (min 2) |
+| `SPRING_BOOT_APPS` | *(none)* | Spring Boot applications to monitor, as comma-separated `name=actuator-base-url` pairs (at most 16), e.g. `orders=http://127.0.0.1:8081/actuator`. A name is 1–64 of `A-Z a-z 0-9 _ . -`. The URL is http(s), with no credentials, query or fragment |
+| `SPRING_BOOT_APP_<NAME>_USERNAME` / `_PASSWORD` | *(none)* | HTTP Basic credentials for one application; both or neither. `<NAME>` is the name upper-cased, with `-` and `.` as `_`. A username can't contain `:`, and neither value a control character (HTTP Basic can't carry them). Never logged. Over plain `http://` to a non-loopback address, the agent logs a startup warning |
+| `SPRING_BOOT_SCRAPE_INTERVAL` | `15` | Seconds between scrape rounds, 10 to 3600 |
+
+The agent parses the `SPRING_BOOT_*` variables before it starts anything. If one is
+malformed, it logs which variable is wrong (never its value) and exits with code **78**
+(`EX_CONFIG`); no other failure uses that code. With applications configured, the agent
+scrapes each one's Actuator every interval and serves the result on `GET /api/applications`.
+(RFC 0009 is being implemented: sending application data to the hub follows.)
 
 ### System Hub — environment variables
 
@@ -246,6 +255,7 @@ For push-mode agents, they appear automatically — no manual registration neede
 | `GET /api/alerts/config` | Current alert rules |
 | `POST /api/alerts/config` | Replace alert rules (JSON body) |
 | `GET /api/{packages,services,containers,ports}` | Installed packages, services, Docker, ports |
+| `GET /api/applications` | Latest scrape round of the Spring Boot applications: round id (`run`, `seq`), `interval_secs`, `scraped_at`, and per application its `name`, `health` (`up`, `down`, `out_of_service`, `unknown`, `unreachable`), `version` and `gauges`. `round`, `interval_secs` and `scraped_at` are `null` (and `applications` is `[]`) before the first round and whenever no scrape loop runs |
 | `GET /api/stream/system` | **SSE** — CPU/mem/load every 2s |
 | `GET /api/stream/processes` | **SSE** — Top processes every 3s |
 | `GET /api/stream/alerts` | **SSE** — Active alerts every 3s |

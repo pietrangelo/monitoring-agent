@@ -30,6 +30,19 @@ Runs on every monitored Linux host. Responsibilities:
   (`auth.rs`, `SYSTEM_AGENT_TOKEN`). Auth is opt-in: if the env var is unset, the API is open.
 - Optionally pushes periodic snapshots to a `system-hub` instance over WebSocket, MessagePack-
   encoded (`push.rs`), if `PUSH_TO`/`PUSH_TOKEN`/`PUSH_INTERVAL` are configured.
+- Reads which Spring Boot applications to monitor from `SPRING_BOOT_APPS` and its companion
+  variables (`applications/config.rs`, RFC 0009). `main` is synchronous: it parses this
+  configuration before it builds the Tokio runtime, so a malformed value refuses startup
+  (exit code 78, `EX_CONFIG`, used for nothing else) before any task, bind or connection
+  exists. Every other startup failure is a typed `StartupError` that exits 1.
+- Scrapes those applications' Actuators (`applications/`): a scrape loop runs a scrape round
+  over every application concurrently, publishes it on a `watch` channel that `AppState`
+  holds the receiver of, then sleeps a full scrape interval, so two rounds are always at least
+  one interval apart. Requests reach only the configured host: one shared HTTP client with
+  redirects and environment proxies off, a 2 s connect and 5 s whole-request timeout, and
+  bodies read chunk by chunk up to 64 KiB. `GET /api/applications` serves the latest round,
+  and nothing once the loop has ended. Health changes are logged when an application becomes
+  unreachable and when it recovers, naming the application and the failure, never a URL.
 
 ### `system-hub` (`system-hub/`)
 
@@ -97,6 +110,7 @@ match those rules (listed under Open architectural questions below).
 | **Alerting** | agent | `alerts.rs` (`AlertRule`, `AlertMetric`, `AlertOperator`, `AlertSeverity`, `AgentRun`, `IncidentId`, the per-rule `Breach` state, `AlertManager::evaluate` and `replace_rules`) | `routes/api.rs` alert endpoints, `routes/sse.rs` and `routes/ws.rs` alert streams | deciding when a metric breaches a rule, for how long, and cooldown; the identity of each alert incident |
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push.rs` (WS client, agent-side `PushPayload`) | sending snapshots to a hub |
+| **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`); `applications/round.rs` (`RoundId`, `RoundSequence`, `ScrapeRound`, `NamedReport`, `health_change`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version); `applications/scraper.rs` (the HTTP client: `Scraper`, `Timeouts`, the body cap); `applications/scrape_loop.rs` (`scrape_loop`, the round `watch` channel); `routes/applications.rs` (`GET /api/applications` and its JSON) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`; `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables, `state.rs` live cache, `routes/*` | stored time series, alert history, retention |
@@ -149,6 +163,22 @@ mixed-version fleet must keep working):
 | **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured. Unset or empty leaves push open; a value that isn't UTF-8 makes the hub refuse to start | `PushToken`, `PushAuth` (hub) |
 | **push handshake** | the JSON text exchange that authenticates a push connection. A *rejection* is an auth message the hub refuses by its content (shape, token or system id); a *refusal* is any `auth_error` answer: a rejection, or a handshake timeout | `AuthMessage`, `HandshakeRejection`, `Refusal`, `Handshake` (hub), `HubMessage` (agent) |
 | **push frame** | one binary, positional MessagePack snapshot message on the push connection | `PushPayload` (both crates) |
+| **application** | a Spring Boot service the agent's operator names in `SPRING_BOOT_APPS`, watched through its Actuator. Not a package, unit or container: those are the host inventory. `ApplicationTarget` is an application *as configured* (name, actuator base URL, credentials), as opposed to what a scrape of it reports | `ApplicationTarget` |
+| **application name** | how the operator names an application: 1 to 64 bytes of `[A-Za-z0-9_.-]`, not `.` or `..`. Upper-cased with `-` and `.` as `_`, it is the application's credential key, and two names with the same key can't coexist | `ApplicationName` |
+| **actuator base URL** | where an application's Actuator endpoints live: an http(s) URL with no userinfo, query or fragment, whose path ends in `/` | `ActuatorBaseUrl` |
+| **actuator credentials** | none, or an HTTP Basic username and password from `SPRING_BOOT_APP_<KEY>_USERNAME` / `_PASSWORD`. A username can't hold `:`, and neither can hold a control character. The password never leaves the type except as the Basic header | `ActuatorCredentials`, `BasicCredentials` |
+| **scrape interval** | the time between one scrape round's end and the next one's start, 10 s to 3600 s (default 15 s) | `ScrapeInterval` |
+| **applications configuration** | off (no `SPRING_BOOT_APPS`), or up to 16 applications and one scrape interval | `ApplicationsConfig`, `Applications` |
+| **scrape** | one read of one application's health, info and Micrometer meters through its Actuator. It reaches the application, or ends in a **scrape failure** (connect, timeout, unauthorized, an HTTP status, or a bad body), which stays in the agent's log | `RawScrape`, `ScrapeFailure` |
+| **meter value** | one Micrometer meter as a scrape read it: published with a value, not published (Actuator's 404), or unavailable (any other failure). Not a **metric reading**, which is a host value alert rules read | `MeterValue` |
+| **application gauge** | one of the ten curated values the agent derives from an application's meters: a meter's value, or a rate between two scrapes. Missing means "couldn't be derived", never zero | `ApplicationGauge` |
+| **application health** | what Actuator's `/actuator/health` reported (up, down, out of service, unknown), or that the application was unreachable | `ApplicationHealth` |
+| **application report** | the result of one scrape of one application: unreachable, or its health, version (≤ 64 chars) and gauges | `ApplicationReport`, `ApplicationVersion` |
+| **scrape history** | an application's baseline for rates: the counters of its previous reachable scrape, when they were read, and how many requests the agent itself made then. Cleared by an unreachable scrape | `ScrapeHistory` |
+| **scrape round** | every application report from one pass over the configured applications, published as one unit | `ScrapeRound` |
+| **round id** | identifies a scrape round: the **agent run** and a sequence counting the run's rounds from 1, never rewinding | `RoundId`, `RoundSequence` |
+| **health change** | an application becoming unreachable, or recovering; a change among reported healths (up to down) is not one. The agent logs each: `warn` naming the scrape failure, `info` on recovery | `HealthChange`, `health_change` |
+| **application restart** | any counter of an application going down, uptime included, between two scrapes. It resets every counter: the scrape that sees it becomes the new baseline and reports no rates | `ScrapeHistory::advance` |
 
 ## Trust boundaries & auth
 
@@ -239,9 +269,8 @@ The `system-agent` has no persistent storage — its metric history is an in-mem
 ## Testing architecture
 
 Both crates have test coverage colocated with the code under test — `#[cfg(test)] mod tests`
-blocks at the bottom of each source file, per standard Rust convention (no separate `tests/`
-integration-test directories exist yet; nothing currently needs cross-file fixtures large enough
-to warrant one).
+blocks at the bottom of each source file, per standard Rust convention. Each crate also has a
+`tests/` directory, used only for tests that must run the real binary (described below).
 
 - **Pure logic** (alert threshold/duration/cooldown evaluation, `ss`/`dpkg`/`rpm`/`pacman`/`apk`
   output parsing, byte/uptime formatting, ISO-8601 formatting, dynamic-SQL clause building) is
@@ -266,6 +295,13 @@ to warrant one).
   deadline and linger tests use rows whose time windows don't overlap, so no fixed duration
   passes them; the pong test shrinks both sockets' kernel buffers so that the write-buffer
   cap is what the returned pongs show.
+- **`tests/`** (agent) runs the real `system-agent` binary with a cleared environment. A
+  malformed applications configuration must exit 78, name the variable, print no credential,
+  log nothing past the parse, and make no push connection. Valid and empty configurations,
+  with and without `PUSH_TO`, must get past the parse. The plain-text credentials warning
+  must come before startup and name the application but not its URL. The configuration
+  parse itself is a table-driven unit test over a lookup table, so no test mutates the
+  environment.
 - **`system-hub/tests/`** runs the real binary (`CARGO_BIN_EXE_system-hub`) in a temp dir to
   check startup configuration no router test can reach: a non-UTF-8 `HUB_PUSH_TOKEN` refuses
   startup before any file is created, and an unopenable database is a logged exit, not a

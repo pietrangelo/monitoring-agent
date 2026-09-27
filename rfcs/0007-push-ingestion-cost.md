@@ -114,8 +114,10 @@ and by the REST handlers, as today. The poller keeps refreshing before it reads.
 ### 3. Frame pacing (push)
 
 A frame read less than `MIN_FRAME_SPACING = 1 s` after the last accepted frame on the same
-connection is dropped. The agent pushes at most every 2 s, and a catch-up tick after an
-agent-side stall is a near-duplicate. The hub measures time when it reads, so frames buffered
+connection is dropped. This applies to snapshot frames. Application frames (RFC 0009) are
+paced by that RFC's own admission rule and don't count as the last accepted frame here. The
+agent pushes at most every 2 s, and a catch-up tick after an agent-side stall is a
+near-duplicate. The hub measures time when it reads, so frames buffered
 during a hub-side stall are read back to back and all but the first are dropped. Those
 samples are already late, and dropping them is accepted. The spacing is injected in tests,
 and the existing two-frame tests run with spacing 0.

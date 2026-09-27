@@ -37,15 +37,7 @@ pub async fn require_auth(request: Request, next: Next) -> Result<Response, Stat
         return Ok(next.run(request).await);
     };
 
-    let path = request.uri().path();
-
-    // Allow health check, static files, dashboard HTML, SSE, and WS without auth
-    if path == "/api/health"
-        || path.starts_with("/static/")
-        || path == "/"
-        || path == "/dashboard"
-        || path == "/index.html"
-    {
+    if is_exempt(request.uri().path()) {
         return Ok(next.run(request).await);
     }
 
@@ -55,6 +47,16 @@ pub async fn require_auth(request: Request, next: Next) -> Result<Response, Stat
     }
 
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// Paths served without the token: the health check, static files and the dashboard HTML.
+/// Every other path, every `/api` route but health included, needs it.
+fn is_exempt(path: &str) -> bool {
+    path == "/api/health"
+        || path.starts_with("/static/")
+        || path == "/"
+        || path == "/dashboard"
+        || path == "/index.html"
 }
 
 /// Constant-time comparison of the presented token against the expected one, to avoid
@@ -298,6 +300,25 @@ mod tests {
                 StatusCode::OK,
                 "path {path} should bypass auth"
             );
+        }
+    }
+
+    #[test]
+    fn only_health_static_files_and_the_dashboard_are_exempt() {
+        let cases = [
+            ("/api/health", true),
+            ("/", true),
+            ("/dashboard", true),
+            ("/index.html", true),
+            ("/static/app.js", true),
+            ("/api/applications", false),
+            ("/api/system", false),
+            ("/api/alerts/config", false),
+            ("/api/health/extra", false),
+            ("/staticx", false),
+        ];
+        for (path, exempt) in cases {
+            assert_eq!(is_exempt(path), exempt, "case: {path}");
         }
     }
 
