@@ -242,7 +242,7 @@ The agent parses the `SPRING_BOOT_*` variables before it starts anything. If one
 malformed, it logs which variable is wrong (never its value) and exits with code **78**
 (`EX_CONFIG`); no other failure uses that code. With applications configured, the agent
 scrapes each one's Actuator every interval and serves the result on `GET /api/applications`.
-(RFC 0009 is being implemented: sending application data to the hub follows.)
+See [Spring Boot applications](#spring-boot-applications) for what each application must expose.
 
 ### System Hub — environment variables
 
@@ -436,6 +436,39 @@ curl -X POST http://hub:9091/api/systems \
   -d '{"name":"web-01","url":"http://10.0.1.5:9090","token":"agent-secret","poll_interval_secs":10}'
 ```
 
+### Spring Boot applications
+
+An agent started with `SPRING_BOOT_APPS` scrapes each application's Actuator and sends every
+scrape round to the hub, by push or when the hub polls it. The hub dashboard shows them in the
+system's **Applications** section, and each gauge's history is at
+`/api/systems/{id}/metrics?metric=app:<name>:<gauge>`.
+
+```sh
+SPRING_BOOT_APPS=orders=http://127.0.0.1:8081/actuator \
+SPRING_BOOT_APP_ORDERS_USERNAME=monitor SPRING_BOOT_APP_ORDERS_PASSWORD=… \
+PUSH_TO=ws://hub.internal:9091 PUSH_TOKEN=… ./system-agent
+```
+
+Each application must expose Actuator's `health`, `info` and `metrics` endpoints:
+
+```properties
+management.endpoints.web.exposure.include=health,info,metrics
+```
+
+On Spring Boot 4, Micrometer's meters also need the `spring-boot-starter-micrometer-metrics`
+starter. A meter the application doesn't publish (no HikariCP pool, or no HTTP request served
+yet) shows as `—`, never as zero.
+
+- **Rates need a cumulative registry.** Requests/s, 5xx/s, mean latency and GC pause are
+  computed from running totals. The Simple registry (Boot's default when no other is present)
+  and the Prometheus registry keep them. A step-based registry alone (Datadog, Elastic, New
+  Relic, OTLP with delta temporality) reports each step's counts instead, and those gauges then
+  show nothing useful.
+- **Mean latency includes the agent's own requests.** Each round makes about 12 Actuator
+  requests per application. The agent subtracts them from requests/s, but it can't take them
+  out of the mean latency, so on a quiet application it leans toward Actuator's own (fast)
+  answers.
+
 ### TLS termination
 
 Neither component has built-in TLS. Place them behind a reverse proxy:
@@ -486,7 +519,7 @@ row or 24h. Run `sqlite3 system-hub.db` for direct queries.
 | URL | Description |
 |---|---|
 | `http://agent:9090/` | Single-machine dashboard with CPU gauge, charts, alerts |
-| `http://hub:9091/` | Multi-system hub with system cards, live metrics, alert feed |
+| `http://hub:9091/` | Multi-system hub with system cards, live metrics, alert feed, and per system its Spring Boot applications |
 
 Both are self-contained single HTML files with zero external dependencies. The hub dashboard updates live via SSE every 5 seconds.
 

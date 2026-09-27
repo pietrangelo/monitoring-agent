@@ -24,8 +24,11 @@
 // breaks out of text, quoted attributes and raw-text elements (statuses and severities are
 // hostile only where they test the allowlists' fallback), ids also break out of inline
 // JS, system urls are hostile both as markup and as javascript: URLs, and numbers arrive as
-// strings or out of range. It drives the dashboard in headless Chromium (open a system, take
-// a live refresh, acknowledge an alert record, decline then accept each delete, open an
+// strings or out of range. Each system's applications (RFC 0009) are hostile the same way:
+// names break out of markup and of the metric query string, healths test the allowlist, and
+// gauges and chart series arrive as strings. It drives the dashboard in headless Chromium (open
+// a system, open one of its applications, refresh the details, open another application, take
+// a live refresh with it open, refresh again once the round has dropped it, take a live refresh, acknowledge an alert record, decline then accept each delete, open an
 // offline system and take a changed summary in which it has no live metrics, a system
 // changes status, and a system and an alert record arrive), then fires pointer, mouse, focus,
 // key and form events at every element, shadow roots included, and window and document
@@ -132,6 +135,91 @@ const changedSummary = {
     live_metrics: { [SYSTEM_A]: summary.live_metrics[SYSTEM_A], [SYSTEM_C]: numericMetrics, [SYSTEM_D]: numericMetrics },
 };
 
+// Applications (RFC 0009 §10). A's names break out of markup and of a query string (so the
+// metric parameter must be encoded), and the first is a prefix of the second, so row
+// selection must compare whole names. Its health, version and gauges are hostile, its round is
+// stale, and its age is a string.
+const MIB = 1048576;
+const APP_1 = `${P}&metric=cpu#`;
+const APP_2 = `${APP_1}-b`;
+const hostileGauges = {
+    heap_used_bytes: "42",
+    heap_max_bytes: P,
+    cpu_percent: "12",
+    live_threads: null,
+    http_requests_per_second: P,
+    http_server_errors_per_second: "1",
+    http_mean_latency_ms: {},
+    db_connections_active: [],
+    uptime_seconds: "90061",
+};
+const applicationsA = {
+    system_id: P,
+    received_at: P,
+    age_secs: "40",
+    freshness: "stale",
+    applications: [
+        { name: APP_1, health: `up" onmouseover="window.__pwned=true" x="`, version: P, gauges: hostileGauges },
+        { name: APP_2, health: "out_of_service x", version: null, gauges: P },
+        null,
+        "x",
+        { name: P, health: "unreachable", version: P, gauges: null },
+    ],
+};
+// What a detail refresh brings: the same round, now with a negative age.
+const refreshedApplicationsA = { ...applicationsA, age_secs: -3 };
+// Then a round in which the open application no longer appears.
+const applicationsAWithoutApp2 = {
+    ...applicationsA,
+    applications: applicationsA.applications.filter((app) => app?.name !== APP_2),
+};
+// C's round is fresh and numeric, so formatting and every known health can be read.
+const applicationsC = {
+    system_id: SYSTEM_C,
+    received_at: 1790000000,
+    age_secs: 7.4,
+    freshness: "fresh",
+    applications: [
+        {
+            name: "orders",
+            health: "up",
+            version: "2.4.1",
+            gauges: {
+                heap_used_bytes: 3 * MIB,
+                heap_max_bytes: 8 * MIB,
+                cpu_percent: 12.34,
+                live_threads: 42,
+                http_requests_per_second: 1.5,
+                http_server_errors_per_second: 0,
+                http_mean_latency_ms: 12.34,
+                db_connections_active: 3,
+                uptime_seconds: 90061,
+            },
+        },
+        { name: "billing", health: "down", version: null, gauges: { heap_used_bytes: 3 * MIB, uptime_seconds: 3720 } },
+        { name: "ledger", health: "out_of_service", version: "1", gauges: { uptime_seconds: 59 } },
+        { name: "search", health: "unknown", version: "1", gauges: { uptime_seconds: -5 } },
+        // Named like the application open on A when C opens, so switching systems must drop
+        // the selection itself rather than lose it by accident.
+        { name: APP_1, health: "up", version: "1", gauges: {} },
+    ],
+};
+// B's `applications` isn't a list, and D holds no round.
+const applicationsB = { system_id: SYSTEM_B, received_at: 1, age_secs: 5, freshness: "stale", applications: P };
+const noRound = { system_id: SYSTEM_D, received_at: null, age_secs: null, freshness: null, applications: [] };
+const applicationsOf = { [SYSTEM_A]: applicationsA, [SYSTEM_B]: applicationsB, [SYSTEM_C]: applicationsC, [SYSTEM_D]: noRound };
+
+const seriesRoute = (systemId, app, gauge) =>
+    `GET /api/systems/${enc(systemId)}/metrics?metric=${enc(`app:${app}:${gauge}`)}`;
+// Points that aren't numbers are left out; if the string counted, the heap scale would be 100
+// MiB, not 11. APP_1's heap has no numeric point at all, and its requests stay so low that
+// without the floor of 1 the top label would round to 0. Every other application's requests
+// peak at 20, so their scale is 22.
+const heapSeries = { points: [{ value: String(100 * MIB) }, { value: 10 * MIB }, { value: null }, null, { value: 2 * MIB }] };
+const noNumericSeries = { points: [{ value: "5" }, null, { value: null }] };
+const lowRequestsSeries = { points: [{ value: 0.1 }, { value: 0.3 }] };
+const requestsSeries = { points: [{ value: 5 }, { value: 20 }] };
+
 const ALERTS_ROUTE = "GET /api/alerts?acknowledged=false&limit=50";
 // Every request the dashboard may make; anything else is recorded as unexpected.
 const routes = {
@@ -143,7 +231,16 @@ const routes = {
             [`GET /api/systems/${enc(s.id)}`, s],
             [`GET /api/systems/${enc(s.id)}/history?limit=300`, { cpu: [], memory: [] }],
             [`DELETE /api/systems/${enc(s.id)}`, {}],
+            [`GET /api/systems/${enc(s.id)}/applications`, applicationsOf[s.id]],
         ]),
+    ),
+    ...Object.fromEntries(
+        [[SYSTEM_A, applicationsA], [SYSTEM_C, applicationsC]].flatMap(([id, round]) =>
+            round.applications.filter((app) => app && typeof app === "object").flatMap((app) => [
+                [seriesRoute(id, app.name, "heap_used_bytes"), app.name === APP_1 ? noNumericSeries : heapSeries],
+                [seriesRoute(id, app.name, "http_requests_per_second"), app.name === APP_1 ? lowRequestsSeries : requestsSeries],
+            ]),
+        ),
     ),
     ...Object.fromEntries(laterAlerts.map((a) => [`POST /api/alerts/${enc(a.id)}/acknowledge`, {}])),
 };
@@ -193,6 +290,18 @@ function installStubs(fx, log) {
     window.open = function (url) {
         log.opened.push(String(url));
         return null;
+    };
+    // What each canvas last drew as text (its axis labels), so a chart's scale can be read.
+    var ctx = CanvasRenderingContext2D.prototype;
+    var clearRect = ctx.clearRect;
+    var fillText = ctx.fillText;
+    ctx.clearRect = function () {
+        log.canvasText[this.canvas.id] = [];
+        return clearRect.apply(this, arguments);
+    };
+    ctx.fillText = function (text) {
+        (log.canvasText[this.canvas.id] = log.canvasText[this.canvas.id] || []).push(String(text));
+        return fillText.apply(this, arguments);
     };
     window.alert = function () {};
     window.confirm = function () {
@@ -256,6 +365,35 @@ function readCard(card) {
         meta: texts(".sys-meta span", card),
         // The error line is the card's only unclassed child.
         error: last && !last.className ? last.textContent : null,
+    };
+}
+
+// Missing elements read as absent rather than throwing, so a page without them fails each
+// check on its own instead of stopping the journey.
+function isShown(id) {
+    var node = document.getElementById(id);
+    return node !== null && getComputedStyle(node).display !== "none";
+}
+
+function readApplications() {
+    var section = document.getElementById("appsSection");
+    var updated = document.getElementById("appsUpdated");
+    return {
+        shown: isShown("appsSection"),
+        stale: section !== null && section.classList.contains("stale"),
+        updated: updated && updated.textContent,
+        charts: isShown("appCharts"),
+        rows: Array.prototype.map.call(document.querySelectorAll("#appsList .app-row"), function (row) {
+            var health = row.querySelector(".app-health");
+            return {
+                name: texts(".app-name", row)[0],
+                healthClass: health && health.className,
+                health: health && health.textContent,
+                version: texts(".app-version", row)[0],
+                gauges: texts(".app-gauge .val", row),
+                selected: row.classList.contains("selected"),
+            };
+        }),
     };
 }
 
@@ -341,9 +479,27 @@ function buildSteps(fx, log, baseline, result, harness) {
             result.opened[name] = {
                 selected: readRendered().cards.map(function (c) { return c.selected; }),
                 disks: document.getElementById("detailDisks").textContent,
+                apps: readApplications(),
             };
         };
     }
+    function readCharts(name) {
+        return function () {
+            result.charts[name] = {
+                apps: readApplications(),
+                heap: log.canvasText.appHeapChart,
+                requests: log.canvasText.appRequestsChart,
+                heapShown: isShown("appHeapChart"),
+                requestsShown: isShown("appRequestsChart"),
+                heapEmpty: isShown("appHeapChartMsg"),
+                requestsEmpty: isShown("appRequestsChartMsg"),
+            };
+        };
+    }
+    function serveApplicationsA(round) {
+        return function () { fx.routes[fx.applicationsARoute] = round; };
+    }
+    var refreshDetails = click('button[onclick="refreshDetailCharts()"]');
     var deleteSystem = click('button[onclick="deleteSystem()"]');
     var deleteOffline = click('button[onclick="deleteOfflineSystems()"]');
     return [
@@ -352,11 +508,24 @@ function buildSteps(fx, log, baseline, result, harness) {
         ["first summary", deliver(fx.summary)],
         ["open system", click(".sys-card")],
         ["read selection", readOpened("open system")],
+        // APP_1 is a prefix of APP_2, so selecting it must not select APP_2's row too.
+        ["open application", click("#appsList .app-row:nth-child(1)")],
+        ["read application", readCharts("open application")],
+        ["serve refreshed round", serveApplicationsA(fx.refreshedApplicationsA)],
+        ["refresh details", refreshDetails],
+        ["read refreshed application", readCharts("refresh details")],
+        ["open another application", click("#appsList .app-row:nth-child(2)")],
+        ["read another application", readCharts("open another application")],
+        ["live refresh with an application open", deliver(fx.summary)],
+        ["serve round without it", serveApplicationsA(fx.applicationsAWithoutApp2)],
+        ["refresh without the application", refreshDetails],
+        ["read round without the application", readCharts("refresh without the application")],
         ["mark disks", function () { document.querySelectorAll("#detailDisks > *").forEach(function (n) { n.dataset.stale = ""; }); }],
         ["live refresh", deliver(fx.summary)],
         ["read page", function () { result.rendered = readRendered(); result.injected = scanInjections(baseline); }],
         ["acknowledge", click(".alert-card button")],
         ["acknowledge another", click(".alert-card:nth-child(3) button")],
+        ["reopen application", click("#appsList .app-row:nth-child(1)")],
         ["open third system", click(".sys-card:nth-child(3)")],
         ["read third selection", readOpened("open third system")],
         ["decline", answerConfirm(false)],
@@ -387,8 +556,8 @@ function runPage(fx) {
         nodes: new Set(nodes),
         handlers: new Map(nodes.map(function (n) { return [n, handlerSignature(n)]; })),
     };
-    var log = { calls: [], steps: [], unexpected: [], errors: [], listeners: {}, missing: [], opened: [], confirms: 0, confirmAnswer: true };
-    var result = { log: log, opened: {} };
+    var log = { calls: [], steps: [], unexpected: [], errors: [], listeners: {}, missing: [], opened: [], canvasText: {}, confirms: 0, confirmAnswer: true };
+    var result = { log: log, opened: {}, charts: {} };
     installStubs(fx, log);
     var steps = buildSteps(fx, log, baseline, result, harness);
 
@@ -415,14 +584,18 @@ function runPage(fx) {
 
 const PAGE_SIDE = [
     allElements, handlerSignature, installStubs, scanInjections, texts,
-    readCard, readRendered, fireEverything, buildSteps, runPage,
+    readCard, isShown, readApplications, readRendered, fireEverything, buildSteps, runPage,
 ];
 
 // ── Node side ──────────────────────────────────────────
 
 function harnessScript() {
     // `<` escaped so no payload can end the <script> element it is embedded in.
-    const fixtures = JSON.stringify({ summary, changedSummary, routes, laterAlerts, alertsRoute: ALERTS_ROUTE })
+    const fixtures = JSON.stringify({
+        summary, changedSummary, routes, laterAlerts, alertsRoute: ALERTS_ROUTE,
+        applicationsARoute: `GET /api/systems/${enc(SYSTEM_A)}/applications`, refreshedApplicationsA,
+        applicationsAWithoutApp2,
+    })
         .replace(/</g, "\\u003c");
     return `<script>\n${PAGE_SIDE.join("\n")}\nrunPage(${fixtures});\n</script>\n`;
 }
@@ -544,6 +717,9 @@ function checks(r) {
     const disks = seen.disks ?? {};
     const alertCards = seen.alerts ?? [];
     const calls = (name) => callsOf(log, name);
+    const appsA = r.opened["open system"]?.apps;
+    const appsC = r.opened["open third system"]?.apps;
+    const charts = (step) => r.charts?.[step];
     return [
         // The dashboard's own SSE listener swallows render errors (`catch (_) {}`), so those
         // surface only through the rendering rows below.
@@ -626,11 +802,112 @@ function checks(r) {
         ["an alert record that arrives later renders as text",
             same(r.changed?.alerts.map((k) => k.body), laterAlerts.map(alertBody)),
             show(r.changed?.alerts.map((k) => k.body))],
+        ["every application's name, health and version render as text, skipping entries that aren't objects",
+            same(appsA?.rows.map((k) => [k.name, k.health, k.version]), [
+                [APP_1, "unknown", P],
+                [APP_2, "unknown", "—"],
+                [P, "unreachable", P],
+            ]),
+            show(appsA?.rows)],
+        ["an application health outside the allowlist renders as unknown",
+            same(appsA?.rows.map((k) => k.healthClass), ["app-health unknown", "app-health unknown", "app-health unreachable"]),
+            show(appsA?.rows.map((k) => k.healthClass))],
+        ["a known application health keeps its class and reads in words",
+            same(appsC?.rows.map((k) => [k.healthClass, k.health]), [
+                ["app-health up", "up"],
+                ["app-health down", "down"],
+                ["app-health out_of_service", "out of service"],
+                ["app-health unknown", "unknown"],
+                ["app-health up", "up"],
+            ]),
+            show(appsC?.rows)],
+        ["application gauges that aren't numbers render as —",
+            appsA?.rows.length === 3 && appsA.rows.every((k) => same(k.gauges, Array(8).fill("—"))),
+            show(appsA?.rows.map((k) => k.gauges))],
+        ["application gauges that are numbers render formatted, and a missing one as —",
+            same(appsC?.rows.map((k) => k.gauges), [
+                ["3.0 / 8.0 MiB", "12.3%", "42", "1.5", "0.0", "12.3 ms", "3", "1d 1h"],
+                ["3.0 MiB", "—", "—", "—", "—", "—", "—", "1h 2m"],
+                ["—", "—", "—", "—", "—", "—", "—", "0m"],
+                Array(8).fill("—"),
+                Array(8).fill("—"),
+            ]),
+            show(appsC?.rows.map((k) => k.gauges))],
+        ["a stale round is dimmed and labelled stale, leaving out an age that isn't a number",
+            appsA?.stale === true && appsA?.updated === "stale", show(appsA)],
+        ["a fresh round shows its age and isn't dimmed",
+            appsC?.stale === false && appsC?.updated === "updated 7 s ago", show(appsC)],
+        ["a system with applications shows the section, and one without hides it",
+            appsA?.shown === true && appsC?.shown === true && r.opened["open offline system"]?.apps.shown === false,
+            show([appsA?.shown, appsC?.shown, r.opened["open offline system"]?.apps])],
+        ["opening an application selects only its row, even when its name is a prefix of another's",
+            same(charts("open application")?.apps.rows.map((k) => k.selected), [true, false, false]) &&
+                same(charts("open another application")?.apps.rows.map((k) => k.selected), [false, true, false]),
+            show([charts("open application")?.apps.rows, charts("open another application")?.apps.rows])],
+        ["a chart without a numeric point hides its canvas and says there is no data yet",
+            charts("open application")?.apps.charts === true &&
+                charts("open application")?.heapShown === false && charts("open application")?.heapEmpty === true &&
+                charts("open application")?.requestsShown === true && charts("open application")?.requestsEmpty === false,
+            show(charts("open application"))],
+        ["a chart with numeric points shows its canvas again",
+            charts("open another application")?.heapShown === true && charts("open another application")?.heapEmpty === false,
+            show(charts("open another application"))],
+        ["a chart's scale floors at 1 for a series that stays below it",
+            same(charts("open application")?.requests, ["1", "1", "1", "0", "0", "Req/s"]),
+            show(charts("open application")?.requests)],
+        ["a chart scales to its largest numeric point with 10% headroom",
+            same(charts("open another application")?.heap, ["11", "8", "6", "3", "0", "Heap MiB"]) &&
+                same(charts("open another application")?.requests, ["22", "17", "11", "6", "0", "Req/s"]),
+            show([charts("open another application")?.heap, charts("open another application")?.requests])],
+        ["a detail refresh re-reads the applications and redraws the open application's charts",
+            same(calls("refresh details"), [
+                `GET /api/systems/${enc(SYSTEM_A)}/history?limit=300`,
+                `GET /api/systems/${enc(SYSTEM_A)}/applications`,
+                seriesRoute(SYSTEM_A, APP_1, "heap_used_bytes"),
+                seriesRoute(SYSTEM_A, APP_1, "http_requests_per_second"),
+            ]),
+            show(calls("refresh details"))],
+        ["a detail refresh keeps the open application selected and its charts shown",
+            same(charts("refresh details")?.apps.rows.map((k) => k.selected), [true, false, false]) &&
+                charts("refresh details")?.apps.charts === true,
+            show(charts("refresh details"))],
+        ["a detail refresh whose round no longer has the open application drops it and hides its charts",
+            same(calls("refresh without the application"), [
+                `GET /api/systems/${enc(SYSTEM_A)}/history?limit=300`,
+                `GET /api/systems/${enc(SYSTEM_A)}/applications`,
+            ]) &&
+                charts("refresh without the application")?.apps.rows.length === 2 &&
+                charts("refresh without the application")?.apps.rows.every((k) => !k.selected) &&
+                charts("refresh without the application")?.apps.charts === false,
+            show([calls("refresh without the application"), charts("refresh without the application")])],
+        ["a live refresh re-reads the open system's applications, without redrawing an open application's charts",
+            same(calls("live refresh with an application open")?.filter((k) => k !== ALERTS_ROUTE), [
+                `GET /api/systems/${enc(SYSTEM_A)}/applications`,
+            ]),
+            show(calls("live refresh with an application open"))],
+        ["a negative age is left out of the header",
+            charts("refresh details")?.apps.updated === "stale", show(charts("refresh details")?.apps.updated)],
+        ["opening another system clears the application selection and hides its charts",
+            appsC?.rows.length === 5 && appsC.charts === false && appsC.rows.every((k) => !k.selected), show(appsC)],
         ["every request goes to a known route", log.unexpected.length === 0, show(log.unexpected)],
         ["opening a system fetches exactly it and its history, by percent-encoded id",
             [["open system", SYSTEM_A], ["open third system", SYSTEM_C], ["open offline system", SYSTEM_B]].every(([step, id]) =>
-                same(calls(step), [`GET /api/systems/${enc(id)}`, `GET /api/systems/${enc(id)}/history?limit=300`])),
+                same(calls(step), [
+                    `GET /api/systems/${enc(id)}`,
+                    `GET /api/systems/${enc(id)}/history?limit=300`,
+                    `GET /api/systems/${enc(id)}/applications`,
+                ])),
             show(["open system", "open third system", "open offline system"].map(calls))],
+        ["opening an application fetches exactly its heap and request series, by percent-encoded name",
+            same(calls("open application"), [
+                seriesRoute(SYSTEM_A, APP_1, "heap_used_bytes"),
+                seriesRoute(SYSTEM_A, APP_1, "http_requests_per_second"),
+            ]) &&
+                same(calls("open another application"), [
+                    seriesRoute(SYSTEM_A, APP_2, "heap_used_bytes"),
+                    seriesRoute(SYSTEM_A, APP_2, "http_requests_per_second"),
+                ]),
+            show([calls("open application"), calls("open another application")])],
         ["acknowledging an alert record acknowledges only it, by percent-encoded id",
             [["acknowledge", alerts[0].id], ["acknowledge another", alerts[2].id]].every(([step, id]) =>
                 same(calls(step)?.filter((k) => k.endsWith("/acknowledge")), [`POST /api/alerts/${enc(id)}/acknowledge`])),
