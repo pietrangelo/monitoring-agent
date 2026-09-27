@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Runs the real `system-hub` binary to check startup configuration that no router test
-//! can reach (RFC 0006 § Fail-closed token).
+//! can reach (RFC 0006 § Fail-closed token, RFC 0015).
 
 #![cfg(unix)]
 
@@ -41,15 +41,16 @@ async fn run_hub(dir: &std::path::Path, token: &OsStr) -> Run {
     run_hub_with(dir, &[("HUB_PUSH_TOKEN", token)]).await
 }
 
-/// Runs the hub in `dir` with `vars` set and `RUST_LOG`, `HUB_PUSH_TOKEN` and
-/// `HUB_STATIC_DIR` removed otherwise, under the same 10 s limit as `run_hub`.
+/// Runs the hub in `dir` with `vars` set and `RUST_LOG`, `HUB_PUSH_TOKEN`, `HUB_STATIC_DIR`
+/// and `HUB_LISTEN` removed otherwise, under the same 10 s limit as `run_hub`.
 async fn run_hub_with(dir: &std::path::Path, vars: &[(&str, &OsStr)]) -> Run {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_system-hub"));
     command
         .current_dir(dir)
         .env_remove("RUST_LOG")
         .env_remove("HUB_PUSH_TOKEN")
-        .env_remove("HUB_STATIC_DIR");
+        .env_remove("HUB_STATIC_DIR")
+        .env_remove("HUB_LISTEN");
     for (key, value) in vars {
         command.env(key, value);
     }
@@ -117,6 +118,66 @@ async fn a_non_utf8_push_token_refuses_startup_before_touching_the_database() {
         created.is_empty(),
         "files were created before the configuration was checked: {created:?}"
     );
+}
+
+#[tokio::test]
+async fn a_refused_listen_address_refuses_startup_before_touching_any_file() {
+    // (name, value, what the refusal says). Each value carries a recognisable prefix, so a
+    // leaked value would show up in the output.
+    // (name, value, what the refusal says, what it must not say)
+    let cases: [(&str, &OsStr, &str, &str); 3] = [
+        (
+            "a host name",
+            OsStr::new("leak-marker.example:9091"),
+            "0.0.0.0:9091",
+            "UTF-8",
+        ),
+        (
+            "a port alone",
+            OsStr::new("leak-marker-9091"),
+            "0.0.0.0:9091",
+            "UTF-8",
+        ),
+        (
+            "not UTF-8",
+            OsStr::from_bytes(b"leak-marker-\xff"),
+            "not valid UTF-8",
+            "0.0.0.0:",
+        ),
+    ];
+    for (name, value, says, never_says) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_hub_with(dir.path(), &[("HUB_LISTEN", value)]).await;
+
+        assert!(run.exited, "{name}: the hub exits instead of serving");
+        assert!(!run.success, "{name}: a refused start exits non-zero");
+        assert!(
+            run.stdout.contains("HUB_LISTEN") && run.stdout.contains(says),
+            "{name}: the refusal names the variable and says {says:?}: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains(never_says),
+            "{name}: says the wrong problem: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("listening"),
+            "{name}: nothing was bound: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("leak-marker") && !run.stderr.contains("leak-marker"),
+            "{name}: the value leaked: {} {}",
+            run.stdout,
+            run.stderr
+        );
+        let created: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(
+            created.is_empty(),
+            "{name}: files were created before the configuration was checked: {created:?}"
+        );
+    }
 }
 
 /// The negative control: a valid token, or an empty one (push open, the README's basic
@@ -364,14 +425,10 @@ async fn a_directory_or_no_static_dir_at_all_gets_past_the_check() {
 
 /// What `run` serves, end to end: the dashboard from `HUB_STATIC_DIR`, never the working
 /// directory's own `static/`, behind the full router (API, applications, SSE, push) with
-/// CORS. The hub binds its fixed port, so this fails, saying why, while something else holds
-/// 9091, rather than asking that process instead.
+/// CORS. The hub binds `HUB_LISTEN=127.0.0.1:0`, so no other hub, test or compose stack can
+/// hold its port, and this asks the address its startup line logs.
 #[tokio::test]
 async fn the_running_hub_serves_the_configured_dashboard_and_the_full_router() {
-    assert!(
-        std::net::TcpListener::bind("0.0.0.0:9091").is_ok(),
-        "port 9091 is already in use, so the hub under test could not bind it"
-    );
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("static")).unwrap();
     std::fs::write(dir.path().join("static/index.html"), "default-marker").unwrap();
@@ -383,14 +440,24 @@ async fn the_running_hub_serves_the_configured_dashboard_and_the_full_router() {
         .env_remove("RUST_LOG")
         .env_remove("HUB_PUSH_TOKEN")
         .env("HUB_STATIC_DIR", web.path())
+        .env("HUB_LISTEN", "127.0.0.1:0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    let bound = bound_address(&mut hub).await;
+    assert!(bound.is_ok(), "the hub logged where it listens: {bound:?}");
+    let bound = bound.unwrap();
+    assert_eq!(
+        bound.ip().to_string(),
+        "127.0.0.1",
+        "the configured address"
+    );
+    assert_ne!(bound.port(), 0, "the port the OS chose, not 0");
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:9091";
+    let base = &format!("http://{bound}");
     let dashboard = wait_for(&client, &format!("{base}/"), &mut hub).await;
 
     assert!(
@@ -446,12 +513,133 @@ async fn the_running_hub_serves_the_configured_dashboard_and_the_full_router() {
     );
 }
 
-/// The body of `url` once the hub answers it, within 10 s. Fails if the hub exits first,
-/// which is what a port already in use looks like.
+/// For each marker in turn, the rest of the first later line of the hub's stdout that holds
+/// it, up to whitespace, read within 10 s; else why not. A task then keeps draining stdout,
+/// so a full pipe never blocks the hub's logging.
+async fn logged_after(
+    hub: &mut tokio::process::Child,
+    markers: &[&str],
+) -> Result<Vec<String>, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let stdout = hub.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    let mut found = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(10), async {
+        for marker in markers {
+            loop {
+                let Ok(Some(line)) = lines.next_line().await else {
+                    return Err(format!("stdout closed before {marker:?}"));
+                };
+                if let Some((_, rest)) = line.split_once(marker) {
+                    found.push(rest.chars().take_while(|c| !c.is_whitespace()).collect());
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })
+    .await;
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    match read {
+        Ok(Ok(())) => Ok(found),
+        Ok(Err(why)) => Err(why),
+        Err(_) => Err(format!(
+            "not all of {markers:?} within 10 s, only {found:?}"
+        )),
+    }
+}
+
+/// The address in the hub's first `listening on http://` line.
+async fn bound_address(hub: &mut tokio::process::Child) -> Result<std::net::SocketAddr, String> {
+    let found = logged_after(hub, &["listening on http://"]).await?;
+    found[0]
+        .parse()
+        .map_err(|err| format!("{:?}: {err}", found[0]))
+}
+
+/// The hub started in `dir` with `HUB_LISTEN` set to `listen`, killed when dropped.
+fn hub_listening_at(dir: &Path, listen: &str) -> tokio::process::Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_system-hub"))
+        .current_dir(dir)
+        .env_remove("RUST_LOG")
+        .env_remove("HUB_PUSH_TOKEN")
+        .env_remove("HUB_STATIC_DIR")
+        .env("HUB_LISTEN", listen)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_hub_serves_at_its_configured_listen_address_and_suggests_it() {
+    let fixed = {
+        let probe = std::net::TcpListener::bind("127.0.0.2:0").expect("a free port");
+        probe.local_addr().unwrap().to_string()
+    };
+    // (name, HUB_LISTEN, the host its URLs are suggested at, `None` for the bound IP)
+    let cases = [
+        ("a fixed port on another address", fixed, None),
+        (
+            "any port on every interface",
+            "0.0.0.0:0".to_owned(),
+            Some("localhost"),
+        ),
+        (
+            "any port on every ipv6 interface",
+            "[::]:0".to_owned(),
+            Some("localhost"),
+        ),
+    ];
+    for (name, listen, suggested_host) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hub = hub_listening_at(dir.path(), &listen);
+        let expected: std::net::SocketAddr = listen.parse().unwrap();
+
+        let logged = logged_after(
+            &mut hub,
+            &["listening on http://", "Dashboard: ", "Push endpoint: "],
+        )
+        .await;
+        assert!(logged.is_ok(), "{name}: the hub serves: {logged:?}");
+        let logged = logged.unwrap();
+        let bound: std::net::SocketAddr = logged[0].parse().expect("the logged address parses");
+        assert_eq!(bound.ip(), expected.ip(), "{name}: the configured address");
+        match expected.port() {
+            0 => assert_ne!(bound.port(), 0, "{name}: the port the OS chose, not 0"),
+            port => assert_eq!(bound.port(), port, "{name}: the configured port"),
+        }
+        let host = suggested_host.map_or_else(|| bound.ip().to_string(), str::to_owned);
+        let at = format!("{host}:{}", bound.port());
+        assert_eq!(
+            logged[1..],
+            [format!("http://{at}/"), format!("ws://{at}/api/push")],
+            "{name}: suggested where it can be reached"
+        );
+        // An unspecified IP can't be connected to, so its family's loopback stands in.
+        let reach = match bound.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                format!("127.0.0.1:{}", bound.port())
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => format!("[::1]:{}", bound.port()),
+            std::net::IpAddr::V4(_) | std::net::IpAddr::V6(_) => bound.to_string(),
+        };
+        let health = reqwest::get(format!("http://{reach}/api/health")).await;
+        assert_eq!(
+            health.map(|res| res.status().as_u16()).ok(),
+            Some(200),
+            "{name}: the hub answers there"
+        );
+    }
+}
+
+/// The body of `url` once the hub answers it, within 10 s. Fails if the hub exits first.
 async fn wait_for(client: &reqwest::Client, url: &str, hub: &mut tokio::process::Child) -> String {
     for _ in 0..100 {
         if let Some(status) = hub.try_wait().unwrap() {
-            panic!("the hub exited ({status}) before serving; is port 9091 already in use?");
+            panic!("the hub exited ({status}) before serving");
         }
         if let Ok(res) = client.get(url).send().await {
             return res.text().await.unwrap();

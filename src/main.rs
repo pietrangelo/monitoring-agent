@@ -19,6 +19,7 @@ mod applications;
 mod auth;
 mod collectors;
 mod environment;
+mod listen;
 mod models;
 mod push;
 mod routes;
@@ -32,6 +33,7 @@ use axum::{Router, middleware};
 use collectors::SnapshotReceiver;
 use collectors::sampler::SysinfoSource;
 use environment::cgroup::MonitoredCgroup;
+use listen::ListenAddress;
 use snapshot::SnapshotSeq;
 use std::fmt;
 use std::net::SocketAddr;
@@ -41,14 +43,11 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
-/// Where the API and dashboard are served.
-const LISTEN: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9090);
-
-/// Why the agent couldn't start, or stopped serving. Logged once by `main`, never with a
-/// configuration value.
+/// Why the agent couldn't start, or stopped serving. Logged once by `main`, never with a raw or
+/// secret configuration value: the parsed listen address isn't secret, so `Bind` names it.
 enum StartupError {
     Config(applications::config::ApplicationsConfigError),
+    Listen(listen::ListenAddressError),
     Runtime(std::io::Error),
     Scraper(applications::scraper::ScraperError),
     Collector(tokio::task::JoinError),
@@ -61,7 +60,7 @@ impl StartupError {
     /// configuration and for nothing else, 1 for any other failure.
     fn exit_code(&self) -> u8 {
         match self {
-            Self::Config(_) => 78,
+            Self::Config(_) | Self::Listen(_) => 78,
             Self::Runtime(_)
             | Self::Scraper(_)
             | Self::Collector(_)
@@ -75,6 +74,7 @@ impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
+            Self::Listen(err) => write!(f, "{err}; refusing to start"),
             Self::Runtime(err) => write!(f, "Failed to start the async runtime: {err}"),
             Self::Scraper(err) => write!(f, "Failed to start scraping applications: {err}"),
             Self::Collector(err) => write!(f, "Failed to read the system: {err}"),
@@ -100,12 +100,14 @@ fn main() -> ExitCode {
 fn start() -> Result<(), StartupError> {
     let applications =
         ApplicationsConfig::parse(|key| std::env::var(key)).map_err(StartupError::Config)?;
+    let listen = ListenAddress::from_env(std::env::var(ListenAddress::VARIABLE))
+        .map_err(StartupError::Listen)?;
     announce(&applications);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    runtime.block_on(run(applications))
+    runtime.block_on(run(applications, listen))
 }
 
 /// Logs what the applications configuration asks for, and warns about credentials that would
@@ -151,7 +153,7 @@ async fn execution_environment() -> Result<environment::ExecutionEnvironment, St
     Ok(found)
 }
 
-async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
+async fn run(applications: ApplicationsConfig, listen: ListenAddress) -> Result<(), StartupError> {
     let environment = execution_environment().await?;
     let cgroup = environment.monitored_cgroup().cloned();
     // The startup snapshot is read before anything can ask for one, so none ever waits.
@@ -192,7 +194,7 @@ async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
     });
     spawn_push_client(snapshots, app_state.rounds.clone());
 
-    serve(router(app_state)).await
+    serve(router(app_state), listen).await
 }
 
 /// Starts the scrape loop when applications are configured, and returns the state that serves
@@ -279,12 +281,17 @@ fn router(app_state: Arc<state::AppState>) -> Router {
         .layer(cors)
 }
 
-async fn serve(app: Router) -> Result<(), StartupError> {
-    let listener = tokio::net::TcpListener::bind(LISTEN)
+async fn serve(app: Router, listen: ListenAddress) -> Result<(), StartupError> {
+    let at = listen.get();
+    let listener = tokio::net::TcpListener::bind(at)
         .await
-        .map_err(|err| StartupError::Bind(LISTEN, err))?;
-    tracing::info!("🚀 System agent listening on http://{LISTEN}");
-    tracing::info!("📊 Dashboard: http://localhost:{}/", LISTEN.port());
+        .map_err(|err| StartupError::Bind(at, err))?;
+    // The bound address, not the configured one: port 0 is only known once bound.
+    let bound = listener
+        .local_addr()
+        .map_err(|err| StartupError::Bind(at, err))?;
+    tracing::info!("🚀 System agent listening on http://{bound}");
+    tracing::info!("📊 Dashboard: http://{}/", listen::reachable_at(bound));
     axum::serve(listener, app)
         .await
         .map_err(StartupError::Serve)
@@ -309,6 +316,11 @@ mod tests {
             (
                 "a refused configuration",
                 StartupError::Config(ApplicationsConfigError::InvalidInterval),
+                78,
+            ),
+            (
+                "a refused listen address",
+                StartupError::Listen(listen::ListenAddressError::Invalid),
                 78,
             ),
             ("no runtime", StartupError::Runtime(io()), 1),

@@ -194,17 +194,18 @@ For push-mode agents, they appear automatically — no manual registration neede
 
 | Variable | Default | Description |
 |---|---|---|
+| `SYSTEM_AGENT_LISTEN` | `0.0.0.0:9090` | Address and port the agent serves on: a literal IP and a port, e.g. `0.0.0.0:9190`, `127.0.0.1:9090` (loopback only) or `[::]:9090`; host names are refused. Unset or empty means the default. A value that isn't an address, or isn't valid UTF-8, refuses startup (exit 78). `0.0.0.0` and `127.0.0.1` are IPv4 only; `[::]` is also IPv4 on Linux by default (`net.ipv6.bindv6only=0`), IPv6 only on the BSDs and Windows. Port `0` lets the OS choose, logged at INFO, so it's for tests and one-off runs. A changed port must be matched in the container's port mapping and in the URL a hub polls; an agent on loopback can't be polled from another host |
 | `SYSTEM_AGENT_TOKEN` | *(none)* | API token required for REST access |
-| `PUSH_TO` | *(none)* | Hub WebSocket URL, e.g. `ws://hub:9091` |
+| `PUSH_TO` | *(none)* | Hub WebSocket URL, e.g. `ws://hub:9091`; its port is the hub's `HUB_LISTEN` port |
 | `PUSH_TOKEN` | *(none)* | Shared secret for hub authentication |
 | `PUSH_INTERVAL` | `2` | Seconds between push ticks (min 2). A tick sends the latest snapshot only if the hub hasn't had it yet; a stale snapshot closes the connection, and the agent reconnects once a fresh one is read |
 | `SPRING_BOOT_APPS` | *(none)* | Spring Boot applications to monitor, as comma-separated `name=actuator-base-url` pairs (at most 16), e.g. `orders=http://127.0.0.1:8081/actuator`. A name is 1–64 of `A-Z a-z 0-9 _ . -`. The URL is http(s), with no credentials, query or fragment |
 | `SPRING_BOOT_APP_<NAME>_USERNAME` / `_PASSWORD` | *(none)* | HTTP Basic credentials for one application; both or neither. `<NAME>` is the name upper-cased, with `-` and `.` as `_`. A username can't contain `:`, and neither value a control character (HTTP Basic can't carry them). Never logged. Over plain `http://` to a non-loopback address, the agent logs a startup warning |
 | `SPRING_BOOT_SCRAPE_INTERVAL` | `15` | Seconds between scrape rounds, 10 to 3600 |
 
-The agent parses the `SPRING_BOOT_*` variables before it starts anything. If one is
-malformed, it logs which variable is wrong (never its value) and exits with code **78**
-(`EX_CONFIG`); no other failure uses that code. With applications configured, the agent
+The agent parses `SYSTEM_AGENT_LISTEN` and the `SPRING_BOOT_*` variables before it starts
+anything. If one is malformed, it logs which variable is wrong (never its value) and exits with
+code **78** (`EX_CONFIG`); no other failure uses that code. With applications configured, the agent
 scrapes each one's Actuator every interval and serves the result on `GET /api/applications`.
 See [Spring Boot applications](#spring-boot-applications) for what each application must expose.
 
@@ -212,6 +213,7 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 
 | Variable | Default | Description |
 |---|---|---|
+| `HUB_LISTEN` | `0.0.0.0:9091` | Address and port the hub serves its API, push endpoint and dashboard on, in the same form as the agent's `SYSTEM_AGENT_LISTEN` (IPv4/IPv6 and port-0 notes included). Parsed before anything else: an invalid or non-UTF-8 value makes the hub refuse to start, naming the variable, never the value, before any file is created. Agents' `PUSH_TO` must use its port |
 | `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning); a value that isn't valid UTF-8 makes the hub refuse to start |
 | `HUB_STATIC_DIR` | `static` | Directory the dashboard is served from. Unset or empty means `static` under the working directory, unchecked. A set value must be a directory the hub can search (read permission alone is not enough), or the hub refuses to start. The container image sets `/usr/share/system-hub/static` |
 
@@ -219,7 +221,7 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 
 ## API Reference
 
-### System Agent (port 9090)
+### System Agent (default port 9090)
 
 | Endpoint | Description |
 |---|---|
@@ -241,7 +243,7 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | `GET /api/stream/alerts` | **SSE** — Active alerts every 3s |
 | `GET /api/ws/system` | **WebSocket** — Full state, `cpu_capacity_cpus`, `cpu_steal_percent` and `collected_at` every 2s; one `{"type": "stale"}` message while the snapshot is stale |
 
-### System Hub (port 9091)
+### System Hub (default port 9091)
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -435,7 +437,9 @@ yet) shows as `—`, never as zero.
 
 ### TLS termination
 
-Neither component has built-in TLS. Place them behind a reverse proxy:
+Neither component has built-in TLS. Place them behind a reverse proxy, and bind the component
+to loopback (`HUB_LISTEN=127.0.0.1:9091`, or `SYSTEM_AGENT_LISTEN=127.0.0.1:9090` for an agent
+polled through a proxy) so the plain port can't be reached around the proxy:
 
 ```nginx
 # Nginx example for the hub

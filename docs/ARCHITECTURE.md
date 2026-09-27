@@ -100,10 +100,15 @@ Runs on every monitored Linux host. Responsibilities:
   up for the agent's lifetime, logging that once, and never re-sends the ended loop's last
   round.
 - Reads which Spring Boot applications to monitor from `SPRING_BOOT_APPS` and its companion
-  variables (`applications/config.rs`, RFC 0009). `main` is synchronous: it parses this
-  configuration before it builds the Tokio runtime, so a malformed value refuses startup
-  (exit code 78, `EX_CONFIG`, used for nothing else) before any task, bind or connection
-  exists. Every other startup failure is a typed `StartupError` that exits 1.
+  variables (`applications/config.rs`, RFC 0009), and where to serve from
+  `SYSTEM_AGENT_LISTEN` (`listen.rs::ListenAddress`, RFC 0015: a literal IP and port, default
+  `0.0.0.0:9090`). `main` is synchronous: it parses this configuration before it builds the
+  Tokio runtime, so a malformed value refuses startup (exit code 78, `EX_CONFIG`, used for
+  nothing else) before any task, bind or connection exists. That the listen parse happens
+  before the runtime can't be seen from outside the process, so it is a review rule; the
+  tests pin that it precedes the runtime's first log line. The agent logs the address it
+  bound (`local_addr`, so port 0 shows the OS's choice) and suggests its dashboard at
+  `listen::reachable_at`: `localhost` for an unspecified IP, else the bound one. Every other startup failure is a typed `StartupError` that exits 1.
 - Scrapes those applications' Actuators (`applications/`): a scrape loop runs a scrape round
   over every application concurrently, publishes it on a `watch` channel that `AppState`
   holds the receiver of, then sleeps a full scrape interval, so two rounds are always at least
@@ -307,8 +312,11 @@ mixed-version fleet must keep working):
   constant-time byte loop) — only token *content* is protected, which matches standard practice
   for this kind of fixed-secret comparison.
 - **Agent → Hub (push)**: agent presents `system_id` + `token` in a JSON handshake frame before
-  any data frame is accepted. `main` parses `HUB_PUSH_TOKEN` once, before it opens the
-  database (`PushAuth::from_env`). Unset or empty leaves push open, and startup logs a
+  any data frame is accepted. `main` parses `HUB_LISTEN` (`listen.rs::ListenAddress`, RFC 0015,
+  default `0.0.0.0:9091`; an invalid or non-UTF-8 value refuses startup, naming the variable,
+  never the value) and `HUB_PUSH_TOKEN` once, before it opens the database
+  (`PushAuth::from_env`). It logs the address it bound and suggests its dashboard and push URLs
+  at `listen::reachable_at`, as the agent does. Unset or empty leaves push open, and startup logs a
   warning. A value that isn't UTF-8 makes the hub refuse to start: it logs the variable's
   name, never its value, exits non-zero, and has created no file. `push::authenticate` parses the handshake into a
   `SystemId` or a typed `HandshakeRejection`, checking the shape first, then the token
@@ -430,13 +438,18 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   malformed applications configuration must exit 78, name the variable, print no credential,
   log nothing past the parse, and make no push connection. Valid and empty configurations,
   with and without `PUSH_TO`, must get past the parse. The plain-text credentials warning
-  must come before startup and name the application but not its URL. The configuration
+  must come before startup and name the application but not its URL. An invalid or non-UTF-8
+  `SYSTEM_AGENT_LISTEN` is refused the same way, before the runtime's first line; a valid one
+  (`127.0.0.1:0`, a fixed port on `127.0.0.2`, `0.0.0.0:0`, `[::]:0`) is bound exactly, logged,
+  suggested and answered on. The configuration
   parse itself is a table-driven unit test over a lookup table, so no test mutates the
   environment.
 - **`system-hub/tests/`** runs the real binary (`CARGO_BIN_EXE_system-hub`) in a temp dir to
-  check startup configuration no router test can reach: a non-UTF-8 `HUB_PUSH_TOKEN` refuses
-  startup before any file is created, and an unopenable database is a logged exit, not a
-  panic.
+  check startup configuration no router test can reach: a non-UTF-8 `HUB_PUSH_TOKEN` or an
+  invalid `HUB_LISTEN` refuses startup before any file is created, an unopenable database is a
+  logged exit, not a panic, and `HUB_LISTEN` is bound, logged and suggested as configured.
+  Every hub it starts to serve listens on a port the OS chose (`HUB_LISTEN=…:0`, read from the
+  startup line) or a probed free one, so none needs 9091 free.
 - Route tests drive each module's `router`. In the hub, `main.rs::app` assembles the
   production router (the module routers, `ServeDir` and CORS), and its tests check that the
   API, applications, SSE and push routes, CORS and the configured dashboard directory all survive the

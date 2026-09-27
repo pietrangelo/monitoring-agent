@@ -40,3 +40,4 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0012](0012-hub-access-control.md) | Hub Access Control: Admin Token over Registry and Retention Writes, Reserved Push Ids | Draft |
 | [0013](0013-sqlite-import.md) | One-Shot Import from SQLite into the Hub Store | Rejected |
 | [0014](0014-execution-environment.md) | Execution Environment: the Agent Monitors What It Runs In | Accepted |
+| [0015](0015-configurable-listen-port.md) | Configurable Listen Address for the Agent and the Hub | Implemented |

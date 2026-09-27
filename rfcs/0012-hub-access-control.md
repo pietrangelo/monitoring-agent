@@ -92,7 +92,7 @@ Every refusal names the variable, never the value.
   `POST` and `PUT` refuse one (400), in constant time; and **at startup**, once 0011 has opened
   the stored tokens, the hub compares the admin token with each in constant time and refuses to
   start on a match, logging the system ids in `Debug` form, never a token.
-- **`HUB_LISTEN`** (new): the address the hub binds, default `0.0.0.0:9091`, parsed with the rest
+- **`HUB_LISTEN`** (shipped early by RFC 0015, as designed here): the address the hub binds, default `0.0.0.0:9091`, parsed with the rest
   of the configuration (an invalid value refuses startup, naming it). The startup line logs the
   address actually bound. The real-binary tests start the hub with `HUB_LISTEN=127.0.0.1:0`
   and read the bound port from that line, so they never collide with a running hub, each other,
@@ -306,7 +306,7 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 - **A05 Security Misconfiguration:** unset means disabled (fail closed). A token that can't be
   presented, or is too short, refuses startup. `docker-compose.yml` passes `HUB_ADMIN_TOKEN:
   ${HUB_ADMIN_TOKEN:-}` with no development default, and `.env.example` shows `openssl rand -hex
-  32`. CORS `Any` doesn't cover `Authorization` (§5). `HUB_LISTEN` fails closed on a bad value.
+  32`. CORS `Any` doesn't cover `Authorization` (§5). `HUB_LISTEN` fails closed on a bad value (RFC 0015).
 - **A06 Vulnerable Components:** none added.
 - **A07 Identification & Authentication Failures:** constant-time comparison, a minimum length,
   no logging of the token, per-reason rate-limited refusal logs, an audit line per action. No
@@ -335,7 +335,7 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 - **API7:** see A10.
 - **API8:** see A05.
 - **API9:** the six admin routes, the three open read routes (`GET /api/offline-systems`,
-  `GET /api/retention`, `GET /api/storage`), `HUB_ADMIN_TOKEN`, `HUB_LISTEN`, the new `auth_error`
+  `GET /api/retention`, `GET /api/storage`), `HUB_ADMIN_TOKEN` (`HUB_LISTEN` is already in it, RFC 0015), the new `auth_error`
   row in the README's push-protocol table, and the breaking changes go into the README.
 - **API10:** N/A.
 
@@ -344,8 +344,7 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 - **`AdminAuth` parsing**, as a table: unset; empty; 31, 32, 1,024 and 1,025 characters; a space
   inside; surrounding whitespace; a non-ASCII letter; not UTF-8; equal to the push token; equal
   to an unset push token (allowed).
-- **`HUB_LISTEN` parsing**: the default; `127.0.0.1:0`; `[::1]:9091`; garbage and a port over
-  65,535 (refused).
+- **`HUB_LISTEN` parsing**: shipped and tested by RFC 0015; nothing to add here.
 - **Admin middleware** over each admin route: disabled (403), missing (401), wrong (401), wrong
   length (401), right (2xx), `Bearer` with an empty value (401).
 - **Refusal limiter** with an injected clock: per reason, one `warn` in 60 s and the next at
@@ -353,8 +352,8 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
   counters in `/api/storage`.
 - **Audit**: each successful admin action logs route, id and peer address; a router without
   `ConnectInfo` logs `peer=unknown` and still answers 2xx.
-- **Real binary** (`system-hub/tests/`, `HUB_LISTEN=127.0.0.1:0`, the bound port read from the
-  startup line): an admin request answers 2xx and logs the peer address; an invalid
+- **Real binary** (`system-hub/tests/`, on RFC 0015's harness: `HUB_LISTEN=127.0.0.1:0`, the
+  bound port read from the startup line): an admin request answers 2xx and logs the peer address; an invalid
   `HUB_ADMIN_TOKEN` exits before `HUB_DATA_DIR` is created; a stored poll token equal to the admin
   token refuses startup (the token stored by a first run with another admin token), naming the
   system id and never the token.
@@ -393,9 +392,8 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 - **Trust boundaries**: *Client → Hub* gains admin routes, the audit log and the CORS note;
   *Agent → Hub (push)* gains reserved ids; *Hub API → hub dashboard* gains the per-action token.
 - **Domain model**: the Hub Access context and the glossary.
-- **Components**: `HUB_LISTEN` in `main`'s configuration.
 - **Testing architecture**: `xss.mjs`'s injected CSP with its canary, wider stubs and token checks;
-  the hub's real-binary tests on `127.0.0.1:0`.
+  the hub's real-binary tests on `127.0.0.1:0` are RFC 0015's already.
 - **Open questions**: closes "No hub-side client authentication" for writes, API1 for polled
   systems, and the legacy-id rule for `DELETE`; keeps open reads, no CSP served by the hub (now
   with a token typed into the page), no TLS, and push handshake refusals logged without a peer
