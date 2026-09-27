@@ -22,6 +22,7 @@ mod db;
 mod listen;
 mod models;
 mod push;
+mod registry;
 mod retention;
 mod round_intake;
 mod routes;

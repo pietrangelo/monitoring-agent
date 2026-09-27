@@ -553,7 +553,7 @@
                         <div class="val" style="color: var(--green)" id="dMem">
                             —
                         </div>
-                        <div class="lbl">Total RAM</div>
+                        <div class="lbl">Memory</div>
                     </div>
                 </div>
                 <div class="chart-row">
@@ -887,7 +887,7 @@
                 if (cores) meta.append(el("span", null, cores + " cores"));
                 if (s.total_memory_display)
                     meta.append(
-                        el("span", null, s.total_memory_display + " RAM"),
+                        el("span", null, s.total_memory_display + " Memory"),
                     );
                 if (s.last_seen)
                     meta.append(el("span", null, "Seen: " + s.last_seen));

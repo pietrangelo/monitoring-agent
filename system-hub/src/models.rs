@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 // ── Registered system ──────────────────────────────────
 
+// `PartialEq` only in tests: `token` is a secret, compared in constant time or not at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct SystemInfo {
     pub id: String,
     pub name: String,

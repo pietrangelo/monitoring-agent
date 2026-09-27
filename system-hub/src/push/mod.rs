@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::registry::{MemoryCapacity, memory_capacity_refresh};
 use axum::{
     Router,
     extract::{
@@ -572,17 +573,26 @@ fn update_registry(app: &AppState, system_id: &SystemId, payload: &PushPayload) 
     let Some(sys) = app.db.get_system(id).ok().flatten() else {
         return;
     };
-    if sys.hostname.is_none() || sys.os.is_none() {
-        let _ = app.db.update_system_info(
+    if (sys.hostname.is_none() || sys.os.is_none())
+        && let Err(err) = app.db.update_system_info(
             id,
             Some(&payload.os_name),
             Some(&payload.hostname),
             Some(&payload.kernel),
             Some(&payload.cpu_model),
             Some(payload.cpu_cores),
-            Some(&payload.memory_total_display),
-            Some(payload.memory_total_bytes),
-        );
+        )
+    {
+        tracing::warn!("Push from {id:?}: couldn't record the system info: {err}");
+    }
+    let reported = MemoryCapacity::reported(
+        Some(&payload.memory_total_display),
+        Some(payload.memory_total_bytes),
+    );
+    if let Some(capacity) = memory_capacity_refresh(MemoryCapacity::stored(&sys).as_ref(), reported)
+        && let Err(err) = app.db.update_memory_capacity(id, &capacity)
+    {
+        tracing::warn!("Push from {id:?}: couldn't refresh the memory capacity: {err}");
     }
     let _ = app
         .db
@@ -2041,16 +2051,7 @@ mod tests {
             let (ws, _) = connect_and_auth(addr, system_id, "").await;
             state
                 .db
-                .update_system_info(
-                    system_id,
-                    preset_os,
-                    preset_hostname,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .update_system_info(system_id, preset_os, preset_hostname, None, None, None)
                 .unwrap();
 
             push_frames_then_disconnect(&state, ws, system_id, &[sample_frame("host1")]).await;
@@ -2059,6 +2060,73 @@ mod tests {
             assert_eq!(sys.hostname.as_deref(), Some(hostname), "{name}: hostname");
             assert_eq!(sys.os.as_deref(), Some(os), "{name}: os");
         }
+    }
+
+    /// RFC 0014 §8: the memory capacity follows every frame, while the rest of the system's
+    /// info keeps its fill-once rule.
+    #[tokio::test]
+    async fn push_frames_refresh_the_memory_capacity_and_keep_the_systems_info() {
+        let system_id = "0123456789abcdef";
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let (ws, _) = connect_and_auth(addr, system_id, "").await;
+        state
+            .db
+            .update_system_info(
+                system_id,
+                Some("Preset OS"),
+                Some("preset-host"),
+                Some("preset-kernel"),
+                Some("preset-cpu"),
+                Some(64),
+            )
+            .unwrap();
+        state
+            .db
+            .update_memory_capacity(
+                system_id,
+                &MemoryCapacity::fixture("31.0 GB", 33_285_996_544),
+            )
+            .unwrap();
+        let mut resized = sample_frame("host1");
+        resized.memory_total_display = "512.0 MB".into();
+        resized.memory_total_bytes = 536_870_912;
+        // A frame whose display is blank carries no capacity: the stored one stays.
+        let mut blank = sample_frame("host1");
+        blank.memory_total_display = String::new();
+        blank.memory_total_bytes = 1;
+
+        push_frames_then_disconnect(
+            &state,
+            ws,
+            system_id,
+            &[sample_frame("host1"), resized, blank],
+        )
+        .await;
+
+        let sys = state.db.get_system(system_id).unwrap().unwrap();
+        assert_eq!(
+            (sys.total_memory_display.as_deref(), sys.total_memory_bytes),
+            (Some("512.0 MB"), Some(536_870_912)),
+            "the last whole capacity, not the host's, the first frame's or a blank one"
+        );
+        assert_eq!(
+            (
+                sys.os.as_deref(),
+                sys.hostname.as_deref(),
+                sys.kernel.as_deref(),
+                sys.cpu_model.as_deref(),
+                sys.cpu_cores,
+            ),
+            (
+                Some("Preset OS"),
+                Some("preset-host"),
+                Some("preset-kernel"),
+                Some("preset-cpu"),
+                Some(64)
+            ),
+            "the rest of the system info keeps its fill-once rule"
+        );
     }
 
     #[tokio::test]
