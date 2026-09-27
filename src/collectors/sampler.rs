@@ -23,6 +23,7 @@ use sysinfo::System;
 
 use super::monotonic_now;
 use super::system::{self, RawReadings};
+use crate::environment::ExecutionEnvironment;
 use crate::snapshot::{CollectedSnapshot, Priming};
 
 /// Where a sampler's readings come from.
@@ -53,16 +54,20 @@ impl Gather for SysinfoSource {
 
 pub struct Sampler<G> {
     source: G,
+    /// What every reading is taken in, found once at startup.
+    environment: ExecutionEnvironment,
     /// When the priming reading ended.
     primed_at: Instant,
 }
 
 impl<G: Gather> Sampler<G> {
-    /// A sampler that has taken its priming reading, which it never publishes.
-    pub fn prime(mut source: G) -> Self {
+    /// A sampler in `environment` that has taken its priming reading, which it never
+    /// publishes.
+    pub fn prime(mut source: G, environment: ExecutionEnvironment) -> Self {
         source.gather();
         Self {
             source,
+            environment,
             primed_at: monotonic_now(),
         }
     }
@@ -79,6 +84,7 @@ impl<G: Gather> Sampler<G> {
         match Priming::of(self.primed_at, read_at) {
             Priming::Done => Some(CollectedSnapshot {
                 system: system::snapshot_from(raw),
+                environment: self.environment.clone(),
                 collected_at,
                 read_at,
             }),
@@ -138,7 +144,28 @@ mod tests {
     use super::fakes::*;
     use super::*;
     use crate::snapshot::PRIMING;
+    use crate::snapshot::fixtures::ENVIRONMENT;
     use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_is_read_in_the_samplers_environment() {
+        let cases = [
+            ("bare metal", ExecutionEnvironment::BareMetal),
+            ("a container", ENVIRONMENT),
+            (
+                "a vm",
+                ExecutionEnvironment::VirtualMachine {
+                    hypervisor: crate::environment::Hypervisor::Kvm,
+                },
+            ),
+        ];
+        for (name, environment) in cases {
+            let mut sampler = Sampler::prime(FakeSource::new(), environment.clone());
+            tokio::time::advance(PRIMING).await;
+            let collected = sampler.read().expect("a snapshot, past priming");
+            assert_eq!(collected.environment, environment, "{name}");
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_reading_is_a_snapshot_only_a_full_priming_interval_after_priming() {
@@ -149,7 +176,7 @@ mod tests {
             ("past it", Duration::from_millis(1_500), Some(1.0)),
         ];
         for (name, wait, expected) in cases {
-            let mut sampler = Sampler::prime(FakeSource::new());
+            let mut sampler = Sampler::prime(FakeSource::new(), ENVIRONMENT);
             tokio::time::advance(wait).await;
             let cpu = sampler.read().map(|s| s.system.cpu.usage_percent);
             assert_eq!(cpu, expected, "case: {name}");
@@ -158,7 +185,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_early_reading_still_refreshes_the_source() {
-        let mut sampler = Sampler::prime(FakeSource::new());
+        let mut sampler = Sampler::prime(FakeSource::new(), ENVIRONMENT);
         assert!(sampler.read().is_none(), "too early to publish");
         tokio::time::advance(PRIMING).await;
         let cpu = sampler.read().map(|s| s.system.cpu.usage_percent);
@@ -167,7 +194,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_snapshot_is_stamped_when_its_reading_started() {
-        let mut sampler = Sampler::prime(FakeSource::new());
+        let mut sampler = Sampler::prime(FakeSource::new(), ENVIRONMENT);
         tokio::time::advance(PRIMING).await;
         let unix_now = || {
             SystemTime::now()

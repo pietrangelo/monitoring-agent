@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 pub mod containers;
+pub mod environment;
 pub mod packages;
 pub mod ports;
 pub mod sampler;
@@ -22,6 +23,7 @@ pub mod services;
 pub mod system;
 
 use crate::alerts::{Reading, Readings};
+use crate::environment::ExecutionEnvironment;
 use crate::environment::usage::{LoadAverage, Percent};
 use crate::models::SystemSnapshot;
 use crate::snapshot::{CollectedSnapshot, PRIMING, PublishedSnapshot, STALENESS_BOUND};
@@ -45,12 +47,13 @@ pub fn monotonic_now() -> std::time::Instant {
 /// How often the background collector reads the system.
 pub const COLLECT_PERIOD: Duration = Duration::from_secs(2);
 
-/// The startup snapshot: primes a sampler from `source`, waits out the priming interval and
-/// reads, all off the runtime. `Err` if the source panicked.
+/// The startup snapshot: primes a sampler in `environment` from `source`, waits out the
+/// priming interval and reads, all off the runtime. `Err` if the source panicked.
 pub async fn first_snapshot<G: Gather>(
     source: G,
+    environment: ExecutionEnvironment,
 ) -> Result<(Sampler<G>, CollectedSnapshot), JoinError> {
-    let mut sampler = spawn_blocking(move || Sampler::prime(source)).await?;
+    let mut sampler = spawn_blocking(move || Sampler::prime(source, environment)).await?;
     loop {
         tokio::time::sleep(PRIMING).await;
         match read_off_runtime(sampler).await? {
@@ -69,7 +72,8 @@ enum Slot<G> {
 /// Background task: every `COLLECT_PERIOD`, reads the system off the runtime, publishes the
 /// snapshot, records it in history and evaluates alerts on it. The first tick is a full
 /// period after the startup snapshot `publisher` already holds. A panic in a tick rebuilds
-/// the sampler from `rebuild`; the published snapshot stays the previous one meanwhile.
+/// the sampler from `rebuild`, in the startup snapshot's environment; the published snapshot
+/// stays the previous one meanwhile.
 pub async fn background_collector<G, F>(
     state: Arc<AppState>,
     publisher: SnapshotSender,
@@ -81,6 +85,7 @@ pub async fn background_collector<G, F>(
 {
     let startup = publisher.borrow().clone();
     record(&state, &startup);
+    let environment = &startup.environment;
     let mut tick = interval_at(Instant::now() + COLLECT_PERIOD, COLLECT_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut slot = Slot::Ready(sampler);
@@ -98,11 +103,16 @@ pub async fn background_collector<G, F>(
                     }
                     Err(err) => {
                         tracing::error!("The system collector panicked: {err}; rebuilding it");
-                        rebuild_sampler(rebuild.clone(), &mut tick, Rebuild::AfterPanic).await
+                        let make = rebuild.clone();
+                        rebuild_sampler(make, environment.clone(), &mut tick, Rebuild::AfterPanic)
+                            .await
                     }
                 }
             }
-            Slot::Broken => rebuild_sampler(rebuild.clone(), &mut tick, Rebuild::Retry).await,
+            Slot::Broken => {
+                let make = rebuild.clone();
+                rebuild_sampler(make, environment.clone(), &mut tick, Rebuild::Retry).await
+            }
         };
     }
 }
@@ -133,12 +143,20 @@ enum Rebuild {
 /// Primes a new sampler off the runtime. On success the next tick is a full period away, so
 /// the new sampler's first reading is taken well after its priming one. Logs a failure only
 /// after a panic, and a success only after a failure: a broken source logs once, not per tick.
-async fn rebuild_sampler<G, F>(make: F, tick: &mut Interval, why: Rebuild) -> Slot<G>
+async fn rebuild_sampler<G, F>(
+    make: F,
+    environment: ExecutionEnvironment,
+    tick: &mut Interval,
+    why: Rebuild,
+) -> Slot<G>
 where
     G: Gather,
     F: FnOnce() -> G + Send + 'static,
 {
-    match (spawn_blocking(move || Sampler::prime(make())).await, why) {
+    match (
+        spawn_blocking(move || Sampler::prime(make(), environment)).await,
+        why,
+    ) {
         (Ok(sampler), Rebuild::AfterPanic) => {
             tick.reset();
             Slot::Ready(sampler)
@@ -257,7 +275,7 @@ mod tests {
 
     /// A sampler primed as at startup: a full priming interval ago.
     async fn primed(source: FakeSource) -> Sampler<FakeSource> {
-        let sampler = Sampler::prime(source);
+        let sampler = Sampler::prime(source, fixtures::ENVIRONMENT);
         tokio::time::advance(PRIMING).await;
         sampler
     }
@@ -373,6 +391,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_rebuilt_sampler_reads_in_the_startup_environment() {
+        let (publisher, mut snapshots) = fixtures::channel(fixtures::published());
+        let state = AppState::new(snapshots.clone());
+        let sampler = primed(FakeSource::panicking_on(3)).await;
+        let collector = tokio::spawn(background_collector(
+            state,
+            publisher,
+            sampler,
+            FakeSource::new,
+        ));
+        let mut environments = Vec::new();
+        let until = Instant::now() + secs(9);
+        while let Ok(Ok(())) = tokio::time::timeout_at(until, snapshots.changed()).await {
+            let snap = snapshots.borrow_and_update().clone();
+            environments.push((snap.seq, snap.environment.clone()));
+        }
+        collector.abort();
+        assert_eq!(
+            environments,
+            [1, 2, 3].map(|n| (seq(n), fixtures::ENVIRONMENT)),
+            "before the panic and after the rebuild"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_failing_rebuild_is_retried_once_a_tick() {
         let builds = Arc::new(AtomicU32::new(0));
         let counted = builds.clone();
@@ -409,7 +452,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_first_snapshot_is_read_a_priming_interval_after_priming() {
         let start = monotonic_now();
-        let (_, first) = first_snapshot(FakeSource::new()).await.expect("no panic");
+        let (_, first) = first_snapshot(FakeSource::new(), fixtures::ENVIRONMENT)
+            .await
+            .expect("no panic");
         assert_eq!(
             first.system.cpu.usage_percent, 1.0,
             "not the priming reading"

@@ -85,7 +85,8 @@ The domain core is pure; the file reads live beside the other collectors.
 
 ```
 src/environment/               domain (Host Telemetry), no I/O
-  mod.rs        ExecutionEnvironment, Hypervisor, ContainerRuntime, EnvironmentEvidence, classify
+  mod.rs        ExecutionEnvironment, Hypervisor, ContainerRuntime, LoadScope, classify
+  evidence.rs   EnvironmentEvidence, ContainerMarker, CpuArchitecture, the evidence parsers and DMI table
   cgroup.rs     parsers (cpu.max, memory.max, cpuset, /proc/self/cgroup, mountinfo, memory.stat, cpu.stat)
                 CgroupPath, MonitoredCgroup, ResourceLimit, CpuCapacity, MemoryCapacity, capacity rules
   usage.rs      CpuCounters, StealCounters, Percent, and the delta rules
@@ -98,7 +99,7 @@ src/collectors/
 ```rust
 pub enum ExecutionEnvironment {
     BareMetal,
-    VirtualMachine { hypervisor: Option<Hypervisor> },
+    VirtualMachine { hypervisor: Hypervisor },
     Container { runtime: Option<ContainerRuntime>, cgroup: CgroupAccess },
     Undetermined,
 }
@@ -116,8 +117,13 @@ pub fn classify(evidence: &EnvironmentEvidence) -> ExecutionEnvironment;
 ```
 
 `Hypervisor::Other` is a variant meaning "a hypervisor we don't name", not a sentinel: its
-presence is evidence (the CPU flag), only its name is missing. All three enums are closed and
+presence is evidence (the CPU flag), only its name is missing. Every rule that finds a virtual
+machine finds a hypervisor, so it isn't optional: `Other` is the one spelling of "unnamed". All three enums are closed and
 carry no free text, so no string read from the environment reaches the API.
+
+`Container`'s `cgroup` field, and the `self_cgroup` / `cgroup2_mount` evidence it needs, land
+with step 5 (cgroup location): rules 1–4 below don't read them, so step 4 classifies without
+them and `/api/system`'s `environment` gains `cgroup` then.
 
 ### 3. Classification (pure, run once at startup)
 
@@ -133,8 +139,8 @@ carry no free text, so no string read from the environment reaches the API.
 | `self_cgroup` | `/proc/self/cgroup` |
 | `cgroup2_mount` | the cgroup2 line in `/proc/self/mountinfo`: mount point and mount root |
 | `cpu_hypervisor_flag` | `hypervisor` in `/proc/cpuinfo`'s `flags` (x86 only) |
-| `arch_x86` | compile-time `cfg!(target_arch)`, passed in as a value |
-| `dmi_vendor`, `dmi_product` | `/sys/class/dmi/id/sys_vendor`, `product_name` |
+| `architecture` | compile-time `cfg!(target_arch)`: `X86` or `NonX86`, passed in as a value |
+| `dmi_hypervisor` | `/sys/class/dmi/id/sys_vendor` and `product_name`, parsed at the edge into the hypervisor they name, if any. A vendor that also sells physical machines names one only with its virtual product: Microsoft with `Virtual Machine`, Amazon EC2 unless the product ends in `.metal`, Google with `Google Compute Engine` |
 | `xen` | `/sys/hypervisor/type` reads `xen` |
 | `wsl` | `/proc/sys/kernel/osrelease` contains `microsoft` (case-insensitive) |
 
@@ -143,12 +149,13 @@ The rules, in precedence order (first match wins):
 1. Any **explicit container marker** (`dockerenv`, `containerenv`, `kubernetes`, or a
    `container_env_var` / `systemd_container` value other than `wsl`) → `Container`. The
    runtime is `Kubernetes` if that marker is set, else `Podman` for `containerenv` or
-   `podman`, `Lxc` / `SystemdNspawn` for those values, `Docker` for `dockerenv` or `docker`,
-   else `None`.
+   `podman` in either value, else the first of `container_env_var` then `systemd_container`
+   reading `lxc` / `systemd-nspawn`, else `Docker` for `dockerenv` or `docker`, else `None`.
 2. `wsl` (osrelease, or `wsl` in either container value: systemd writes `wsl` to
    `/run/systemd/container` on WSL, measured on the owner's machine) → `VirtualMachine { Wsl }`. `xen`, the CPU flag, or a DMI vendor/product in the known
-   table → `VirtualMachine`, naming the hypervisor from DMI when it matches, else `Other`.
-3. `arch_x86` with no CPU flag and no virtual DMI → `BareMetal`.
+   table → `VirtualMachine`, naming the hypervisor from DMI when it matches, else `Xen` when
+   `xen` is set, else `Other`.
+3. `architecture` `X86` with no CPU flag and no virtual DMI → `BareMetal`.
 4. Otherwise → `Undetermined` (ARM without DMI, for example).
 
 **Only a marker makes a container.** Neither a cgroup limit nor an `overlay` root filesystem
@@ -442,7 +449,7 @@ consistent pairing. The API says the load is host-wide (§7).
   "environment": {
     "kind": "container",            // bare_metal | virtual_machine | container | undetermined
     "runtime": "podman",            // container only; null when unknown
-    "hypervisor": null,             // virtual_machine only; null when unknown
+    "hypervisor": null,             // virtual_machine only, "other" when unnamed; else null
     "cgroup": "v2",                 // container only: "v2" | "unreadable"
     "load_scope": "host"            // "host" in a container, "environment" elsewhere
   },
@@ -461,6 +468,11 @@ SSE (`/api/stream/system`) and WS (`/api/ws/system`) build hand-picked `json!` o
 (`sse.rs:42-57`, `ws.rs:58-76`). They gain `cpu_capacity_cpus`, `cpu_steal_percent` and
 `collected_at`: the live values a chart would plot. Both also send the `stale` event (§6). The static `environment` stays on
 `/api/system` only. SSE's `timestamp` field, today `uptime_seconds`, is left as it is.
+
+The `runtime` values are `docker`, `podman`, `kubernetes`, `lxc` and `systemd_nspawn`; the
+`hypervisor` values are `kvm`, `qemu`, `vmware`, `hyperv`, `wsl`, `xen`, `virtualbox`,
+`amazon_ec2`, `google_compute` and `other`. They are chosen on the wire DTO, not derived from
+the domain's names, and a test pins each one.
 
 The wire shape gets its own DTO (`models.rs`), converted from the domain values at the edge,
 rather than serde derives on `ExecutionEnvironment`: the first step, for the types touched, of

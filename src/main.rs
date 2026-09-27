@@ -133,9 +133,27 @@ fn system_source() -> SysinfoSource {
     SysinfoSource::new(PathBuf::from("/"))
 }
 
+/// The agent's execution environment, classified once from the evidence under `/` and the
+/// agent's own variables, read off the runtime (RFC 0014 §3).
+async fn execution_environment() -> Result<environment::ExecutionEnvironment, StartupError> {
+    let evidence = tokio::task::spawn_blocking(|| {
+        collectors::environment::gather_evidence(
+            std::path::Path::new("/"),
+            |key| std::env::var(key).ok(),
+            environment::evidence::CpuArchitecture::of_build(),
+        )
+    })
+    .await
+    .map_err(StartupError::Collector)?;
+    let found = environment::classify(&evidence);
+    tracing::info!("execution environment: {found}");
+    Ok(found)
+}
+
 async fn run(applications: ApplicationsConfig) -> Result<(), StartupError> {
+    let environment = execution_environment().await?;
     // The startup snapshot is read before anything can ask for one, so none ever waits.
-    let (sampler, first) = collectors::first_snapshot(system_source())
+    let (sampler, first) = collectors::first_snapshot(system_source(), environment)
         .await
         .map_err(StartupError::Collector)?;
     let (publisher, snapshots) =

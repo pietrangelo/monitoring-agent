@@ -82,6 +82,7 @@ impl IntoResponse for StaleSnapshot {
 #[derive(Serialize)]
 struct SystemResponse<'a> {
     collected_at: u64,
+    environment: crate::models::EnvironmentInfo,
     #[serde(flatten)]
     system: &'a crate::models::SystemSnapshot,
 }
@@ -90,6 +91,7 @@ async fn system_full(State(s): State<Arc<AppState>>) -> Result<Response, StaleSn
     let snap = s.fresh_snapshot()?;
     Ok(Json(SystemResponse {
         collected_at: snap.collected_at,
+        environment: (&snap.environment).into(),
         system: &snap.system,
     })
     .into_response())
@@ -389,6 +391,13 @@ mod tests {
         let snap = serde_json::to_value(&fixture.system).unwrap();
         let mut whole = snap.clone();
         whole["collected_at"] = fixture.collected_at.into();
+        // The fixture's environment, a podman container, as RFC 0014 §7 puts it on the wire.
+        whole["environment"] = serde_json::json!({
+            "kind": "container",
+            "runtime": "podman",
+            "hypervisor": null,
+            "load_scope": "host",
+        });
         let cases = [
             ("/api/system", whole),
             ("/api/system/cpu", snap["cpu"].clone()),

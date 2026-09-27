@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::environment::ExecutionEnvironment;
 use crate::models::SystemSnapshot;
 
 /// The collector's count of published snapshots. It only grows, across sampler rebuilds, and
@@ -65,6 +66,8 @@ impl Priming {
 /// One reading of the system, not yet published.
 pub struct CollectedSnapshot {
     pub system: SystemSnapshot,
+    /// What the reading was taken in: the sampler's, found once at startup.
+    pub environment: ExecutionEnvironment,
     /// Unix seconds on the agent's clock, when the reading started.
     pub collected_at: u64,
     /// When the reading started, on the runtime's monotonic clock.
@@ -76,6 +79,7 @@ impl CollectedSnapshot {
     pub fn published(self, seq: SnapshotSeq) -> PublishedSnapshot {
         PublishedSnapshot {
             system: self.system,
+            environment: self.environment,
             collected_at: self.collected_at,
             read_at: self.read_at,
             seq,
@@ -86,6 +90,7 @@ impl CollectedSnapshot {
 /// The snapshot every reader shares.
 pub struct PublishedSnapshot {
     pub system: SystemSnapshot,
+    pub environment: ExecutionEnvironment,
     pub collected_at: u64,
     pub read_at: Instant,
     pub seq: SnapshotSeq,
@@ -164,6 +169,11 @@ pub mod fixtures {
     /// The fixture snapshot's `collected_at`.
     pub const COLLECTED_AT: u64 = 1_790_000_000;
 
+    /// The fixture snapshot's execution environment.
+    pub const ENVIRONMENT: ExecutionEnvironment = ExecutionEnvironment::Container {
+        runtime: Some(crate::environment::ContainerRuntime::Podman),
+    };
+
     /// `system::fixtures::raw()` with a disk, a network and processes, so no real system's
     /// readings can match it.
     fn readings() -> RawReadings {
@@ -195,6 +205,7 @@ pub mod fixtures {
     pub fn published_as(seq: SnapshotSeq) -> PublishedSnapshot {
         CollectedSnapshot {
             system: snapshot_from(readings()),
+            environment: ENVIRONMENT,
             collected_at: COLLECTED_AT,
             read_at: Instant::now(),
         }
