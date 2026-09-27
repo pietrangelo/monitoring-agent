@@ -347,6 +347,109 @@ mod tests {
         assert!(!packed.is_empty());
     }
 
+    use crate::models::{
+        CpuInfo, DiskInfo, LoadAverage, MemoryInfo, OsInfo, ProcessInfo, SwapInfo,
+    };
+
+    /// A snapshot whose same-typed fields all hold different values, so a frame that moves
+    /// one field onto another's position can't encode to the same bytes.
+    fn distinct_snapshot(processes: u32) -> SystemSnapshot {
+        SystemSnapshot {
+            hostname: "host-h".into(),
+            os: OsInfo {
+                name: "os-name".into(),
+                version: "os-version".into(),
+                id: "os-id".into(),
+                pretty_name: "os-pretty".into(),
+            },
+            kernel: "kernel-k".into(),
+            uptime_seconds: 3333,
+            uptime_display: "uptime-u".into(),
+            load_average: LoadAverage {
+                one: 0.5,
+                five: 0.25,
+                fifteen: 0.125,
+            },
+            cpu: CpuInfo {
+                model: "cpu-model".into(),
+                physical_cores: 4,
+                logical_cores: 8,
+                usage_percent: 12.5,
+                frequency_mhz: 2400,
+            },
+            memory: MemoryInfo {
+                total_bytes: 2222,
+                used_bytes: 1111,
+                free_bytes: 555,
+                available_bytes: 666,
+                total_display: "mem-total".into(),
+                used_display: "mem-used".into(),
+                usage_percent: 33.25,
+            },
+            swap: SwapInfo {
+                total_bytes: 777,
+                used_bytes: 88,
+                free_bytes: 689,
+                total_display: "swap-total".into(),
+                used_display: "swap-used".into(),
+                usage_percent: 7.75,
+            },
+            disks: vec![
+                DiskInfo {
+                    mount_point: "disk-mount".into(),
+                    filesystem: "disk-fs".into(),
+                    total_bytes: 9999,
+                    used_bytes: 4444,
+                    free_bytes: 5555,
+                    total_display: "disk-total".into(),
+                    used_display: "disk-used".into(),
+                    usage_percent: 50.5,
+                },
+                DiskInfo {
+                    mount_point: "disk2-mount".into(),
+                    filesystem: "disk2-fs".into(),
+                    total_bytes: 8888,
+                    used_bytes: 3333,
+                    free_bytes: 5555,
+                    total_display: "disk2-total".into(),
+                    used_display: "disk2-used".into(),
+                    usage_percent: 60.25,
+                },
+            ],
+            networks: vec![],
+            top_processes: (1..=processes)
+                .map(|pid| ProcessInfo {
+                    pid,
+                    name: format!("proc-{pid}"),
+                    cpu_usage: 1.5,
+                    memory_usage_bytes: 1234,
+                    memory_usage_display: "proc-mem".into(),
+                    memory_percent: 0.75,
+                    status: "proc-status".into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The snapshot frame is a positional MessagePack array (`rmp_serde::to_vec`), so field
+    /// order is the contract with every hub already deployed. The golden is written by
+    /// `testdata/generate_snapshot_frame_v1.py`, an encoder independent of rmp-serde, and the
+    /// hub's test decodes the same bytes. A change here is a push frame change, which needs an
+    /// RFC (CLAUDE.md).
+    #[test]
+    fn snapshot_frame_encodes_to_the_published_bytes() {
+        const GOLDEN: &[u8] = include_bytes!("../../testdata/snapshot-frame-v1.msgpack");
+        let payload = snapshot_payload("system-s", distinct_snapshot(1), 4_444_444);
+        assert_eq!(rmp_serde::to_vec(&payload).unwrap(), GOLDEN);
+    }
+
+    #[test]
+    fn snapshot_frame_carries_the_ten_busiest_processes() {
+        let payload = snapshot_payload("system-s", distinct_snapshot(12), 1);
+        let pids: Vec<u32> = payload.top_processes.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, (1..=10).collect::<Vec<u32>>());
+    }
+
     #[test]
     fn hub_message_deserializes_auth_ok() {
         let msg: HubMessage = serde_json::from_str(r#"{"type":"auth_ok"}"#).unwrap();

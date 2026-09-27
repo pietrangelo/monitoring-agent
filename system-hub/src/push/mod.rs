@@ -719,6 +719,73 @@ mod tests {
         }
     }
 
+    /// The agent's test pins the same bytes, so this is the round trip across the two
+    /// independent `PushPayload` declarations (CLAUDE.md, the push frame contract).
+    #[test]
+    fn the_golden_snapshot_frame_decodes_to_every_field_in_place() {
+        let golden: &[u8] = include_bytes!("../../../testdata/snapshot-frame-v1.msgpack");
+        let p: PushPayload = rmp_serde::from_slice(golden).unwrap();
+        let identity = (
+            p.system_id.as_str(),
+            p.hostname.as_str(),
+            p.os_name.as_str(),
+        );
+        assert_eq!(identity, ("system-s", "host-h", "os-pretty"));
+        assert_eq!(
+            (p.kernel.as_str(), p.cpu_model.as_str()),
+            ("kernel-k", "cpu-model")
+        );
+        let percents = (p.cpu_percent, p.memory_percent, p.swap_percent);
+        assert_eq!(percents, (12.5, 33.25, 7.75));
+        assert_eq!(p.cpu_cores, 8);
+        let memory = (
+            p.memory_used_display.as_str(),
+            p.memory_total_display.as_str(),
+            p.memory_used_bytes,
+            p.memory_total_bytes,
+        );
+        assert_eq!(memory, ("mem-used", "mem-total", 1111, 2222));
+        assert_eq!(
+            (p.load_one, p.load_five, p.load_fifteen),
+            (0.5, 0.25, 0.125)
+        );
+        assert_eq!(
+            (p.uptime_seconds, p.uptime_display.as_str()),
+            (3333, "uptime-u")
+        );
+        let disks: Vec<(&str, f32, &str, &str)> = p
+            .disks
+            .iter()
+            .map(|d| {
+                let (total, used) = (d.total_display.as_str(), d.used_display.as_str());
+                (d.mount_point.as_str(), d.usage_percent, total, used)
+            })
+            .collect();
+        assert_eq!(
+            disks,
+            vec![
+                ("disk-mount", 50.5, "disk-total", "disk-used"),
+                ("disk2-mount", 60.25, "disk2-total", "disk2-used"),
+            ]
+        );
+        let processes: Vec<(u32, &str, f32, &str, f32)> = p
+            .top_processes
+            .iter()
+            .map(|q| {
+                let display = q.memory_usage_display.as_str();
+                (
+                    q.pid,
+                    q.name.as_str(),
+                    q.cpu_usage,
+                    display,
+                    q.memory_percent,
+                )
+            })
+            .collect();
+        assert_eq!(processes, vec![(1, "proc-1", 1.5, "proc-mem", 0.75)]);
+        assert_eq!(p.timestamp, 4_444_444);
+    }
+
     #[test]
     fn a_snapshot_frame_and_an_application_frame_never_decode_as_each_other() {
         let golden: &[u8] = include_bytes!("../../../testdata/application-frame-v1.msgpack");
