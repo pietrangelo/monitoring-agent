@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::applications::{HeldRound, RecentRounds, RoundDigester};
 use crate::db::Database;
 use crate::models::SystemInfo;
 use serde::Serialize;
@@ -43,11 +44,25 @@ impl Default for LiveMetrics {
     }
 }
 
+/// What the hub holds in memory of one system's applications (RFC 0009 §8).
+#[derive(Debug, Default)]
+pub struct SystemApplications {
+    /// The round the dashboard shows. A push disconnect keeps it; it goes stale on its own.
+    pub shown: Option<HeldRound>,
+    /// The rounds accepted most recently, surviving disconnects, so a re-send is recognised.
+    pub recent: RecentRounds,
+}
+
 pub struct AppState {
     pub db: Arc<Database>,
     pub systems_cache: RwLock<Vec<SystemInfo>>,
     /// Per-system latest live metrics (updated by push or poll).
     pub live_metrics: RwLock<HashMap<String, LiveMetrics>>,
+    /// Per-system applications, keyed by system id. Lock order: the database mutex, then
+    /// this; never take the database mutex while holding it.
+    pub live_applications: RwLock<HashMap<String, SystemApplications>>,
+    /// The one digest key every ingestion path shares.
+    pub digester: RoundDigester,
 }
 
 impl AppState {
@@ -57,6 +72,8 @@ impl AppState {
             db,
             systems_cache: RwLock::new(systems),
             live_metrics: RwLock::new(HashMap::new()),
+            live_applications: RwLock::new(HashMap::new()),
+            digester: RoundDigester::new(),
         })
     }
 

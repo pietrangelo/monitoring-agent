@@ -23,3 +23,4 @@ pub mod report;
 pub mod round;
 pub mod scrape_loop;
 pub mod scraper;
+pub mod wire;

@@ -77,7 +77,10 @@ monitoring-agent/
     ├── state.rs                # Shared state (history ring buffers)
     ├── auth.rs                 # Token auth middleware
     ├── alerts.rs               # Alert engine (thresholds, cooldowns)
-    ├── push.rs                 # Push client → connects to Hub
+    ├── push/
+    │   ├── mod.rs              # Push client → connects to Hub
+    │   └── application_frame.rs # Scrape rounds as application frames
+    ├── applications/           # Spring Boot scraping (config, actuator, rounds, wire DTO)
     ├── collectors/
     │   ├── mod.rs              # Background metric collector
     │   ├── system.rs           # CPU, memory, disk, network, processes
@@ -102,12 +105,16 @@ monitoring-agent/system-hub/
     ├── state.rs                # Shared state + live metrics cache
     ├── db.rs                   # SQLite: migrations, CRUD, queries
     ├── collector.rs            # HTTP poller (pulls agent /api/system)
+    ├── applications.rs         # Scrape rounds: admission, freshness, metric points
+    ├── retention.rs            # Periodic pruning of app:* points
     ├── push/
     │   ├── mod.rs              # Push receiver (accepts agent WS connections)
+    │   ├── application_wire.rs # Application frame decoding and conversion
     │   └── config.rs           # Push token, socket limits, deadlines
     └── routes/
         ├── mod.rs
         ├── api.rs              # REST endpoints
+        ├── applications.rs     # A system's latest scrape round
         └── sse.rs              # SSE stream with live metrics
 ```
 
@@ -274,6 +281,7 @@ scrapes each one's Actuator every interval and serves the result on `GET /api/ap
 | `GET /api/summary` | GET | Aggregated stats (online/offline/alerts) |
 | `GET /api/systems/{id}/metrics?metric=cpu&limit=300` | GET | Time-series for a specific metric |
 | `GET /api/systems/{id}/history?limit=300` | GET | Combined CPU + memory history |
+| `GET /api/systems/{id}/applications` | GET | The system's latest Spring Boot scrape round (from push), with `received_at`, `age_secs` and `freshness` (`fresh`/`stale`) computed on the hub; all three `null` and `applications: []` when none is held. History: `/metrics?metric=app:<name>:<gauge>` |
 | `GET /api/alerts?acknowledged=false&limit=50` | GET | Alert history |
 | `POST /api/alerts/{id}/acknowledge` | POST | Acknowledge an alert |
 | `GET /api/stream/summary` | **SSE** | Live summary + system list + live metrics every 5s |
@@ -341,6 +349,27 @@ MessagePack({
 ```
 
 MessagePack is ~50-70% smaller than equivalent JSON. A typical 2 KB JSON snapshot compresses to ~600-800 bytes.
+
+**Application frames (on each scrape round):**
+
+An agent with `SPRING_BOOT_APPS` also sends each scrape round on the same connection, once
+right after `auth_ok` if a round exists, then whenever a new one is published. It is a
+positional 5-element MessagePack array:
+
+```
+[ "applications.v1", run: String (UUID), seq: u64, interval_secs: u64,
+  [ [ name: String, health: String, version: String | nil, { gauge: f64 } ], … ] ]
+```
+
+`health` is `up`, `down`, `out_of_service`, `unknown` or `unreachable`; gauges use the wire
+names of `/api/applications`. The hub refuses a whole round with an unknown `kind`, a `run`
+that isn't a UUID, an interval outside 10..=3600 s, more than 16 applications, or an invalid or
+repeated name. It reads an unknown health as `unknown`, skips unknown gauges and non-finite
+values, and cuts versions to 64 characters. It drops an exact re-send of one of the system's
+last 8 accepted rounds, and more than 2 rounds per connection within 8 s (then one per 8 s).
+An accepted round's points are stored at the hub's time as `app:<name>:<gauge>` and
+`app:<name>:up` (1 when `up`, else 0). A hub older than this frame drops it silently and keeps
+storing snapshots. The golden bytes are `testdata/application-frame-v1.msgpack`.
 
 ---
 
@@ -427,11 +456,13 @@ The hub stores everything in **SQLite** (`system-hub.db`, created automatically)
 | Table | Contents |
 |---|---|
 | `systems` | Registered agents, URLs, tokens, status, OS info |
-| `metrics` | Time-series: cpu, memory, swap, load1, load5, disk:{mount} |
+| `metrics` | Time-series: cpu, memory, swap, load1, load5, disk:{mount}, and per application app:{name}:{gauge} and app:{name}:up |
 | `alerts` | Alert history, one record per alert incident, with acknowledge support |
 | `metric_retention` | Per-system per-metric retention (default 24h) |
 
-Metrics are automatically pruned after their retention period. Run `sqlite3 system-hub.db` for direct queries.
+Snapshot metrics are pruned after their retention period each time that metric is inserted.
+Application metrics (`app:*`) are pruned by a task every 10 minutes, past their retention
+row or 24h. Run `sqlite3 system-hub.db` for direct queries.
 
 ---
 
