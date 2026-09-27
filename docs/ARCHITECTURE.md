@@ -89,8 +89,8 @@ Aggregates data from many `system-agent` instances. Responsibilities:
   between DB writes.
 - Exposes a REST API and an SSE summary stream (`routes/`), and serves a static fleet
   dashboard (`static/index.html`) that updates every 5s via SSE. The dashboard is served from
-  `HUB_STATIC_DIR` when it is set (it must then be a directory, or the hub refuses to start),
-  and from `static` under the working directory otherwise. The container image sets it to
+  `HUB_STATIC_DIR` when it is set (it must then be a directory the hub can search, or the
+  hub refuses to start), and from `static` under the working directory otherwise. The container image sets it to
   `/usr/share/system-hub/static`, outside the `/app` data volume, because a named volume is
   filled from the image only when it is created and would otherwise pin the dashboard to the
   volume's first image. `main.rs::app` assembles the served router, so a test can reach it.

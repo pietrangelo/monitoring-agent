@@ -249,7 +249,7 @@ scrapes each one's Actuator every interval and serves the result on `GET /api/ap
 | Variable | Default | Description |
 |---|---|---|
 | `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning); a value that isn't valid UTF-8 makes the hub refuse to start |
-| `HUB_STATIC_DIR` | `static` | Directory the dashboard is served from. Unset or empty means `static` under the working directory, unchecked. A set value must be a directory, or the hub refuses to start. The container image sets `/usr/share/system-hub/static` |
+| `HUB_STATIC_DIR` | `static` | Directory the dashboard is served from. Unset or empty means `static` under the working directory, unchecked. A set value must be a directory the hub can search (read permission alone is not enough), or the hub refuses to start. The container image sets `/usr/share/system-hub/static` |
 
 ---
 

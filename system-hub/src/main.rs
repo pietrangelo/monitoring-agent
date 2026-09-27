@@ -75,6 +75,7 @@ async fn run() -> Result<(), StartupError> {
         push::PushAuth::from_env(std::env::var("HUB_PUSH_TOKEN")).map_err(StartupError::Config)?;
     let static_dir = StaticDir::from_env(std::env::var_os(StaticDir::VARIABLE))
         .check()
+        .await
         .map_err(StartupError::StaticDir)?;
 
     let db = Arc::new(db::Database::new("system-hub.db").map_err(StartupError::Database)?);
@@ -124,19 +125,24 @@ impl StaticDir {
         }
     }
 
-    /// A configured path must be a readable directory (a symlink to one counts); the
-    /// default is served as it is, unchecked.
-    fn check(self) -> Result<ServedStaticDir, StaticDirError> {
+    /// A configured path must be a directory the hub can look inside (a symlink to one
+    /// counts); the default is served as it is, unchecked. Looking inside takes search
+    /// permission, which is what `ServeDir` needs; listing the directory is not.
+    async fn check(self) -> Result<ServedStaticDir, StaticDirError> {
         let path = match self {
             Self::Default => return Ok(ServedStaticDir(PathBuf::from("static"))),
             Self::Configured(path) => path,
         };
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_dir() => Ok(ServedStaticDir(path)),
-            Ok(_) => Err(StaticDirError::NotADirectory(path)),
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(StaticDirError::NotADirectory(path)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(StaticDirError::Missing(path))
+                return Err(StaticDirError::Missing(path));
             }
+            Err(err) => return Err(StaticDirError::Unreadable(path, err.kind())),
+        }
+        match tokio::fs::metadata(path.join(".")).await {
+            Ok(_) => Ok(ServedStaticDir(path)),
             Err(err) => Err(StaticDirError::Unreadable(path, err.kind())),
         }
     }
@@ -205,8 +211,8 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use tower::ServiceExt;
 
-    #[test]
-    fn the_static_dir_is_configured_by_a_non_empty_variable_and_the_default_otherwise() {
+    #[tokio::test]
+    async fn the_static_dir_is_configured_by_a_non_empty_variable_and_the_default_otherwise() {
         let not_utf8 = OsString::from_vec(b"/srv/st\xffatic".to_vec());
         let configured = |path: &OsString| StaticDir::Configured(PathBuf::from(path));
         let cases = [
@@ -238,6 +244,7 @@ mod tests {
         }
         let default = StaticDir::Default
             .check()
+            .await
             .map(|dir| dir.path().to_path_buf());
         assert_eq!(
             default.ok(),
@@ -247,8 +254,8 @@ mod tests {
     }
 
     /// A configured directory, checked as `run` checks it.
-    fn served(path: &Path) -> ServedStaticDir {
-        match StaticDir::Configured(path.to_path_buf()).check() {
+    async fn served(path: &Path) -> ServedStaticDir {
+        match StaticDir::Configured(path.to_path_buf()).check().await {
             Ok(dir) => dir,
             Err(err) => panic!("{err}"),
         }
@@ -279,7 +286,7 @@ mod tests {
             })
             .collect();
         for (dir, marker) in &dirs {
-            let static_dir = served(dir.path());
+            let static_dir = served(dir.path()).await;
             let app = app(state.clone(), push::PushAuth::Open, &static_dir);
             for uri in ["/", "/index.html"] {
                 let (status, body) = get(app.clone(), uri).await;
@@ -290,7 +297,11 @@ mod tests {
         // No fallback to the default `static/`, which exists in the crate: a configured
         // directory without a page answers 404, not the default directory's page.
         let empty = tempfile::tempdir().unwrap();
-        let app = app(state.clone(), push::PushAuth::Open, &served(empty.path()));
+        let app = app(
+            state.clone(),
+            push::PushAuth::Open,
+            &served(empty.path()).await,
+        );
         for uri in ["/", "/index.html"] {
             let (status, _) = get(app.clone(), uri).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "no fallback for {uri}");
@@ -305,7 +316,7 @@ mod tests {
         let app = app(
             state::AppState::new(db),
             push::PushAuth::Open,
-            &served(static_dir.path()),
+            &served(static_dir.path()).await,
         );
 
         let (status, body) = get(app.clone(), "/api/systems").await;
