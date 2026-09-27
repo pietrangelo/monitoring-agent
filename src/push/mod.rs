@@ -18,13 +18,15 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::applications::round::ScrapeRound;
 use crate::applications::scrape_loop::RoundReceiver;
-use crate::collectors;
+use crate::collectors::{SnapshotReceiver, monotonic_now};
 use crate::models::SystemSnapshot;
+use crate::snapshot::{PublishedSnapshot, SnapshotFreshness, SnapshotSeq};
 
 mod application_frame;
 
@@ -79,49 +81,170 @@ struct HubMessage {
     message: String,
 }
 
-/// Connect to the hub via WebSocket and push system snapshots using MessagePack, and each
-/// scrape round `rounds` publishes as an application frame. `rounds` is `None` when
-/// applications are off.
+/// What the push client sends, kept across its connections.
+pub struct PushFeed {
+    pub snapshots: SnapshotCursor,
+    /// The scrape loop's rounds: `None` when applications are off.
+    pub rounds: Option<RoundReceiver>,
+}
+
+/// The published snapshots, and which of them the hub was last sent.
+pub struct SnapshotCursor {
+    snapshots: SnapshotReceiver,
+    last_sent: Option<SnapshotSeq>,
+}
+
+impl SnapshotCursor {
+    pub fn new(snapshots: SnapshotReceiver) -> Self {
+        Self {
+            snapshots,
+            last_sent: None,
+        }
+    }
+
+    /// What a push tick at `now` owes the hub. Sent snapshots are told apart by seq, never
+    /// by time, so a wall clock step neither repeats nor hides one.
+    fn due(&self, now: std::time::Instant) -> Due {
+        let snapshot = self.snapshots.borrow().clone();
+        match snapshot.freshness(now) {
+            SnapshotFreshness::Stale => Due::Stale,
+            SnapshotFreshness::Fresh if self.last_sent == Some(snapshot.seq) => Due::Unchanged,
+            SnapshotFreshness::Fresh => Due::Send(snapshot),
+        }
+    }
+
+    /// Waits until the published snapshot is fresh, so a hung collector makes no handshake.
+    /// `Err` if the collector has ended, when none ever will be.
+    async fn fresh(&mut self) -> Result<(), watch::error::RecvError> {
+        let is_fresh =
+            |s: &Arc<PublishedSnapshot>| s.freshness(monotonic_now()) == SnapshotFreshness::Fresh;
+        self.snapshots.wait_for(is_fresh).await.map(drop)
+    }
+
+    fn mark_sent(&mut self, seq: SnapshotSeq) {
+        self.last_sent = Some(seq);
+    }
+}
+
+/// What a push tick owes the hub.
+enum Due {
+    Send(Arc<PublishedSnapshot>),
+    /// The hub has the published snapshot already.
+    Unchanged,
+    /// The published snapshot is stale: the connection closes, so the hub marks the system
+    /// offline.
+    Stale,
+}
+
+/// Why `run_push_client` returned an error.
+#[derive(Debug)]
+pub enum PushError {
+    /// The system collector has ended, so no fresh snapshot will come: pushing is over.
+    CollectorEnded,
+    /// Connecting or authenticating failed; worth another try.
+    Connection(String),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CollectorEnded => write!(f, "the system collector has ended"),
+            Self::Connection(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// Why a connected push session ended.
+enum SessionEnd {
+    /// A send failed, or the hub hung up.
+    Lost,
+    /// The published snapshot went stale.
+    Stale,
+}
+
+/// Connect to the hub via WebSocket, once the published snapshot is fresh, and push each
+/// published snapshot once using MessagePack, and each scrape round as an application frame.
 pub async fn run_push_client(
     hub_url: &str,
     token: &str,
     system_id: &str,
     push_interval_secs: u64,
-    rounds: &mut Option<RoundReceiver>,
-) -> Result<(), String> {
+    feed: &mut PushFeed,
+) -> Result<(), PushError> {
+    feed.snapshots
+        .fresh()
+        .await
+        .map_err(|_| PushError::CollectorEnded)?;
     let url = format!("{}/api/push", hub_url.trim_end_matches('/'));
     tracing::info!("🔌 Connecting to hub via push: {url}");
-    let (mut ws, _) = connect_async(&url).await.map_err(|e| e.to_string())?;
-    authenticate(&mut ws, system_id, token).await?;
+    let (mut ws, _) = connect_async(&url)
+        .await
+        .map_err(|e| PushError::Connection(e.to_string()))?;
+    authenticate(&mut ws, system_id, token)
+        .await
+        .map_err(PushError::Connection)?;
 
     // A round re-sent after a reconnect keeps its round id, so the hub drops it as a duplicate
     // if it already has it.
-    if let Some(round) = current_round(rounds)
-        && send_round(&mut ws, &round).await.is_err()
-    {
-        tracing::error!("Push connection lost, will retry...");
-        return Ok(());
-    }
-
-    let mut tick = interval(Duration::from_secs(push_interval_secs.max(2)));
-    let mut ping_tick = interval(Duration::from_secs(30));
-    loop {
-        let sent = tokio::select! {
-            _ = tick.tick() => send_snapshot(&mut ws, system_id).await,
-            _ = ping_tick.tick() => ws.send(Message::Ping(vec![])).await,
-            round = next_round(rounds), if rounds.is_some() => match round {
-                Some(round) => send_round(&mut ws, &round).await,
-                None => Ok(()),
-            },
-        };
-        if sent.is_err() {
-            tracing::error!("Push connection lost, will retry...");
-            break;
+    let resent = match current_round(&mut feed.rounds) {
+        Some(round) => send_round(&mut ws, &round).await.is_ok(),
+        None => true,
+    };
+    let end = if resent {
+        pump(&mut ws, system_id, push_interval_secs, feed).await
+    } else {
+        SessionEnd::Lost
+    };
+    match end {
+        SessionEnd::Lost => tracing::error!("Push connection lost, will retry..."),
+        SessionEnd::Stale => {
+            tracing::warn!("The snapshot is stale; closing the push connection");
+            if let Err(err) = ws.close(None).await {
+                tracing::debug!("Closing the push connection failed: {err}");
+            }
         }
     }
-
     tracing::warn!("Push connection closed");
     Ok(())
+}
+
+/// Sends snapshots, pings and rounds over a connected, authenticated `ws` until the session
+/// ends.
+async fn pump<S>(ws: &mut S, system_id: &str, interval_secs: u64, feed: &mut PushFeed) -> SessionEnd
+where
+    S: Sink<Message>
+        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let rounds = &mut feed.rounds;
+    let mut tick = interval(Duration::from_secs(interval_secs.max(2)));
+    let mut ping_tick = interval(Duration::from_secs(30));
+    loop {
+        let alive = tokio::select! {
+            _ = tick.tick() => match feed.snapshots.due(monotonic_now()) {
+                Due::Send(snapshot) => {
+                    send_snapshot(ws, system_id, &mut feed.snapshots, &snapshot).await.is_ok()
+                }
+                Due::Unchanged => true,
+                Due::Stale => return SessionEnd::Stale,
+            },
+            _ = ping_tick.tick() => ws.send(Message::Ping(vec![])).await.is_ok(),
+            round = next_round(rounds), if rounds.is_some() => match round {
+                Some(round) => send_round(ws, &round).await.is_ok(),
+                None => true,
+            },
+            // A tick with no new snapshot sends nothing, so a hub hanging up is noticed here.
+            incoming = ws.next() => !hub_hung_up(&incoming),
+        };
+        if !alive {
+            return SessionEnd::Lost;
+        }
+    }
+}
+
+/// Whether what the hub's side of the socket yielded means the connection is gone.
+fn hub_hung_up<E>(incoming: &Option<Result<Message, E>>) -> bool {
+    matches!(incoming, Some(Ok(Message::Close(_)) | Err(_)) | None)
 }
 
 /// Sends the auth message and reads the hub's answer; `Err` on an `auth_error`.
@@ -154,39 +277,44 @@ where
     Ok(())
 }
 
-/// Collects a snapshot and sends it as a snapshot frame. One that can't be encoded is
-/// skipped, never sent empty.
-async fn send_snapshot<S>(ws: &mut S, system_id: &str) -> Result<(), S::Error>
+/// Sends `snapshot` as a snapshot frame stamped with its `collected_at`, and marks it sent.
+/// One that can't be encoded is skipped, never sent empty.
+async fn send_snapshot<S>(
+    ws: &mut S,
+    system_id: &str,
+    cursor: &mut SnapshotCursor,
+    snapshot: &PublishedSnapshot,
+) -> Result<(), S::Error>
 where
     S: Sink<Message> + Unpin,
 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let payload = snapshot_payload(system_id, collectors::system::collect(), now);
-    match rmp_serde::to_vec(&payload) {
+    let payload = snapshot_payload(system_id, &snapshot.system, snapshot.collected_at);
+    let sent = match rmp_serde::to_vec(&payload) {
         Ok(frame) => ws.send(Message::Binary(frame)).await,
         Err(err) => {
             tracing::warn!("Skipping a snapshot frame that failed to encode: {err}");
             Ok(())
         }
+    };
+    if sent.is_ok() {
+        cursor.mark_sent(snapshot.seq);
     }
+    sent
 }
 
-/// The snapshot frame for one snapshot, stamped with the agent's clock.
-fn snapshot_payload(system_id: &str, snap: SystemSnapshot, timestamp: u64) -> PushPayload {
+/// The snapshot frame for one snapshot, stamped with `timestamp`.
+fn snapshot_payload(system_id: &str, snap: &SystemSnapshot, timestamp: u64) -> PushPayload {
     PushPayload {
         system_id: system_id.to_string(),
-        hostname: snap.hostname,
-        os_name: snap.os.pretty_name,
-        kernel: snap.kernel,
+        hostname: snap.hostname.clone(),
+        os_name: snap.os.pretty_name.clone(),
+        kernel: snap.kernel.clone(),
         cpu_percent: snap.cpu.usage_percent,
         cpu_cores: snap.cpu.logical_cores,
-        cpu_model: snap.cpu.model,
+        cpu_model: snap.cpu.model.clone(),
         memory_percent: snap.memory.usage_percent,
-        memory_used_display: snap.memory.used_display,
-        memory_total_display: snap.memory.total_display,
+        memory_used_display: snap.memory.used_display.clone(),
+        memory_total_display: snap.memory.total_display.clone(),
         memory_used_bytes: snap.memory.used_bytes,
         memory_total_bytes: snap.memory.total_bytes,
         swap_percent: snap.swap.usage_percent,
@@ -194,7 +322,7 @@ fn snapshot_payload(system_id: &str, snap: SystemSnapshot, timestamp: u64) -> Pu
         load_five: snap.load_average.five,
         load_fifteen: snap.load_average.fifteen,
         uptime_seconds: snap.uptime_seconds,
-        uptime_display: snap.uptime_display,
+        uptime_display: snap.uptime_display.clone(),
         disks: snap
             .disks
             .iter()
@@ -439,13 +567,13 @@ mod tests {
     #[test]
     fn snapshot_frame_encodes_to_the_published_bytes() {
         const GOLDEN: &[u8] = include_bytes!("../../testdata/snapshot-frame-v1.msgpack");
-        let payload = snapshot_payload("system-s", distinct_snapshot(1), 4_444_444);
+        let payload = snapshot_payload("system-s", &distinct_snapshot(1), 4_444_444);
         assert_eq!(rmp_serde::to_vec(&payload).unwrap(), GOLDEN);
     }
 
     #[test]
     fn snapshot_frame_carries_the_ten_busiest_processes() {
-        let payload = snapshot_payload("system-s", distinct_snapshot(12), 1);
+        let payload = snapshot_payload("system-s", &distinct_snapshot(12), 1);
         let pids: Vec<u32> = payload.top_processes.iter().map(|p| p.pid).collect();
         assert_eq!(pids, (1..=10).collect::<Vec<u32>>());
     }
@@ -455,6 +583,52 @@ mod tests {
         let msg: HubMessage = serde_json::from_str(r#"{"type":"auth_ok"}"#).unwrap();
         assert_eq!(msg.msg_type, "auth_ok");
         assert_eq!(msg.message, "");
+    }
+
+    #[test]
+    fn only_a_close_an_error_or_the_end_means_the_hub_hung_up() {
+        type Incoming = Option<Result<Message, ()>>;
+        let cases: [(&str, Incoming, bool); 5] = [
+            ("a close frame", Some(Ok(Message::Close(None))), true),
+            ("a read error", Some(Err(())), true),
+            ("the end of the stream", None, true),
+            (
+                "a text message",
+                Some(Ok(Message::Text("hi".into()))),
+                false,
+            ),
+            ("a ping", Some(Ok(Message::Ping(vec![]))), false),
+        ];
+        for (name, incoming, expected) in cases {
+            assert_eq!(hub_hung_up(&incoming), expected, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn a_push_tick_owes_each_fresh_snapshot_once() {
+        use crate::snapshot::fixtures;
+        let (publisher, snapshots) = fixtures::channel(fixtures::published());
+        let mut cursor = SnapshotCursor::new(snapshots);
+        let due = |cursor: &SnapshotCursor| match cursor.due(monotonic_now()) {
+            Due::Send(snapshot) => format!("send {:?}", snapshot.seq),
+            Due::Unchanged => "unchanged".into(),
+            Due::Stale => "stale".into(),
+        };
+        assert_eq!(due(&cursor), "send SnapshotSeq(0)", "nothing sent yet");
+        cursor.mark_sent(SnapshotSeq::FIRST);
+        assert_eq!(due(&cursor), "unchanged", "sent already");
+        // The next snapshot was read after the wall clock stepped back an hour.
+        let mut next = fixtures::published_as(SnapshotSeq::FIRST.next());
+        next.collected_at = fixtures::COLLECTED_AT - 3600;
+        publisher.send_replace(Arc::new(next));
+        assert_eq!(
+            due(&cursor),
+            "send SnapshotSeq(1)",
+            "a new seq, whatever its time"
+        );
+        cursor.mark_sent(SnapshotSeq::FIRST.next());
+        publisher.send_replace(Arc::new(fixtures::stale()));
+        assert_eq!(due(&cursor), "stale", "a stale snapshot, sent or not");
     }
 
     #[test]
@@ -478,6 +652,7 @@ mod tests {
         use crate::alerts::AgentRun;
         use crate::applications::round::ScrapeRound;
         use crate::applications::wire::sample_round;
+        use crate::snapshot::fixtures;
         use std::collections::BTreeMap;
         use std::sync::Arc;
         use tokio::net::{TcpListener, TcpStream};
@@ -576,27 +751,57 @@ mod tests {
                 .collect()
         }
 
-        fn snapshots(frames: &[Vec<u8>]) -> usize {
+        fn snapshots_in(frames: &[Vec<u8>]) -> usize {
             frames
                 .iter()
                 .filter(|bytes| application_frame(bytes).is_none())
                 .count()
         }
 
-        /// Runs the client against a hub that watches the connection for `window` after the
-        /// handshake while `during` runs, then hangs up; returns what the hub received.
-        /// The client runs as a task of its own on a multi-thread runtime, so a client that
-        /// never yields fails the timeout instead of starving the test.
+        /// A snapshot channel whose collector publishes a new snapshot every 500 ms, so every
+        /// push tick has one to send, until the returned task is aborted.
+        fn collecting() -> (SnapshotReceiver, tokio::task::JoinHandle<()>) {
+            let (publisher, snapshots) = watch::channel(Arc::new(fixtures::published()));
+            let collector = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let seq = publisher.borrow().seq.next();
+                    publisher.send_replace(Arc::new(fixtures::published_as(seq)));
+                }
+            });
+            (snapshots, collector)
+        }
+
+        /// `push_session_on` with a collector publishing throughout.
         async fn push_session(
             rounds: &mut Option<RoundReceiver>,
             window: Duration,
             during: impl std::future::Future<Output = ()>,
         ) -> Vec<Vec<u8>> {
+            let (snapshots, collector) = collecting();
+            let frames = push_session_on(snapshots, rounds, window, during).await;
+            collector.abort();
+            frames
+        }
+
+        /// Runs the client against a hub that watches the connection for `window` after the
+        /// handshake while `during` runs, then hangs up; returns what the hub received.
+        /// The client runs as a task of its own on a multi-thread runtime, so a client that
+        /// never yields fails the timeout instead of starving the test.
+        async fn push_session_on(
+            snapshots: SnapshotReceiver,
+            rounds: &mut Option<RoundReceiver>,
+            window: Duration,
+            during: impl std::future::Future<Output = ()>,
+        ) -> Vec<Vec<u8>> {
             let (url, listener) = listen().await;
-            let mut owned = rounds.take();
+            let mut feed = PushFeed {
+                snapshots: SnapshotCursor::new(snapshots),
+                rounds: rounds.take(),
+            };
             let client = tokio::spawn(async move {
-                let pushed = run_push_client(&url, "token", "test-system", 2, &mut owned).await;
-                (pushed, owned)
+                let pushed = run_push_client(&url, "token", "test-system", 2, &mut feed).await;
+                (pushed, feed.rounds)
             });
             let mut ws = accept_agent(&listener).await;
             let (frames, ()) = tokio::join!(binaries_within(&mut ws, window), during);
@@ -608,6 +813,69 @@ mod tests {
             assert!(pushed.is_ok(), "the client ends once the hub hangs up");
             *rounds = owned;
             frames
+        }
+
+        /// Runs the client on `snapshots`, with applications off, until aborted.
+        fn spawn_client(url: String, snapshots: SnapshotReceiver) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                let mut feed = PushFeed {
+                    snapshots: SnapshotCursor::new(snapshots),
+                    rounds: None,
+                };
+                let ended = run_push_client(&url, "token", "test-system", 2, &mut feed).await;
+                assert!(ended.is_ok(), "the client ends cleanly: {ended:?}");
+            })
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stale_snapshot_closes_the_connection() {
+            let (publisher, snapshots) = fixtures::channel(fixtures::published());
+            let (url, listener) = listen().await;
+            let client = spawn_client(url, snapshots);
+            let mut ws = accept_agent(&listener).await;
+            publisher.send_replace(Arc::new(fixtures::stale()));
+            let closed = tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(message) = ws.next().await {
+                    if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                        return;
+                    }
+                }
+            })
+            .await;
+            assert!(closed.is_ok(), "the agent closes by the next push tick");
+            let ended = tokio::time::timeout(Duration::from_secs(1), client).await;
+            assert!(matches!(ended, Ok(Ok(()))), "and its push session ends");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stale_agent_makes_no_handshake_until_a_fresh_snapshot() {
+            let (publisher, snapshots) = fixtures::channel(fixtures::stale());
+            let (url, listener) = listen().await;
+            let client = spawn_client(url, snapshots);
+            let early = tokio::time::timeout(Duration::from_millis(1_500), listener.accept());
+            assert!(
+                early.await.is_err(),
+                "no connection while the snapshot is stale"
+            );
+            // Fresh on the monotonic clock, though read after the wall clock stepped back.
+            let mut fresh = fixtures::published_as(SnapshotSeq::FIRST.next());
+            fresh.collected_at = fixtures::COLLECTED_AT - 3600;
+            publisher.send_replace(Arc::new(fresh));
+            let connected =
+                tokio::time::timeout(Duration::from_secs(2), accept_agent(&listener)).await;
+            assert!(
+                connected.is_ok(),
+                "a handshake once a fresh snapshot is published"
+            );
+            client.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_snapshot_is_pushed_once_however_many_ticks_see_it() {
+            let (publisher, snapshots) = watch::channel(Arc::new(fixtures::published()));
+            let frames = push_session_on(snapshots, &mut None, LONG_WATCH, async {}).await;
+            assert_eq!(snapshots_in(&frames), 1, "the t=2 s tick has nothing new");
+            drop(publisher);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -625,7 +893,7 @@ mod tests {
                     "{case}: the first message after the handshake is the current round"
                 );
                 assert_eq!(application_seqs(&frames), [5], "{case}: sent once");
-                assert!(snapshots(&frames) > 0, "{case}: snapshots still flow");
+                assert!(snapshots_in(&frames) > 0, "{case}: snapshots still flow");
                 assert!(rounds.is_some(), "{case}: an open channel is kept");
                 drop(sender);
             }
@@ -655,7 +923,7 @@ mod tests {
             let mut rounds = Some(receiver);
             let frames = push_session(&mut rounds, LONG_WATCH, async {}).await;
             assert_eq!(application_seqs(&frames), [] as [u64; 0], "no stale round");
-            assert!(snapshots(&frames) > 0, "snapshots still flow");
+            assert!(snapshots_in(&frames) > 0, "snapshots still flow");
             assert!(
                 rounds.is_none(),
                 "the closed channel is given up, so no later connection looks at it again"
@@ -682,7 +950,11 @@ mod tests {
                     expected,
                     "{case}: only the handshake's round, never re-sent on close"
                 );
-                assert_eq!(snapshots(&frames), 2, "{case}: the t=0 and t=2 s snapshots");
+                assert_eq!(
+                    snapshots_in(&frames),
+                    2,
+                    "{case}: the t=0 and t=2 s snapshots"
+                );
                 assert!(rounds.is_none(), "{case}: the closed channel is given up");
             }
         }
@@ -691,7 +963,7 @@ mod tests {
         async fn without_applications_only_snapshots_are_sent() {
             let mut rounds = None;
             let frames = push_session(&mut rounds, LONG_WATCH, async {}).await;
-            assert!(snapshots(&frames) > 0, "snapshots flow");
+            assert!(snapshots_in(&frames) > 0, "snapshots flow");
             assert_eq!(application_seqs(&frames), [] as [u64; 0]);
         }
     }

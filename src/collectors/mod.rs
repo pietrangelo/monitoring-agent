@@ -17,65 +17,315 @@
 pub mod containers;
 pub mod packages;
 pub mod ports;
+pub mod sampler;
 pub mod services;
 pub mod system;
 
+use crate::snapshot::{CollectedSnapshot, PRIMING, PublishedSnapshot, STALENESS_BOUND};
 use crate::state::AppState;
+use sampler::{Gather, Sampler};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{Duration, interval};
+use tokio::sync::watch;
+use tokio::task::{JoinError, spawn_blocking};
+use tokio::time::{Duration, Instant, Interval, MissedTickBehavior, interval_at};
 
-/// Background task: collect metrics every 2s, push to history, evaluate alerts.
-pub async fn background_collector(state: Arc<AppState>) {
-    let mut tick = interval(Duration::from_secs(2));
+/// Where the background collector publishes each snapshot, and where every reader reads it.
+pub type SnapshotSender = watch::Sender<Arc<PublishedSnapshot>>;
+pub type SnapshotReceiver = watch::Receiver<Arc<PublishedSnapshot>>;
+
+/// Now, on the runtime's monotonic clock (which tests can pause and advance), as the plain
+/// `std` instant the domain takes.
+pub fn monotonic_now() -> std::time::Instant {
+    Instant::now().into_std()
+}
+
+/// How often the background collector reads the system.
+pub const COLLECT_PERIOD: Duration = Duration::from_secs(2);
+
+/// The startup snapshot: primes a sampler from `source`, waits out the priming interval and
+/// reads, all off the runtime. `Err` if the source panicked.
+pub async fn first_snapshot<G: Gather>(
+    source: G,
+) -> Result<(Sampler<G>, CollectedSnapshot), JoinError> {
+    let mut sampler = spawn_blocking(move || Sampler::prime(source)).await?;
+    loop {
+        tokio::time::sleep(PRIMING).await;
+        match read_off_runtime(sampler).await? {
+            (sampler, Some(collected)) => return Ok((sampler, collected)),
+            (early, None) => sampler = early,
+        }
+    }
+}
+
+/// The sampler the collector reads with: none after a panic whose rebuild panicked too.
+enum Slot<G> {
+    Ready(Sampler<G>),
+    Broken,
+}
+
+/// Background task: every `COLLECT_PERIOD`, reads the system off the runtime, publishes the
+/// snapshot, records it in history and evaluates alerts on it. The first tick is a full
+/// period after the startup snapshot `publisher` already holds. A panic in a tick rebuilds
+/// the sampler from `rebuild`; the published snapshot stays the previous one meanwhile.
+pub async fn background_collector<G, F>(
+    state: Arc<AppState>,
+    publisher: SnapshotSender,
+    sampler: Sampler<G>,
+    rebuild: F,
+) where
+    G: Gather,
+    F: Fn() -> G + Send + Clone + 'static,
+{
+    let startup = publisher.borrow().clone();
+    record(&state, &startup);
+    let mut tick = interval_at(Instant::now() + COLLECT_PERIOD, COLLECT_PERIOD);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut slot = Slot::Ready(sampler);
     loop {
         tick.tick().await;
-        let snap = system::collect();
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Push to history
-        {
-            let mut hist = state.history.write();
-            hist.push_cpu(snap.cpu.usage_percent, now);
-            hist.push_memory(snap.memory.usage_percent, now);
-            hist.push_swap(snap.swap.usage_percent, now);
-            hist.push_load1(snap.load_average.one as f32, now);
-            hist.push_load5(snap.load_average.five as f32, now);
-            hist.push_load15(snap.load_average.fifteen as f32, now);
-            for disk in &snap.disks {
-                hist.push_disk(&disk.mount_point, disk.usage_percent, now);
+        slot = match slot {
+            Slot::Ready(sampler) => {
+                let stale_at = Instant::from_std(publisher.borrow().read_at + STALENESS_BOUND);
+                match watched(read_off_runtime(sampler), stale_at).await {
+                    Ok((sampler, collected)) => {
+                        if let Some(collected) = collected {
+                            publish(&state, &publisher, collected);
+                        }
+                        Slot::Ready(sampler)
+                    }
+                    Err(err) => {
+                        tracing::error!("The system collector panicked: {err}; rebuilding it");
+                        rebuild_sampler(rebuild.clone(), &mut tick, Rebuild::AfterPanic).await
+                    }
+                }
             }
-        }
-
-        // Evaluate alerts
-        let disk_usages: HashMap<String, f32> = snap
-            .disks
-            .iter()
-            .map(|d| (d.mount_point.clone(), d.usage_percent))
-            .collect();
-
-        let new_alerts = {
-            let mut mgr = state.alert_manager.write();
-            mgr.evaluate(
-                snap.cpu.usage_percent,
-                snap.memory.usage_percent,
-                snap.swap.usage_percent,
-                &disk_usages,
-                snap.load_average.one as f32,
-                snap.load_average.five as f32,
-                snap.load_average.fifteen as f32,
-                snap.cpu.logical_cores,
-                now,
-            )
+            Slot::Broken => rebuild_sampler(rebuild.clone(), &mut tick, Rebuild::Retry).await,
         };
+    }
+}
 
-        for alert in &new_alerts {
-            tracing::warn!("🚨 ALERT: {}", alert.message);
+/// Awaits `read`, logging once if it is still running when the published snapshot goes
+/// stale at `stale_at`. The read is never abandoned, so blocking threads can't pile up.
+async fn watched<T>(read: impl Future<Output = T>, stale_at: Instant) -> T {
+    tokio::pin!(read);
+    if stale_at > Instant::now() {
+        tokio::select! {
+            out = &mut read => return out,
+            () = tokio::time::sleep_until(stale_at) => tracing::error!(
+                "Reading the system is taking too long; the snapshot is stale until it ends"
+            ),
         }
+    }
+    read.await
+}
+
+/// Why the collector is building a sampler: it decides what is worth a log line.
+enum Rebuild {
+    /// The sampler panicked this tick.
+    AfterPanic,
+    /// The last rebuild panicked too.
+    Retry,
+}
+
+/// Primes a new sampler off the runtime. On success the next tick is a full period away, so
+/// the new sampler's first reading is taken well after its priming one. Logs a failure only
+/// after a panic, and a success only after a failure: a broken source logs once, not per tick.
+async fn rebuild_sampler<G, F>(make: F, tick: &mut Interval, why: Rebuild) -> Slot<G>
+where
+    G: Gather,
+    F: FnOnce() -> G + Send + 'static,
+{
+    match (spawn_blocking(move || Sampler::prime(make())).await, why) {
+        (Ok(sampler), Rebuild::AfterPanic) => {
+            tick.reset();
+            Slot::Ready(sampler)
+        }
+        (Ok(sampler), Rebuild::Retry) => {
+            tracing::info!("The system collector is reading again");
+            tick.reset();
+            Slot::Ready(sampler)
+        }
+        (Err(err), Rebuild::AfterPanic) => {
+            tracing::error!("Rebuilding the system collector failed: {err}; retrying each tick");
+            Slot::Broken
+        }
+        (Err(_), Rebuild::Retry) => Slot::Broken,
+    }
+}
+
+async fn read_off_runtime<G: Gather>(
+    mut sampler: Sampler<G>,
+) -> Result<(Sampler<G>, Option<CollectedSnapshot>), JoinError> {
+    spawn_blocking(move || {
+        let collected = sampler.read();
+        (sampler, collected)
+    })
+    .await
+}
+
+/// Publishes `collected` under the seq after the last published one, and records it.
+fn publish(state: &AppState, publisher: &SnapshotSender, collected: CollectedSnapshot) {
+    let seq = publisher.borrow().seq.next();
+    let snapshot = Arc::new(collected.published(seq));
+    record(state, &snapshot);
+    publisher.send_replace(snapshot);
+}
+
+/// Adds `snapshot` to the history and evaluates the alert rules on it, at its `collected_at`.
+fn record(state: &AppState, snapshot: &PublishedSnapshot) {
+    let (snap, now) = (&snapshot.system, snapshot.collected_at);
+    {
+        let mut hist = state.history.write();
+        hist.push_cpu(snap.cpu.usage_percent, now);
+        hist.push_memory(snap.memory.usage_percent, now);
+        hist.push_swap(snap.swap.usage_percent, now);
+        hist.push_load1(snap.load_average.one as f32, now);
+        hist.push_load5(snap.load_average.five as f32, now);
+        hist.push_load15(snap.load_average.fifteen as f32, now);
+        for disk in &snap.disks {
+            hist.push_disk(&disk.mount_point, disk.usage_percent, now);
+        }
+    }
+    let disk_usages: HashMap<String, f32> = snap
+        .disks
+        .iter()
+        .map(|d| (d.mount_point.clone(), d.usage_percent))
+        .collect();
+    let new_alerts = state.alert_manager.write().evaluate(
+        snap.cpu.usage_percent,
+        snap.memory.usage_percent,
+        snap.swap.usage_percent,
+        &disk_usages,
+        snap.load_average.one as f32,
+        snap.load_average.five as f32,
+        snap.load_average.fifteen as f32,
+        snap.cpu.logical_cores,
+        now,
+    );
+    for alert in &new_alerts {
+        tracing::warn!("🚨 ALERT: {}", alert.message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampler::fakes::{FakeSource, SINCE_BOOT_CPU};
+    use super::*;
+    use crate::snapshot::{SnapshotSeq, fixtures};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::watch;
+
+    /// One publish: when, relative to the collector's start, under which seq, with which CPU.
+    type Publish = (Duration, SnapshotSeq, f32);
+
+    /// Starts the collector with `sampler`, and returns every publish until `until`.
+    async fn run<F>(sampler: Sampler<FakeSource>, rebuild: F, until: Duration) -> Vec<Publish>
+    where
+        F: Fn() -> FakeSource + Send + Clone + 'static,
+    {
+        let (publisher, mut snapshots): (SnapshotSender, SnapshotReceiver) =
+            watch::channel(Arc::new(fixtures::published()));
+        let state = AppState::new(snapshots.clone());
+        let start = Instant::now();
+        let collector = tokio::spawn(background_collector(state, publisher, sampler, rebuild));
+        let mut publishes = Vec::new();
+        while let Ok(Ok(())) = tokio::time::timeout_at(start + until, snapshots.changed()).await {
+            let snap = snapshots.borrow_and_update().clone();
+            publishes.push((start.elapsed(), snap.seq, snap.system.cpu.usage_percent));
+        }
+        collector.abort();
+        publishes
+    }
+
+    /// A sampler primed as at startup: a full priming interval ago.
+    async fn primed(source: FakeSource) -> Sampler<FakeSource> {
+        let sampler = Sampler::prime(source);
+        tokio::time::advance(PRIMING).await;
+        sampler
+    }
+
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    fn seq(n: u32) -> SnapshotSeq {
+        (0..n).fold(SnapshotSeq::FIRST, |s, _| s.next())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_tick_is_a_full_period_after_startup() {
+        let sampler = primed(FakeSource::new()).await;
+        let publishes = run(sampler, FakeSource::new, secs(5)).await;
+        assert_eq!(
+            publishes,
+            [(secs(2), seq(1), 1.0), (secs(4), seq(2), 2.0)],
+            "a tick every period from startup, none at once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_tick_rebuilds_the_sampler_which_never_publishes_its_priming() {
+        // The first sampler's third reading (the t=4 s tick) panics.
+        let sampler = primed(FakeSource::panicking_on(3)).await;
+        let publishes = run(sampler, FakeSource::new, secs(9)).await;
+        assert_eq!(
+            publishes,
+            [
+                (secs(2), seq(1), 1.0),
+                (secs(6), seq(2), 1.0),
+                (secs(8), seq(3), 2.0),
+            ],
+            "nothing at the panic, then the rebuilt sampler's readings, seqs running on"
+        );
+        assert!(
+            publishes.iter().all(|p| p.2 != SINCE_BOOT_CPU),
+            "no priming reading is published"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_rebuild_is_retried_once_a_tick() {
+        let builds = Arc::new(AtomicU32::new(0));
+        let counted = builds.clone();
+        // The first three rebuilds panic while priming; the fourth works.
+        let rebuild = move || match counted.fetch_add(1, Ordering::SeqCst) + 1 {
+            1..=3 => FakeSource::panicking_on(1),
+            _ => FakeSource::new(),
+        };
+        let sampler = primed(FakeSource::panicking_on(3)).await;
+        let publishes = run(sampler, rebuild, secs(13)).await;
+        assert_eq!(
+            publishes,
+            [(secs(2), seq(1), 1.0), (secs(12), seq(2), 1.0)],
+            "rebuilds at 4, 6, 8 and 10 s; the one at 10 s publishes a period later"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            4,
+            "one rebuild a tick, no loop"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_outlasting_the_staleness_bound_is_waited_for_not_abandoned() {
+        let start = Instant::now();
+        let hung = async {
+            tokio::time::sleep(STALENESS_BOUND * 2).await;
+            "the reading"
+        };
+        assert_eq!(watched(hung, start + STALENESS_BOUND).await, "the reading");
+        assert_eq!(start.elapsed(), STALENESS_BOUND * 2, "awaited to its end");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_snapshot_is_read_a_priming_interval_after_priming() {
+        let start = monotonic_now();
+        let (_, first) = first_snapshot(FakeSource::new()).await.expect("no panic");
+        assert_eq!(
+            first.system.cpu.usage_percent, 1.0,
+            "not the priming reading"
+        );
+        assert_eq!(first.read_at - start, PRIMING);
     }
 }

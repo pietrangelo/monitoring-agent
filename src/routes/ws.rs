@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 
-use crate::collectors;
+use crate::collectors::monotonic_now;
+use crate::snapshot::{PublishedSnapshot, StreamEmit, StreamState};
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -44,39 +45,18 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("WebSocket client connected");
 
     let mut tick = interval(Duration::from_secs(2));
+    // A stale snapshot is told once, then nothing until a fresh one; the socket stays open.
+    let mut told = StreamState::Live;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let snap = collectors::system::collect();
-
-                let alerts = {
-                    let mgr = state.alert_manager.read();
-                    mgr.active_alerts().to_vec()
+                let msg = match told.next(state.snapshot(), monotonic_now()) {
+                    StreamEmit::Snapshot(snapshot) => system_message(&snapshot, &state),
+                    StreamEmit::StaleNotice => serde_json::json!({ "type": "stale" }).to_string(),
+                    StreamEmit::Nothing => continue,
                 };
-
-                let payload = serde_json::json!({
-                    "type": "system",
-                    "timestamp": snap.uptime_seconds,
-                    "cpu_percent": snap.cpu.usage_percent,
-                    "cpu_logical_cores": snap.cpu.logical_cores,
-                    "memory_percent": snap.memory.usage_percent,
-                    "memory_used_display": snap.memory.used_display,
-                    "memory_total_display": snap.memory.total_display,
-                    "memory_used_bytes": snap.memory.used_bytes,
-                    "memory_total_bytes": snap.memory.total_bytes,
-                    "swap_percent": snap.swap.usage_percent,
-                    "load_one": snap.load_average.one,
-                    "load_five": snap.load_average.five,
-                    "load_fifteen": snap.load_average.fifteen,
-                    "uptime_display": snap.uptime_display,
-                    "disks": &snap.disks,
-                    "top_processes": &snap.top_processes[..10.min(snap.top_processes.len())],
-                    "alerts": &alerts,
-                });
-
-                let msg = Message::Text(serde_json::to_string(&payload).unwrap_or_default());
-                if socket.send(msg).await.is_err() {
+                if socket.send(Message::Text(msg)).await.is_err() {
                     break;
                 }
             }
@@ -104,6 +84,33 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("WebSocket client disconnected");
 }
 
+/// The live message for one fresh snapshot, with the active alerts.
+fn system_message(published: &PublishedSnapshot, state: &AppState) -> String {
+    let snap = &published.system;
+    let alerts = state.alert_manager.read().active_alerts().to_vec();
+    let payload = serde_json::json!({
+        "type": "system",
+        "timestamp": snap.uptime_seconds,
+        "collected_at": published.collected_at,
+        "cpu_percent": snap.cpu.usage_percent,
+        "cpu_logical_cores": snap.cpu.logical_cores,
+        "memory_percent": snap.memory.usage_percent,
+        "memory_used_display": snap.memory.used_display,
+        "memory_total_display": snap.memory.total_display,
+        "memory_used_bytes": snap.memory.used_bytes,
+        "memory_total_bytes": snap.memory.total_bytes,
+        "swap_percent": snap.swap.usage_percent,
+        "load_one": snap.load_average.one,
+        "load_five": snap.load_average.five,
+        "load_fifteen": snap.load_average.fifteen,
+        "uptime_display": snap.uptime_display,
+        "disks": &snap.disks,
+        "top_processes": &snap.top_processes[..10.min(snap.top_processes.len())],
+        "alerts": &alerts,
+    });
+    serde_json::to_string(&payload).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_upgrade_request_without_headers_is_rejected() {
-        let state = AppState::new();
+        let state = AppState::new(crate::snapshot::fixtures::receiver());
         let res = router(state)
             .oneshot(
                 Request::builder()
@@ -133,7 +140,7 @@ mod tests {
         // extension available even with a fully valid handshake -- axum reports 426.
         // The 101 path is covered by `ws_connects_and_streams_system_payloads` below,
         // which runs a real server.
-        let state = AppState::new();
+        let state = AppState::new(crate::snapshot::fixtures::receiver());
         let res = router(state)
             .oneshot(
                 Request::builder()
@@ -154,7 +161,8 @@ mod tests {
     async fn ws_connects_and_streams_system_payloads() {
         use futures_util::StreamExt;
 
-        let state = AppState::new();
+        let fixture = crate::snapshot::fixtures::published();
+        let state = AppState::new(crate::snapshot::fixtures::receiver());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state);
@@ -177,15 +185,64 @@ mod tests {
             tokio_tungstenite::tungstenite::Message::Text(txt) => {
                 let json: serde_json::Value = serde_json::from_str(&txt).unwrap();
                 assert_eq!(json["type"], "system");
-                assert!(json.get("cpu_percent").is_some());
+                assert_eq!(json["collected_at"], fixture.collected_at);
+                assert_eq!(json["cpu_percent"], fixture.system.cpu.usage_percent);
+                assert_eq!(
+                    json["top_processes"],
+                    serde_json::to_value(&fixture.system.top_processes).unwrap()
+                );
             }
             other => panic!("expected a text message, got {other:?}"),
         }
     }
 
     #[tokio::test]
+    async fn a_stale_snapshot_is_told_once_and_the_socket_waits_for_a_fresh_one() {
+        use crate::snapshot::fixtures;
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as Received;
+
+        let (publisher, snapshots) = fixtures::channel(fixtures::stale());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(AppState::new(snapshots));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("ws://{addr}/api/ws/system");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut next_type = async |wait: u64| {
+            let wait = std::time::Duration::from_millis(wait);
+            match tokio::time::timeout(wait, ws.next()).await {
+                Ok(Some(Ok(Received::Text(txt)))) => {
+                    let json: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                    Some(json["type"].as_str().unwrap_or_default().to_string())
+                }
+                Ok(other) => panic!("expected a text message, got {other:?}"),
+                Err(_) => None,
+            }
+        };
+        assert_eq!(
+            next_type(1_000).await.as_deref(),
+            Some("stale"),
+            "told at once"
+        );
+        assert_eq!(
+            next_type(2_500).await,
+            None,
+            "nothing more on the next tick"
+        );
+        publisher.send_replace(Arc::new(fixtures::published()));
+        assert_eq!(
+            next_type(2_500).await.as_deref(),
+            Some("system"),
+            "the same socket resumes with a fresh snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_ws_path_is_not_found() {
-        let state = AppState::new();
+        let state = AppState::new(crate::snapshot::fixtures::receiver());
         let res = router(state)
             .oneshot(
                 Request::builder()

@@ -121,7 +121,11 @@ mod tests {
     async fn a_published_round_is_served_in_full() {
         let (sender, receiver) = watch::channel(None);
         sender.send_replace(Some(Arc::new(round())));
-        let body = get_applications(AppState::with_rounds(receiver)).await;
+        let body = get_applications(AppState::with_rounds(
+            crate::snapshot::fixtures::receiver(),
+            receiver,
+        ))
+        .await;
         assert_eq!(
             body,
             json!({
@@ -155,12 +159,18 @@ mod tests {
         // The loop ended: its sender is gone, though the channel still holds its last round.
         drop(ended);
         let cases = [
-            ("applications off", AppState::new()),
+            (
+                "applications off",
+                AppState::new(crate::snapshot::fixtures::receiver()),
+            ),
             (
                 "before the first round",
-                AppState::with_rounds(before_first),
+                AppState::with_rounds(crate::snapshot::fixtures::receiver(), before_first),
             ),
-            ("the loop ended", AppState::with_rounds(after_end)),
+            (
+                "the loop ended",
+                AppState::with_rounds(crate::snapshot::fixtures::receiver(), after_end),
+            ),
         ];
         for (name, state) in cases {
             assert_eq!(get_applications(state).await, no_round, "case: {name}");

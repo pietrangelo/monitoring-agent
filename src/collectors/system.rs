@@ -83,13 +83,9 @@ pub(crate) struct RawProcess {
     pub status: String,
 }
 
-pub fn collect() -> SystemSnapshot {
-    snapshot_from(gather(Path::new("/")))
-}
-
-/// Reads sysinfo, and the OS release file under `root`.
-fn gather(root: &Path) -> RawReadings {
-    let mut sys = System::new_all();
+/// Refreshes `sys` in place, then reads it and the OS release file under `root`. A long-lived
+/// `sys` is what makes CPU usage a reading over the time since its previous refresh.
+pub(crate) fn gather(sys: &mut System, root: &Path) -> RawReadings {
     sys.refresh_all();
     let load = System::load_average();
     RawReadings {
@@ -125,7 +121,7 @@ fn gather(root: &Path) -> RawReadings {
         },
         disks: gather_disks(),
         networks: gather_networks(),
-        processes: gather_processes(&sys),
+        processes: gather_processes(sys),
     }
 }
 
@@ -367,7 +363,69 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    pub fn cpu(brand: &str, usage: f32, frequency_mhz: u64) -> RawCpu {
+        RawCpu {
+            brand: brand.into(),
+            usage,
+            frequency_mhz,
+        }
+    }
+
+    pub fn process(pid: u32, cpu_usage: f32, memory: u64) -> RawProcess {
+        RawProcess {
+            pid,
+            name: format!("p{pid}"),
+            cpu_usage,
+            memory,
+            status: "Run".into(),
+        }
+    }
+
+    pub fn raw() -> RawReadings {
+        RawReadings {
+            hostname: Some("host-a".into()),
+            kernel: Some("6.6.1".into()),
+            os: parse_os_release_content("PRETTY_NAME=\"Debian 12\"\n"),
+            uptime_secs: 2 * 86400 + 3600,
+            load: LoadAverage {
+                one: 0.5,
+                five: 0.25,
+                fifteen: 0.125,
+            },
+            cpus: vec![cpu("Xeon", 10.04, 2400), cpu("Other", 20.0, 1200)],
+            physical_cores: Some(1),
+            memory: RawMemory {
+                total: 4096,
+                used: 1024,
+                free: 2048,
+                available: 3072,
+            },
+            swap: RawSwap {
+                total: 1000,
+                used: 250,
+                free: 750,
+            },
+            disks: vec![],
+            networks: vec![],
+            processes: vec![],
+        }
+    }
+
+    /// `raw()` with every CPU at `usage`, so the snapshot's CPU usage is `usage`.
+    pub fn raw_with_cpu(usage: f32) -> RawReadings {
+        RawReadings {
+            cpus: vec![cpu("Xeon", usage, 2400)],
+            ..raw()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::fixtures::*;
     use super::*;
 
     #[test]
@@ -446,54 +504,6 @@ mod tests {
         let os = parse_os_release_content(content);
         assert_eq!(os.id, "fedora");
         assert_eq!(os.name, "");
-    }
-
-    fn cpu(brand: &str, usage: f32, frequency_mhz: u64) -> RawCpu {
-        RawCpu {
-            brand: brand.into(),
-            usage,
-            frequency_mhz,
-        }
-    }
-
-    fn process(pid: u32, cpu_usage: f32, memory: u64) -> RawProcess {
-        RawProcess {
-            pid,
-            name: format!("p{pid}"),
-            cpu_usage,
-            memory,
-            status: "Run".into(),
-        }
-    }
-
-    fn raw() -> RawReadings {
-        RawReadings {
-            hostname: Some("host-a".into()),
-            kernel: Some("6.6.1".into()),
-            os: parse_os_release_content("PRETTY_NAME=\"Debian 12\"\n"),
-            uptime_secs: 2 * 86400 + 3600,
-            load: LoadAverage {
-                one: 0.5,
-                five: 0.25,
-                fifteen: 0.125,
-            },
-            cpus: vec![cpu("Xeon", 10.04, 2400), cpu("Other", 20.0, 1200)],
-            physical_cores: Some(1),
-            memory: RawMemory {
-                total: 4096,
-                used: 1024,
-                free: 2048,
-                available: 3072,
-            },
-            swap: RawSwap {
-                total: 1000,
-                used: 250,
-                free: 750,
-            },
-            disks: vec![],
-            networks: vec![],
-            processes: vec![],
-        }
     }
 
     #[test]

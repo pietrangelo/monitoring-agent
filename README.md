@@ -72,8 +72,9 @@ monitoring-agent/
 ├── .env.example                # Template for docker-compose token overrides
 ├── static/index.html           # Single-machine dashboard
 └── src/
-    ├── main.rs                 # Server entry, push client spawn
+    ├── main.rs                 # Server entry, startup snapshot, push client spawn
     ├── models.rs               # Data types
+    ├── snapshot.rs             # The published snapshot, its seq and staleness
     ├── state.rs                # Shared state (history ring buffers)
     ├── auth.rs                 # Token auth middleware
     ├── alerts.rs               # Alert engine (thresholds, cooldowns)
@@ -82,7 +83,8 @@ monitoring-agent/
     │   └── application_frame.rs # Scrape rounds as application frames
     ├── applications/           # Spring Boot scraping (config, actuator, rounds, wire DTO)
     ├── collectors/
-    │   ├── mod.rs              # Background metric collector
+    │   ├── mod.rs              # Background collector: reads, publishes, records
+    │   ├── sampler.rs          # Long-lived sysinfo reader, never publishes its priming
     │   ├── system.rs           # CPU, memory, disk, network, processes
     │   ├── packages.rs         # dpkg/rpm/pacman/apk
     │   ├── services.rs         # systemd units
@@ -233,7 +235,7 @@ For push-mode agents, they appear automatically — no manual registration neede
 | `SYSTEM_AGENT_TOKEN` | *(none)* | API token required for REST access |
 | `PUSH_TO` | *(none)* | Hub WebSocket URL, e.g. `ws://hub:9091` |
 | `PUSH_TOKEN` | *(none)* | Shared secret for hub authentication |
-| `PUSH_INTERVAL` | `2` | Seconds between push snapshots (min 2) |
+| `PUSH_INTERVAL` | `2` | Seconds between push ticks (min 2). A tick sends the latest snapshot only if the hub hasn't had it yet; a stale snapshot closes the connection, and the agent reconnects once a fresh one is read |
 | `SPRING_BOOT_APPS` | *(none)* | Spring Boot applications to monitor, as comma-separated `name=actuator-base-url` pairs (at most 16), e.g. `orders=http://127.0.0.1:8081/actuator`. A name is 1–64 of `A-Z a-z 0-9 _ . -`. The URL is http(s), with no credentials, query or fragment |
 | `SPRING_BOOT_APP_<NAME>_USERNAME` / `_PASSWORD` | *(none)* | HTTP Basic credentials for one application; both or neither. `<NAME>` is the name upper-cased, with `-` and `.` as `_`. A username can't contain `:`, and neither value a control character (HTTP Basic can't carry them). Never logged. Over plain `http://` to a non-loopback address, the agent logs a startup warning |
 | `SPRING_BOOT_SCRAPE_INTERVAL` | `15` | Seconds between scrape rounds, 10 to 3600 |
@@ -260,7 +262,7 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | Endpoint | Description |
 |---|---|
 | `GET /api/health` | Health check + version |
-| `GET /api/system` | Full snapshot — CPU, memory, disk, network, load, processes |
+| `GET /api/system` | Full snapshot — CPU, memory, disk, network, load, processes — plus `collected_at` (unix seconds, the agent's clock, when it was read). Every `/api/system*` route serves the background collector's latest snapshot (at most one 2 s tick old) and answers `503` with `{"error": "stale snapshot"}` when it was read more than 30 s ago |
 | `GET /api/system/cpu` | CPU model, cores, usage % |
 | `GET /api/system/memory` | RAM + swap |
 | `GET /api/system/disk` | All mounted disks |
@@ -272,10 +274,10 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | `POST /api/alerts/config` | Replace alert rules (JSON body) |
 | `GET /api/{packages,services,containers,ports}` | Installed packages, services, Docker, ports |
 | `GET /api/applications` | Latest scrape round of the Spring Boot applications: round id (`run`, `seq`), `interval_secs`, `scraped_at`, and per application its `name`, `health` (`up`, `down`, `out_of_service`, `unknown`, `unreachable`), `version` and `gauges`. `round`, `interval_secs` and `scraped_at` are `null` (and `applications` is `[]`) before the first round and whenever no scrape loop runs |
-| `GET /api/stream/system` | **SSE** — CPU/mem/load every 2s |
-| `GET /api/stream/processes` | **SSE** — Top processes every 3s |
+| `GET /api/stream/system` | **SSE** — CPU/mem/load and `collected_at` every 2s. A stale snapshot sends one `stale` event, then nothing until a fresh one; the stream stays open |
+| `GET /api/stream/processes` | **SSE** — Top processes every 3s; `stale` as above |
 | `GET /api/stream/alerts` | **SSE** — Active alerts every 3s |
-| `GET /api/ws/system` | **WebSocket** — Full state every 2s |
+| `GET /api/ws/system` | **WebSocket** — Full state and `collected_at` every 2s; one `{"type": "stale"}` message while the snapshot is stale |
 
 ### System Hub (port 9091)
 
