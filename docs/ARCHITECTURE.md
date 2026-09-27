@@ -123,7 +123,16 @@ Runs on every monitored Linux host. Responsibilities:
 Aggregates data from many `system-agent` instances. Responsibilities:
 
 - Maintains a registry of known systems (`db.rs`, SQLite table `systems`) — name, URL, token,
-  poll interval, last-known status/OS info.
+  poll interval, last-known status/OS info. A system's info (hostname, OS, kernel, CPU model
+  and cores) is filled once, while its hostname or OS is missing (`db.rs::update_system_info`,
+  which never writes the memory columns). Its **memory
+  capacity** follows the agent (RFC 0014 §8): every push frame and every poll that reports
+  both its bytes and a non-empty display refreshes the stored pair when it differs
+  (`registry.rs::memory_capacity_refresh`, over `MemoryCapacity::stored` and `::reported`),
+  written by `db.rs::update_memory_capacity`, two fixed columns in one statement and the
+  columns' only writer; the poll path runs it on the blocking pool. A report without the whole pair never clears it. So a
+  containerised agent's system shows the container's limit, and a VM's memory hotplug shows
+  too. The dashboard labels the figure "Memory", true on every environment.
 - Two ingestion modes, both able to run simultaneously per fleet:
   - **HTTP poll** (`collector/`): every 30 s the hub calls each enabled agent's
     `/api/system`, then `/api/alerts` and `/api/applications` (it ignores
@@ -194,7 +203,7 @@ match those rules (listed under Open architectural questions below).
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `PushFeed` and `SnapshotCursor`, which sends each published snapshot once, by seq; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
 | **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`); `applications/round.rs` (`RoundId`, `RoundSequence`, `ScrapeRound`, `NamedReport`, `health_change`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version); `applications/scraper.rs` (the HTTP client: `Scraper`, `Timeouts`, the body cap); `applications/scrape_loop.rs` (`scrape_loop`, the round `watch` channel); `routes/applications.rs` (`GET /api/applications` and its JSON) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
-| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
+| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`, `ConnectionRounds` (a connection's pace and refusal count), `RefusedFrame`; `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `refused_poll`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables and `store_round`, `state.rs` live cache and `live_applications`, `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`) | stored time series, alert history, retention, and each system's shown scrape round |
 
@@ -236,6 +245,7 @@ mixed-version fleet must keep working):
 | **agent** | the `system-agent` process running on one monitored host | `system-agent` crate |
 | **hub** | the `system-hub` process aggregating many agents | `system-hub` crate |
 | **system** | a monitored host *as the hub knows it*: registry entry, config, status | `SystemInfo`, `systems` table |
+| **memory capacity** (hub) | a system's memory total as its agent last reported it, bytes and display always together: the agent's resource capacity for memory, so a container's limit in a container | `MemoryCapacity` |
 | **system id** | the identifier an agent presents in the push handshake; the hub uses it as the system's primary key. It is one URL path segment: non-empty, at most 255 bytes, and not `.` or `..`. The hub refuses any other id at the push handshake; rows stored before the rule may still hold one (see Open architectural questions) | `SystemId` (hub) |
 | **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
 | **system status** | the hub's view of whether a system is reachable: online / offline / unknown. A push system is marked offline when its connection ends, and a connection ends at the latest 90 s after its last message, or 30 s after an oversize one | `SystemStatus` |
@@ -640,8 +650,8 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   once in `collector/` over the poll DTO. It belongs in one Fleet History domain function.
 - The Fleet Registry rules applied on each push frame are decided inside the Ingestion
   adapter (`push::update_registry`). Those rules are: refill system info while its
-  hostname or OS is missing, and mark the system online. Only the default-name rule lives
-  in the domain.
+  hostname or OS is missing, and mark the system online. The default-name rule and the
+  memory capacity refresh live in the domain.
 - Rejected push handshakes are logged without the peer's address. The hub isn't served with
   connect info, and behind a reverse proxy it would need a forwarded-header policy.
 - The agent doesn't treat a missing handshake answer as a failure. Its handshake check has

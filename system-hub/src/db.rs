@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::registry::MemoryCapacity;
 use rusqlite::Connection;
 use std::sync::Mutex;
 
@@ -247,7 +248,8 @@ impl Database {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Writes a system's info. Not its memory capacity, which follows the agent and has its
+    /// own writer, `update_memory_capacity`.
     pub fn update_system_info(
         &self,
         id: &str,
@@ -256,24 +258,27 @@ impl Database {
         kernel: Option<&str>,
         cpu_model: Option<&str>,
         cpu_cores: Option<usize>,
-        total_memory_display: Option<&str>,
-        total_memory_bytes: Option<u64>,
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE systems SET os=?1, hostname=?2, kernel=?3, cpu_model=?4,
-             cpu_cores=?5, total_memory_display=?6, total_memory_bytes=?7
-             WHERE id=?8",
-            rusqlite::params![
-                os,
-                hostname,
-                kernel,
-                cpu_model,
-                cpu_cores,
-                total_memory_display,
-                total_memory_bytes,
-                id
-            ],
+            "UPDATE systems SET os=?1, hostname=?2, kernel=?3, cpu_model=?4, cpu_cores=?5
+             WHERE id=?6",
+            rusqlite::params![os, hostname, kernel, cpu_model, cpu_cores, id],
+        )?;
+        Ok(())
+    }
+
+    /// Stores `capacity` as the system's memory total, both columns in one statement, leaving
+    /// every other column as it is.
+    pub fn update_memory_capacity(
+        &self,
+        id: &str,
+        capacity: &MemoryCapacity,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE systems SET total_memory_display=?1, total_memory_bytes=?2 WHERE id=?3",
+            rusqlite::params![capacity.display(), capacity.bytes(), id],
         )?;
         Ok(())
     }
@@ -735,15 +740,61 @@ mod tests {
             Some("6.6.0"),
             Some("Generic CPU"),
             Some(8),
-            Some("16.0 GB"),
-            Some(16_000_000_000),
         )
         .unwrap();
         let sys = db.get_system("id-1").unwrap().unwrap();
         assert_eq!(sys.os.as_deref(), Some("Ubuntu 22.04"));
         assert_eq!(sys.hostname.as_deref(), Some("web01"));
         assert_eq!(sys.cpu_cores, Some(8));
-        assert_eq!(sys.total_memory_bytes, Some(16_000_000_000));
+        assert_eq!(
+            (sys.total_memory_display, sys.total_memory_bytes),
+            (None, None),
+            "the memory capacity has its own writer"
+        );
+    }
+
+    #[test]
+    fn update_memory_capacity_writes_both_columns_and_nothing_else() {
+        let (db, _dir) = temp_db();
+        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
+        db.insert_system(&sample_system("id-2", "web-02")).unwrap();
+        let known = |db: &Database, id: &str| {
+            db.update_system_info(
+                id,
+                Some("Ubuntu 22.04"),
+                Some("web01"),
+                Some("6.6.0"),
+                Some("Generic CPU"),
+                Some(8),
+            )
+            .unwrap();
+            db.update_memory_capacity(id, &MemoryCapacity::fixture("16.0 GB", 16_000_000_000))
+                .unwrap();
+        };
+        known(&db, "id-1");
+        known(&db, "id-2");
+        let capacity = MemoryCapacity::fixture("512.0 MB", 536_870_912);
+        let before = db.get_system("id-1").unwrap().unwrap();
+
+        db.update_memory_capacity("id-1", &capacity).unwrap();
+
+        let sys = db.get_system("id-1").unwrap().unwrap();
+        // The whole row, so a column added later is covered too.
+        assert_eq!(
+            sys,
+            SystemInfo {
+                total_memory_display: Some("512.0 MB".into()),
+                total_memory_bytes: Some(536_870_912),
+                ..before
+            },
+            "both columns written, every other one untouched"
+        );
+        let other = db.get_system("id-2").unwrap().unwrap();
+        assert_eq!(
+            other.total_memory_bytes,
+            Some(16_000_000_000),
+            "only the named system"
+        );
     }
 
     #[test]

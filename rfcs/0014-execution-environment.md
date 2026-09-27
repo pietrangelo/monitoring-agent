@@ -802,6 +802,12 @@ Test-first per behaviour, table-driven, per `CLAUDE.md`.
   `Reading<Percent>` / `LoadAverage` and the skip and clear rules; (4) `environment/` classification and the `environment` field;
   (5) cgroup location, capacity and container sourcing; (6) steal time; (7) the hub registry
   refresh and the "Memory" labels; (8) docs, README and the agent dashboard.
+  Steps 1–7 have landed. Step 7 put the refresh rule in the hub's domain
+  (`registry.rs::memory_capacity_refresh`, over a `MemoryCapacity` that holds the bytes and
+  the display together); the adapters write it through `db.rs::update_memory_capacity`.
+  That the adapters call the refresh rule, rather than writing every frame, isn't visible to
+  a test (only as one redundant write per frame), so it is a review rule. So is the static
+  "Memory" label beside the dashboard's memory total, which `xss.mjs` doesn't read.
 
 ## Review
 

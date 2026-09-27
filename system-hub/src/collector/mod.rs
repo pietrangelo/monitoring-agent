@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::registry::{MemoryCapacity, memory_capacity_refresh};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -146,6 +147,7 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
     if system.hostname.is_none() || system.os.is_none() {
         record_system_info(&state, system, &agent);
     }
+    refresh_memory_capacity(&state, system, &agent).await;
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -198,11 +200,6 @@ fn record_system_info(state: &AppState, system: &SystemInfo, agent: &AgentRespon
         .and_then(|o| o.pretty_name.as_deref().or(o.name.as_deref()));
     let cpu_model = agent.cpu.as_ref().and_then(|c| c.model.as_deref());
     let cpu_cores = agent.cpu.as_ref().and_then(|c| c.logical_cores);
-    let mem_display = agent
-        .memory
-        .as_ref()
-        .and_then(|m| m.total_display.as_deref());
-    let mem_bytes = agent.memory.as_ref().and_then(|m| m.total_bytes);
     let recorded = state.db.update_system_info(
         &system.id,
         os_name,
@@ -210,10 +207,37 @@ fn record_system_info(state: &AppState, system: &SystemInfo, agent: &AgentRespon
         agent.kernel.as_deref(),
         cpu_model,
         cpu_cores,
-        mem_display,
-        mem_bytes,
     );
     warn_on_failure(recorded, "record system info", system);
+}
+
+/// Stores the memory capacity the answer reports when it differs from the stored one
+/// (RFC 0014 §8): unlike the rest of the system's info, it follows every poll. The write runs
+/// on the blocking pool, awaited, so SQLite never holds a runtime thread.
+async fn refresh_memory_capacity(
+    state: &Arc<AppState>,
+    system: &SystemInfo,
+    agent: &AgentResponse,
+) {
+    let memory = agent.memory.as_ref();
+    let reported = MemoryCapacity::reported(
+        memory.and_then(|m| m.total_display.as_deref()),
+        memory.and_then(|m| m.total_bytes),
+    );
+    let Some(capacity) = memory_capacity_refresh(MemoryCapacity::stored(system).as_ref(), reported)
+    else {
+        return;
+    };
+    let (state, id) = (Arc::clone(state), system.id.clone());
+    let refreshed =
+        tokio::task::spawn_blocking(move || state.db.update_memory_capacity(&id, &capacity)).await;
+    match refreshed {
+        Ok(result) => warn_on_failure(result, "refresh the memory capacity", system),
+        Err(err) => tracing::warn!(
+            "Poll of {:?}: the memory capacity write failed: {err}",
+            system.id
+        ),
+    }
 }
 
 /// The snapshot an agent's `/api/system` answer describes, stamped with the hub's clock.
@@ -498,6 +522,95 @@ mod tests {
 
         let live = state.live_metrics.read().unwrap();
         assert_eq!(live.get("id-1").unwrap().cpu_percent, 12.5);
+    }
+
+    /// RFC 0014 §8: a poll refreshes the memory capacity when its answer has both halves, and
+    /// leaves the stored one, and the rest of its system info, alone otherwise.
+    #[tokio::test]
+    async fn poll_system_refreshes_the_memory_capacity_only_from_a_whole_report() {
+        let resized = serde_json::json!({"total_bytes": 536_870_912, "total_display": "512.0 MB"});
+        let host = (Some("31.0 GB"), Some(33_285_996_544));
+        // (name, the answer's memory object, expected stored capacity)
+        let cases = [
+            (
+                "a whole report",
+                Some(resized),
+                (Some("512.0 MB"), Some(536_870_912)),
+            ),
+            ("no memory", None, host),
+            (
+                "bytes only",
+                Some(serde_json::json!({"total_bytes": 536_870_912})),
+                host,
+            ),
+            (
+                "an empty display",
+                Some(serde_json::json!({"total_bytes": 536_870_912, "total_display": ""})),
+                host,
+            ),
+            (
+                "display only",
+                Some(serde_json::json!({"total_display": "512.0 MB"})),
+                host,
+            ),
+        ];
+        for (name, memory, expected) in cases {
+            let (state, _dir) = temp_state();
+            let mut answer = serde_json::json!({
+                "hostname": "polled-host",
+                "os": {"pretty_name": "Polled OS"},
+                "kernel": "polled-kernel",
+                "cpu": {"model": "polled-cpu", "logical_cores": 2},
+            });
+            if let Some(memory) = memory {
+                answer["memory"] = memory;
+            }
+            let app = Router::new().route(
+                "/api/system",
+                get(move || {
+                    let v = answer.clone();
+                    async move { Json(v) }
+                }),
+            );
+            let url = spawn_mock_agent(app).await;
+            let system = SystemInfo {
+                os: Some("Preset OS".into()),
+                hostname: Some("preset-host".into()),
+                kernel: Some("preset-kernel".into()),
+                cpu_model: Some("preset-cpu".into()),
+                cpu_cores: Some(64),
+                total_memory_display: host.0.map(str::to_owned),
+                total_memory_bytes: host.1,
+                ..sample_system("id-1", url)
+            };
+            state.db.insert_system(&system).unwrap();
+
+            poll_system(state.clone(), &system).await;
+
+            let sys = state.db.get_system("id-1").unwrap().unwrap();
+            assert_eq!(
+                (sys.total_memory_display.as_deref(), sys.total_memory_bytes),
+                expected,
+                "{name}: capacity"
+            );
+            assert_eq!(
+                (
+                    sys.os.as_deref(),
+                    sys.hostname.as_deref(),
+                    sys.kernel.as_deref(),
+                    sys.cpu_model.as_deref(),
+                    sys.cpu_cores,
+                ),
+                (
+                    Some("Preset OS"),
+                    Some("preset-host"),
+                    Some("preset-kernel"),
+                    Some("preset-cpu"),
+                    Some(64)
+                ),
+                "{name}: the rest of the system info keeps its fill-once rule"
+            );
+        }
     }
 
     #[tokio::test]

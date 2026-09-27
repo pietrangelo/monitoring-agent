@@ -741,7 +741,7 @@ function checks(r) {
         ["every system card's error renders as text",
             same(cards.map((k) => k.error), [P, P, P]), show(cards.map((k) => k.error))],
         ["every system card's OS, memory and last-seen render as text",
-            cards.length === 3 && cards.every((k) => same(withoutCores(k.meta), [P, `${P} RAM`, `Seen: ${P}`])),
+            cards.length === 3 && cards.every((k) => same(withoutCores(k.meta), [P, `${P} Memory`, `Seen: ${P}`])),
             show(cards.map((k) => k.meta))],
         ["a core count that isn't a number is left out",
             a !== undefined && !a.meta.some((m) => m.endsWith(" cores")), show(a?.meta)],
