@@ -1,0 +1,1221 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Pietrangelo Masala
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{Duration, interval};
+
+use crate::models::{
+    AlertRecord, DiskSnapshot, MetricSnapshot, ProcessSnapshot, SystemInfo, SystemStatus,
+};
+use crate::state::AppState;
+
+mod application_poll;
+use application_poll::poll_applications;
+
+// ── Agent response shape (maps the system-agent /api/system JSON) ──
+
+#[derive(Debug, Deserialize)]
+struct AgentResponse {
+    hostname: Option<String>,
+    os: Option<AgentOs>,
+    kernel: Option<String>,
+    cpu: Option<AgentCpu>,
+    memory: Option<AgentMemory>,
+    swap: Option<AgentSwap>,
+    load_average: Option<AgentLoad>,
+    uptime_seconds: Option<u64>,
+    uptime_display: Option<String>,
+    disks: Option<Vec<AgentDisk>>,
+    top_processes: Option<Vec<AgentProcess>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentOs {
+    name: Option<String>,
+    pretty_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentCpu {
+    model: Option<String>,
+    logical_cores: Option<usize>,
+    usage_percent: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMemory {
+    total_bytes: Option<u64>,
+    total_display: Option<String>,
+    used_display: Option<String>,
+    used_bytes: Option<u64>,
+    usage_percent: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSwap {
+    usage_percent: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentLoad {
+    one: Option<f64>,
+    five: Option<f64>,
+    fifteen: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDisk {
+    mount_point: Option<String>,
+    usage_percent: Option<f32>,
+    total_display: Option<String>,
+    used_display: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentProcess {
+    pid: Option<u32>,
+    name: Option<String>,
+    cpu_usage: Option<f32>,
+    memory_usage_display: Option<String>,
+    memory_percent: Option<f32>,
+}
+
+// ── Collector ──────────────────────────────────────────
+
+fn now_iso() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    unix_to_iso8601(secs)
+}
+
+pub fn start_collectors(state: Arc<AppState>) {
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let mut refresh_tick = interval(Duration::from_secs(30));
+        loop {
+            refresh_tick.tick().await;
+            state_clone.refresh_cache();
+            let systems = state_clone.get_enabled_systems();
+            for system in systems {
+                let s = state_clone.clone();
+                tokio::spawn(async move {
+                    poll_system(s, &system).await;
+                });
+            }
+        }
+    });
+}
+
+async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
+    let Some(client) = poll_client(system) else {
+        return;
+    };
+    let now = now_iso();
+    let url = format!("{}/api/system", system.url.trim_end_matches('/'));
+    let answer = match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json::<AgentResponse>().await,
+        Ok(resp) => return mark_offline(&state, system, &now, &format!("HTTP {}", resp.status())),
+        Err(e) => return mark_offline(&state, system, &now, &e.to_string()),
+    };
+    let agent = match answer {
+        Ok(agent) => agent,
+        Err(e) => return mark_offline(&state, system, &now, &format!("JSON parse error: {e}")),
+    };
+
+    let online = state
+        .db
+        .update_system_status(&system.id, &SystemStatus::Online, &now, None);
+    warn_on_failure(online, "mark online", system);
+    if system.hostname.is_none() || system.os.is_none() {
+        record_system_info(&state, system, &agent);
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    store_metrics(&state, &metric_snapshot(&system.id, agent, now_secs));
+    store_agent_alerts(&state, system, &client).await;
+    poll_applications(&state, system, &client).await;
+}
+
+/// The HTTP client for one system's polls: its token as `X-API-Key`, a 10 s timeout, and no
+/// redirects.
+fn poll_client(system: &SystemInfo) -> Option<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if !system.token.is_empty()
+        && let Ok(val) = reqwest::header::HeaderValue::from_str(&system.token)
+    {
+        headers.insert("X-API-Key", val);
+    }
+    // No redirects: reqwest would carry `X-API-Key` across hosts (RFC 0009 §8). A registered
+    // URL that redirects shows as offline, naming the 3xx.
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers)
+        .build()
+        .inspect_err(|err| tracing::warn!("No poll client for {:?}: {err}", system.id))
+        .ok()
+}
+
+/// Logs a failed registry or history write of a poll: the poll goes on.
+fn warn_on_failure(result: Result<(), rusqlite::Error>, what: &str, system: &SystemInfo) {
+    if let Err(err) = result {
+        tracing::warn!("Poll of {:?}: couldn't {what}: {err}", system.id);
+    }
+}
+
+fn mark_offline(state: &AppState, system: &SystemInfo, now: &str, error: &str) {
+    let offline =
+        state
+            .db
+            .update_system_status(&system.id, &SystemStatus::Offline, now, Some(error));
+    warn_on_failure(offline, "mark offline", system);
+}
+
+/// Fills in a system's static info from its first successful poll.
+fn record_system_info(state: &AppState, system: &SystemInfo, agent: &AgentResponse) {
+    let os_name = agent
+        .os
+        .as_ref()
+        .and_then(|o| o.pretty_name.as_deref().or(o.name.as_deref()));
+    let cpu_model = agent.cpu.as_ref().and_then(|c| c.model.as_deref());
+    let cpu_cores = agent.cpu.as_ref().and_then(|c| c.logical_cores);
+    let mem_display = agent
+        .memory
+        .as_ref()
+        .and_then(|m| m.total_display.as_deref());
+    let mem_bytes = agent.memory.as_ref().and_then(|m| m.total_bytes);
+    let recorded = state.db.update_system_info(
+        &system.id,
+        os_name,
+        agent.hostname.as_deref(),
+        agent.kernel.as_deref(),
+        cpu_model,
+        cpu_cores,
+        mem_display,
+        mem_bytes,
+    );
+    warn_on_failure(recorded, "record system info", system);
+}
+
+/// The snapshot an agent's `/api/system` answer describes, stamped with the hub's clock.
+fn metric_snapshot(system_id: &str, agent: AgentResponse, now_secs: u64) -> MetricSnapshot {
+    let cpu = agent.cpu.as_ref();
+    let memory = agent.memory.as_ref();
+    let load = agent.load_average.as_ref();
+    MetricSnapshot {
+        system_id: system_id.to_string(),
+        timestamp: now_secs,
+        cpu_percent: cpu.and_then(|c| c.usage_percent).unwrap_or(0.0),
+        memory_percent: memory.and_then(|m| m.usage_percent).unwrap_or(0.0),
+        swap_percent: agent
+            .swap
+            .as_ref()
+            .and_then(|s| s.usage_percent)
+            .unwrap_or(0.0),
+        load_one: load.and_then(|l| l.one).unwrap_or(0.0),
+        load_five: load.and_then(|l| l.five).unwrap_or(0.0),
+        load_fifteen: load.and_then(|l| l.fifteen).unwrap_or(0.0),
+        uptime_seconds: agent.uptime_seconds.unwrap_or(0),
+        uptime_display: agent.uptime_display.clone().unwrap_or_default(),
+        memory_used_display: memory
+            .and_then(|m| m.used_display.clone())
+            .unwrap_or_default(),
+        memory_total_display: memory
+            .and_then(|m| m.total_display.clone())
+            .unwrap_or_default(),
+        memory_used_bytes: memory.and_then(|m| m.used_bytes).unwrap_or(0),
+        memory_total_bytes: memory.and_then(|m| m.total_bytes).unwrap_or(0),
+        cpu_logical_cores: cpu.and_then(|c| c.logical_cores).unwrap_or(0),
+        disks: agent
+            .disks
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| DiskSnapshot {
+                mount_point: d.mount_point.unwrap_or_default(),
+                usage_percent: d.usage_percent.unwrap_or(0.0),
+                total_display: d.total_display.unwrap_or_default(),
+                used_display: d.used_display.unwrap_or_default(),
+            })
+            .collect(),
+        top_processes: agent
+            .top_processes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| ProcessSnapshot {
+                pid: p.pid.unwrap_or(0),
+                name: p.name.unwrap_or_default(),
+                cpu_usage: p.cpu_usage.unwrap_or(0.0),
+                memory_usage_display: p.memory_usage_display.unwrap_or_default(),
+                memory_percent: p.memory_percent.unwrap_or(0.0),
+            })
+            .collect(),
+    }
+}
+
+/// Stores one alert record per active alert incident the agent reports.
+async fn store_agent_alerts(state: &AppState, system: &SystemInfo, client: &reqwest::Client) {
+    let alerts_url = format!("{}/api/alerts", system.url.trim_end_matches('/'));
+    let Ok(resp) = client.get(&alerts_url).send().await else {
+        return;
+    };
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(active) = body.get("active").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let stored_at = now_iso();
+    for alert_val in active {
+        let stored = state
+            .db
+            .insert_alert(&alert_record(system, alert_val, &stored_at));
+        warn_on_failure(stored, "store an alert record", system);
+    }
+}
+
+/// A string field of the agent's untyped JSON, if present.
+fn text(value: Option<&serde_json::Value>) -> Option<&str> {
+    value.and_then(|v| v.as_str())
+}
+
+/// One active alert, read field by field from the agent's untyped JSON.
+fn alert_record(
+    system: &SystemInfo,
+    alert_val: &serde_json::Value,
+    stored_at: &str,
+) -> AlertRecord {
+    let id = text(alert_val.get("id"))
+        .map(|s| format!("{}_{}", system.id, s))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    AlertRecord {
+        id,
+        system_id: system.id.clone(),
+        system_name: system.name.clone(),
+        severity: text(alert_val.get("rule").and_then(|v| v.get("severity")))
+            .unwrap_or("warning")
+            .to_string(),
+        message: text(alert_val.get("message")).unwrap_or("").to_string(),
+        current_value: alert_val
+            .get("current_value")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32,
+        fired_at: text(alert_val.get("fired_at")).unwrap_or("").to_string(),
+        stored_at: stored_at.to_string(),
+        acknowledged: false,
+    }
+}
+
+fn store_metrics(state: &AppState, snap: &MetricSnapshot) {
+    let ts = snap.timestamp;
+    let sid = &snap.system_id;
+
+    let _ = state.db.insert_metric(sid, "cpu", snap.cpu_percent, ts);
+    let _ = state
+        .db
+        .insert_metric(sid, "memory", snap.memory_percent, ts);
+    let _ = state.db.insert_metric(sid, "swap", snap.swap_percent, ts);
+    let _ = state
+        .db
+        .insert_metric(sid, "load1", snap.load_one as f32, ts);
+    let _ = state
+        .db
+        .insert_metric(sid, "load5", snap.load_five as f32, ts);
+
+    for disk in &snap.disks {
+        let metric = format!("disk:{}", disk.mount_point);
+        let _ = state.db.insert_metric(sid, &metric, disk.usage_percent, ts);
+    }
+
+    // Update live metrics cache
+    let mut live = state.live_metrics.write().unwrap();
+    live.insert(
+        sid.clone(),
+        crate::state::LiveMetrics {
+            cpu_percent: snap.cpu_percent,
+            memory_percent: snap.memory_percent,
+            load_one: snap.load_one,
+            disks: snap
+                .disks
+                .iter()
+                .map(|d| (d.mount_point.clone(), d.usage_percent))
+                .collect(),
+            updated_at: ts,
+        },
+    );
+}
+
+fn unix_to_iso8601(secs: u64) -> String {
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let mins = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    let mut y = 1970i64;
+    let mut d = days_since_epoch as i64;
+    loop {
+        let days_in_year = if is_leap(y) { 366 } else { 365 };
+        if d < days_in_year {
+            break;
+        }
+        d -= days_in_year;
+        y += 1;
+    }
+    let month_days = if is_leap(y) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m = 1;
+    for &md in &month_days {
+        if d < md as i64 {
+            break;
+        }
+        d -= md as i64;
+        m += 1;
+    }
+    let day = d + 1;
+    format!("{y:04}-{m:02}-{day:02}T{hours:02}:{mins:02}:{s:02}Z")
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use axum::{Json, Router, routing::get};
+
+    fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+        let state = AppState::new(db);
+        (state, dir)
+    }
+
+    fn sample_system(id: &str, url: String) -> SystemInfo {
+        SystemInfo {
+            id: id.to_string(),
+            name: "test-sys".into(),
+            url,
+            token: String::new(),
+            status: SystemStatus::Unknown,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled: true,
+        }
+    }
+
+    async fn spawn_mock_agent(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn poll_system_success_updates_status_hardware_info_and_metrics() {
+        let (state, _dir) = temp_state();
+        let system_json = serde_json::json!({
+            "hostname": "host1",
+            "os": {"name": "Ubuntu", "pretty_name": "Ubuntu 22.04"},
+            "kernel": "6.6.0",
+            "cpu": {"model": "Generic", "logical_cores": 4, "usage_percent": 12.5},
+            "memory": {"total_bytes": 1000, "total_display": "1KB", "used_display": "500B", "used_bytes": 500, "usage_percent": 50.0},
+            "swap": {"usage_percent": 0.0},
+            "load_average": {"one": 0.1, "five": 0.2, "fifteen": 0.3},
+            "uptime_seconds": 100,
+            "uptime_display": "1m",
+            "disks": [{"mount_point": "/", "usage_percent": 40.0, "total_display": "10G", "used_display": "4G"}],
+            "top_processes": []
+        });
+        let alerts_json = serde_json::json!({"active": []});
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let v = system_json.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(move || {
+                    let v = alerts_json.clone();
+                    async move { Json(v) }
+                }),
+            );
+        let url = spawn_mock_agent(app).await;
+
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Online);
+        assert_eq!(updated.hostname.as_deref(), Some("host1"));
+        assert_eq!(updated.cpu_cores, Some(4));
+
+        let points = state.db.get_metrics("id-1", "cpu", 10, None).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, 12.5);
+
+        let disk_points = state.db.get_metrics("id-1", "disk:/", 10, None).unwrap();
+        assert_eq!(disk_points.len(), 1);
+
+        let live = state.live_metrics.read().unwrap();
+        assert_eq!(live.get("id-1").unwrap().cpu_percent, 12.5);
+    }
+
+    #[tokio::test]
+    async fn poll_system_stores_active_alerts_from_agent() {
+        let (state, _dir) = temp_state();
+        let system_json = serde_json::json!({});
+        let alerts_json = serde_json::json!({
+            "active": [{
+                "id": "4c0a8f0e-2b1d-4f5e-9a37-6c1e2d3b4a50-1",
+                "rule": {"severity": "critical"},
+                "current_value": 97.5,
+                "fired_at": "2026-01-01T00:00:00Z",
+                "message": "CPU too high"
+            }]
+        });
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let v = system_json.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(move || {
+                    let v = alerts_json.clone();
+                    async move { Json(v) }
+                }),
+            );
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let alerts = state.db.get_alerts(Some("id-1"), None, 10).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "critical");
+        assert_eq!(alerts[0].message, "CPU too high");
+        assert_eq!(alerts[0].id, "id-1_4c0a8f0e-2b1d-4f5e-9a37-6c1e2d3b4a50-1");
+    }
+
+    fn agent_alert(incident_id: &str, cpu_percent: f64) -> serde_json::Value {
+        serde_json::json!({
+            "id": incident_id,
+            "rule": {"severity": "warning"},
+            "current_value": cpu_percent,
+            "fired_at": "2026-01-01T00:00:00Z",
+            "message": format!("CPU at {cpu_percent}%")
+        })
+    }
+
+    #[tokio::test]
+    async fn poll_system_stores_one_alert_record_per_incident() {
+        const RUN: &str = "4c0a8f0e-2b1d-4f5e-9a37-6c1e2d3b4a50";
+        let (state, _dir) = temp_state();
+        let active = Arc::new(std::sync::Mutex::new(serde_json::json!([])));
+        let served = active.clone();
+        let app = Router::new()
+            .route("/api/system", get(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/api/alerts",
+                get(move || {
+                    let v = served.lock().unwrap().clone();
+                    async move { Json(serde_json::json!({ "active": v })) }
+                }),
+            );
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        // (name, (incident sequence, cpu) served by the agent, sequence to acknowledge after
+        //  the poll, expected (sequence, acknowledged, cpu, message) per record, by sequence).
+        // Each row runs against the records the previous rows left behind.
+        type Served = &'static [(u64, f64)];
+        type Records = &'static [(u64, bool, f32, &'static str)];
+        let cases: [(&str, Served, Option<u64>, Records); 4] = [
+            (
+                "first incident is recorded",
+                &[(1, 95.5)],
+                Some(1),
+                &[(1, true, 95.5, "CPU at 95.5%")],
+            ),
+            (
+                "the same incident on a later poll keeps its first-seen value, message and acknowledgement",
+                &[(1, 97.0)],
+                None,
+                &[(1, true, 95.5, "CPU at 95.5%")],
+            ),
+            (
+                "two incidents on one poll get a record each",
+                &[(2, 96.0), (3, 98.0)],
+                None,
+                &[
+                    (1, true, 95.5, "CPU at 95.5%"),
+                    (2, false, 96.0, "CPU at 96%"),
+                    (3, false, 98.0, "CPU at 98%"),
+                ],
+            ),
+            (
+                "an incident the agent no longer reports stays unacknowledged",
+                &[(3, 98.0)],
+                None,
+                &[
+                    (1, true, 95.5, "CPU at 95.5%"),
+                    (2, false, 96.0, "CPU at 96%"),
+                    (3, false, 98.0, "CPU at 98%"),
+                ],
+            ),
+        ];
+        let record_id = |sequence: u64| format!("id-1_{RUN}-{sequence}");
+        for (name, served, acknowledge, expected) in cases {
+            *active.lock().unwrap() = served
+                .iter()
+                .map(|&(sequence, cpu)| agent_alert(&format!("{RUN}-{sequence}"), cpu))
+                .collect();
+            poll_system(state.clone(), &system).await;
+            if let Some(sequence) = acknowledge {
+                state.db.acknowledge_alert(&record_id(sequence)).unwrap();
+            }
+            let mut records: Vec<(String, bool, f32, String)> = state
+                .db
+                .get_alerts(Some("id-1"), None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|a| (a.id, a.acknowledged, a.current_value, a.message))
+                .collect();
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+            let expected: Vec<(String, bool, f32, String)> = expected
+                .iter()
+                .map(|&(sequence, acked, cpu, message)| {
+                    (record_id(sequence), acked, cpu, message.to_string())
+                })
+                .collect();
+            assert_eq!(records, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_system_marks_offline_on_json_parse_error() {
+        let (state, _dir) = temp_state();
+        let app = Router::new().route("/api/system", get(|| async { "not json" }));
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Offline);
+        assert!(updated.last_error.unwrap().contains("JSON parse error"));
+    }
+
+    #[tokio::test]
+    async fn poll_system_marks_offline_on_http_error_status() {
+        let (state, _dir) = temp_state();
+        let app = Router::new().route(
+            "/api/system",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let url = spawn_mock_agent(app).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Offline);
+        assert!(updated.last_error.unwrap().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn poll_system_marks_offline_on_connection_error() {
+        let (state, _dir) = temp_state();
+        // Nothing is listening on this port: reqwest should fail to connect.
+        let system = sample_system("id-1", "http://127.0.0.1:1".to_string());
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let updated = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(updated.status, SystemStatus::Offline);
+        assert!(updated.last_error.is_some());
+    }
+
+    #[test]
+    fn store_metrics_writes_all_metrics_and_updates_live_cache() {
+        let (state, _dir) = {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+            db.insert_system(&sample_system("id-1", "http://x".to_string()))
+                .unwrap();
+            (AppState::new(db), dir)
+        };
+
+        let snap = MetricSnapshot {
+            system_id: "id-1".to_string(),
+            timestamp: 100,
+            cpu_percent: 10.0,
+            memory_percent: 20.0,
+            swap_percent: 5.0,
+            load_one: 0.1,
+            load_five: 0.2,
+            load_fifteen: 0.3,
+            uptime_seconds: 60,
+            uptime_display: "1m".to_string(),
+            memory_used_display: "1 GB".to_string(),
+            memory_total_display: "4 GB".to_string(),
+            memory_used_bytes: 1_000_000,
+            memory_total_bytes: 4_000_000,
+            cpu_logical_cores: 4,
+            disks: vec![DiskSnapshot {
+                mount_point: "/".to_string(),
+                usage_percent: 33.0,
+                total_display: "10G".to_string(),
+                used_display: "3G".to_string(),
+            }],
+            top_processes: vec![],
+        };
+
+        store_metrics(&state, &snap);
+
+        assert_eq!(
+            state.db.get_metrics("id-1", "cpu", 10, None).unwrap()[0].value,
+            10.0
+        );
+        assert_eq!(
+            state.db.get_metrics("id-1", "memory", 10, None).unwrap()[0].value,
+            20.0
+        );
+        assert_eq!(
+            state.db.get_metrics("id-1", "swap", 10, None).unwrap()[0].value,
+            5.0
+        );
+        assert_eq!(
+            state.db.get_metrics("id-1", "disk:/", 10, None).unwrap()[0].value,
+            33.0
+        );
+
+        let live = state.live_metrics.read().unwrap();
+        let m = live.get("id-1").unwrap();
+        assert_eq!(m.cpu_percent, 10.0);
+        assert_eq!(m.disks, vec![("/".to_string(), 33.0)]);
+        assert_eq!(m.updated_at, 100);
+    }
+
+    #[test]
+    fn agent_response_deserializes_with_all_fields_missing() {
+        let resp: AgentResponse = serde_json::from_str("{}").unwrap();
+        assert!(resp.hostname.is_none());
+        assert!(resp.os.is_none());
+        assert!(resp.cpu.is_none());
+        assert!(resp.disks.is_none());
+        assert!(resp.top_processes.is_none());
+    }
+
+    #[test]
+    fn agent_response_deserializes_partial_nested_fields() {
+        let resp: AgentResponse =
+            serde_json::from_str(r#"{"cpu":{"usage_percent":42.0}}"#).unwrap();
+        assert_eq!(resp.cpu.unwrap().usage_percent, Some(42.0));
+    }
+
+    #[test]
+    fn unix_to_iso8601_epoch_zero() {
+        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn unix_to_iso8601_leap_day_boundary() {
+        assert_eq!(unix_to_iso8601(1_709_251_200), "2024-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn is_leap_rules() {
+        assert!(is_leap(2000));
+        assert!(!is_leap(1900));
+        assert!(is_leap(2024));
+        assert!(!is_leap(2023));
+    }
+
+    mod applications {
+        use super::*;
+        use crate::applications::{
+            ApplicationHealth, ApplicationName, ApplicationReport, Gauges, HeldRound, RecentRounds,
+            RoundId, ScrapeInterval, ScrapeRound,
+        };
+        use crate::collector::application_poll::{RefusedPoll, refused_poll};
+        use crate::state::SystemApplications;
+        use axum::http::{StatusCode, header};
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+
+        const RUN: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
+        fn system_json() -> serde_json::Value {
+            serde_json::json!({"hostname": "host1", "cpu": {"usage_percent": 1.0}})
+        }
+
+        fn round_body(seq: u64, heap: f64, scraped_at: u64) -> String {
+            serde_json::json!({
+                "round": {"run": RUN, "seq": seq},
+                "interval_secs": 15,
+                "scraped_at": scraped_at,
+                "applications": [{
+                    "name": "orders", "health": "up", "version": "2.4.1",
+                    "gauges": {"heap_used_bytes": heap}
+                }]
+            })
+            .to_string()
+        }
+
+        /// An agent whose `/api/applications` answers `status` with `body`; `None` leaves
+        /// the route out, as an agent older than RFC 0009 does.
+        fn agent(applications: Option<(StatusCode, String)>) -> Router {
+            let base = Router::new()
+                .route("/api/system", get(|| async { Json(system_json()) }))
+                .route(
+                    "/api/alerts",
+                    get(|| async { Json(serde_json::json!({"active": []})) }),
+                );
+            match applications {
+                None => base,
+                Some((status, body)) => base.route(
+                    "/api/applications",
+                    get(move || {
+                        let body = body.clone();
+                        async move { (status, [(header::CONTENT_TYPE, "application/json")], body) }
+                    }),
+                ),
+            }
+        }
+
+        async fn polled(state: &Arc<AppState>, app: Router) -> SystemInfo {
+            let url = spawn_mock_agent(app).await;
+            let system = sample_system("id-1", url);
+            state.db.insert_system(&system).unwrap();
+            system
+        }
+
+        fn up_points(state: &AppState) -> Vec<u64> {
+            state
+                .db
+                .get_metrics("id-1", "app:orders:up", 100, None)
+                .unwrap()
+                .iter()
+                .map(|p| p.timestamp)
+                .collect()
+        }
+
+        fn shown_seq(state: &AppState) -> Option<u64> {
+            let live = state.live_applications.read().unwrap();
+            live.get("id-1")?
+                .shown
+                .as_ref()
+                .map(|held| held.round.id().seq())
+        }
+
+        fn status(state: &AppState) -> SystemStatus {
+            state.db.get_system("id-1").unwrap().unwrap().status
+        }
+
+        fn now_secs() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        }
+
+        /// A held round (seq 9) and a remembered id, as an earlier push or poll left them.
+        fn seed(state: &AppState) -> (RoundId, crate::applications::RoundDigest) {
+            let round = ScrapeRound::new(
+                RoundId::parse(RUN, 9).unwrap(),
+                ScrapeInterval::from_secs(15).unwrap(),
+                vec![ApplicationReport {
+                    name: ApplicationName::parse("orders").unwrap(),
+                    health: ApplicationHealth::Up,
+                    version: None,
+                    gauges: Gauges::default(),
+                }],
+            )
+            .unwrap();
+            let digest = state.digester.digest(&round);
+            let mut recent = RecentRounds::default();
+            recent.remember(round.id(), digest);
+            let id = round.id();
+            let entry = SystemApplications {
+                shown: Some(HeldRound {
+                    round,
+                    received_at: 1,
+                }),
+                recent,
+                ..SystemApplications::default()
+            };
+            state
+                .live_applications
+                .write()
+                .unwrap()
+                .insert("id-1".into(), entry);
+            (id, digest)
+        }
+
+        #[tokio::test]
+        async fn a_polled_round_is_stored_at_hub_time_and_shown() {
+            let (state, _dir) = temp_state();
+            // A far-future agent clock changes nothing.
+            let body = round_body(1, 300.0, u64::MAX);
+            let system = polled(&state, agent(Some((StatusCode::OK, body)))).await;
+            let before = now_secs();
+            poll_system(state.clone(), &system).await;
+            let after = now_secs();
+            let points = up_points(&state);
+            assert_eq!(points.len(), 1, "one up point");
+            // A few seconds of slack for a host clock that steps (WSL2 resyncs); the agent's
+            // clock here says u64::MAX, so any slack still tells the two apart.
+            assert!(
+                (before.saturating_sub(30)..=after + 30).contains(&points[0]),
+                "hub time: {} not near {before}..={after}",
+                points[0]
+            );
+            assert_eq!(shown_seq(&state), Some(1));
+            assert_eq!(status(&state), SystemStatus::Online);
+        }
+
+        #[tokio::test]
+        async fn the_same_round_on_two_polls_is_stored_once() {
+            let (state, _dir) = temp_state();
+            let body = round_body(1, 300.0, 1);
+            let system = polled(&state, agent(Some((StatusCode::OK, body)))).await;
+            poll_system(state.clone(), &system).await;
+            poll_system(state.clone(), &system).await;
+            assert_eq!(up_points(&state).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_systems_polls_are_paced_two_rounds_then_one_per_8_seconds() {
+            let (state, _dir) = temp_state();
+            let seq = Arc::new(AtomicU64::new(0));
+            let next = seq.clone();
+            let app = agent(None).route(
+                "/api/applications",
+                get(move || {
+                    let n = next.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        (
+                            [(header::CONTENT_TYPE, "application/json")],
+                            round_body(n, 300.0, 1),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+            let system = polled(&state, app).await;
+            for _ in 0..3 {
+                poll_system(state.clone(), &system).await;
+            }
+            assert_eq!(
+                seq.load(Ordering::SeqCst),
+                3,
+                "three distinct rounds were polled"
+            );
+            assert_eq!(up_points(&state).len(), 2, "the burst is two");
+            assert_eq!(shown_seq(&state), Some(2));
+        }
+
+        #[tokio::test]
+        async fn no_round_or_an_older_agent_forgets_the_shown_round_and_keeps_the_rest() {
+            let null = r#"{"round":null,"interval_secs":null,"scraped_at":null,"applications":[]}"#;
+            let cases = [
+                ("an agent older than RFC 0009 (404)", agent(None)),
+                (
+                    "applications off (null round)",
+                    agent(Some((StatusCode::OK, null.into()))),
+                ),
+            ];
+            for (case, app) in cases {
+                let (state, _dir) = temp_state();
+                let system = polled(&state, app).await;
+                let (id, digest) = seed(&state);
+                poll_system(state.clone(), &system).await;
+                let live = state.live_applications.read().unwrap();
+                let entry = live.get("id-1").expect("the entry stays");
+                assert!(entry.shown.is_none(), "case: {case}: nothing shown");
+                assert!(
+                    entry.recent.contains(id, digest),
+                    "case: {case}: recent kept"
+                );
+                drop(live);
+                assert_eq!(status(&state), SystemStatus::Online, "case: {case}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unusable_answer_leaves_the_shown_round_and_the_status_alone() {
+            let oversize = format!(r#"{{"round":null,"pad":"{}"}}"#, "x".repeat(300 * 1024));
+            let just_over = format!(r#"{{"round":null,"pad":"{}"}}"#, "x".repeat(256 * 1024));
+            assert!(just_over.len() > 256 * 1024);
+            let refused = round_body(1, 300.0, 1).replace(RUN, "not-a-uuid");
+            let cases = [
+                (
+                    "a server error",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    round_body(1, 300.0, 1),
+                ),
+                (
+                    "a wrong token",
+                    StatusCode::UNAUTHORIZED,
+                    round_body(1, 300.0, 1),
+                ),
+                ("bad JSON", StatusCode::OK, "{not json".to_string()),
+                ("a body over 256 KiB", StatusCode::OK, oversize),
+                ("a body just over 256 KiB", StatusCode::OK, just_over),
+                ("a refused round", StatusCode::OK, refused),
+            ];
+            for (case, code, body) in cases {
+                let (state, _dir) = temp_state();
+                let system = polled(&state, agent(Some((code, body)))).await;
+                seed(&state);
+                poll_system(state.clone(), &system).await;
+                assert_eq!(shown_seq(&state), Some(9), "case: {case}: still shown");
+                assert!(up_points(&state).is_empty(), "case: {case}: nothing stored");
+                assert_eq!(status(&state), SystemStatus::Online, "case: {case}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_body_of_exactly_256_kib_is_read() {
+            let frame = r#"{"round":null,"pad":""}"#;
+            let body = frame.replace(
+                r#""pad":"""#,
+                &format!(r#""pad":"{}""#, "x".repeat(256 * 1024 - frame.len())),
+            );
+            assert_eq!(body.len(), 256 * 1024);
+            let (state, _dir) = temp_state();
+            let system = polled(&state, agent(Some((StatusCode::OK, body)))).await;
+            seed(&state);
+            poll_system(state.clone(), &system).await;
+            assert_eq!(
+                shown_seq(&state),
+                None,
+                "the null round was read: nothing shown"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_chunked_body_over_256_kib_is_refused_while_it_streams() {
+            // No Content-Length: only a cap on the bytes read can refuse it.
+            let app = agent(None).route(
+                "/api/applications",
+                get(|| async {
+                    let pad = "x".repeat(1024);
+                    let chunks = std::iter::once(r#"{"round":null,"pad":""#.to_string())
+                        .chain(std::iter::repeat_n(pad, 300))
+                        .chain(std::iter::once(r#""}"#.to_string()))
+                        .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)));
+                    axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+                }),
+            );
+            let (state, _dir) = temp_state();
+            let system = polled(&state, app).await;
+            seed(&state);
+            poll_system(state.clone(), &system).await;
+            assert_eq!(shown_seq(&state), Some(9), "the null round wasn't read");
+        }
+
+        /// An agent answering a new round (seq 1, 2, …) on every poll.
+        fn counting_agent() -> Router {
+            let seq = Arc::new(AtomicU64::new(0));
+            agent(None).route(
+                "/api/applications",
+                get(move || {
+                    let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        (
+                            [(header::CONTENT_TYPE, "application/json")],
+                            round_body(n, 300.0, 1),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn each_system_polls_under_a_pace_of_its_own() {
+            let (state, _dir) = temp_state();
+            let mut systems = Vec::new();
+            for id in ["id-1", "id-2"] {
+                let url = spawn_mock_agent(counting_agent()).await;
+                let system = sample_system(id, url);
+                state.db.insert_system(&system).unwrap();
+                systems.push(system);
+            }
+            for system in &systems {
+                for _ in 0..3 {
+                    poll_system(state.clone(), system).await;
+                }
+            }
+            for id in ["id-1", "id-2"] {
+                let stored = state.db.get_metrics(id, "app:orders:up", 10, None).unwrap();
+                assert_eq!(stored.len(), 2, "{id}: its own burst of two");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_systems_poll_pace_refills_one_round_per_8_seconds() {
+            let (state, _dir) = temp_state();
+            let system = polled(&state, counting_agent()).await;
+            for _ in 0..3 {
+                poll_system(state.clone(), &system).await;
+            }
+            assert_eq!(up_points(&state).len(), 2, "the burst is two");
+            tokio::time::sleep(Duration::from_millis(8_200)).await;
+            poll_system(state.clone(), &system).await;
+            assert_eq!(up_points(&state).len(), 3, "one token refilled after 8 s");
+            assert_eq!(shown_seq(&state), Some(4));
+        }
+
+        #[tokio::test]
+        async fn a_poll_never_follows_a_redirect() {
+            let hits = Arc::new(AtomicU64::new(0));
+            let counted = hits.clone();
+            let target = spawn_mock_agent(Router::new().fallback(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { Json(system_json()) }
+            }))
+            .await;
+            let redirect = move |path: &'static str| {
+                let location = format!("{target}{path}");
+                move || {
+                    let location = location.clone();
+                    async move {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, location)],
+                        )
+                            .into_response()
+                    }
+                }
+            };
+            let cases = [
+                (
+                    "the system poll",
+                    Router::new().route("/api/system", get(redirect("/api/system"))),
+                    SystemStatus::Offline,
+                ),
+                (
+                    "the applications poll",
+                    agent(None).route("/api/applications", get(redirect("/api/applications"))),
+                    SystemStatus::Online,
+                ),
+                (
+                    "the alerts poll",
+                    Router::new()
+                        .route("/api/system", get(|| async { Json(system_json()) }))
+                        .route("/api/alerts", get(redirect("/api/alerts")))
+                        .route(
+                            "/api/applications",
+                            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                        ),
+                    SystemStatus::Online,
+                ),
+            ];
+            for (case, app, expected) in cases {
+                let (state, _dir) = temp_state();
+                let system = polled(&state, app).await;
+                seed(&state);
+                poll_system(state.clone(), &system).await;
+                assert_eq!(
+                    shown_seq(&state),
+                    Some(9),
+                    "case: {case}: a 3xx clears nothing"
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 0, "case: {case}: not followed");
+                let updated = state.db.get_system("id-1").unwrap().unwrap();
+                assert_eq!(updated.status, expected, "case: {case}");
+                if expected == SystemStatus::Offline {
+                    let error = updated.last_error.unwrap_or_default();
+                    assert!(
+                        error.contains("307"),
+                        "case: {case}: names the 3xx: {error}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_systems_refused_polls_warn_at_most_once_an_hour() {
+            let base = Instant::now();
+            let at = |secs: u64| base + Duration::from_secs(secs);
+            let cases = [
+                ("never warned", None, at(0), RefusedPoll::Warn),
+                (
+                    "warned a minute ago",
+                    Some(at(0)),
+                    at(60),
+                    RefusedPoll::Quiet,
+                ),
+                (
+                    "just under an hour",
+                    Some(at(0)),
+                    at(3_599),
+                    RefusedPoll::Quiet,
+                ),
+                ("exactly an hour", Some(at(0)), at(3_600), RefusedPoll::Warn),
+                (
+                    "a clock behind the last warning",
+                    Some(at(10)),
+                    at(0),
+                    RefusedPoll::Quiet,
+                ),
+            ];
+            for (case, last, now, expected) in cases {
+                assert_eq!(refused_poll(last, now), expected, "case: {case}");
+            }
+        }
+    }
+}

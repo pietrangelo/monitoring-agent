@@ -104,7 +104,11 @@ monitoring-agent/system-hub/
     ├── models.rs               # Data types
     ├── state.rs                # Shared state + live metrics cache
     ├── db.rs                   # SQLite: migrations, CRUD, queries
-    ├── collector.rs            # HTTP poller (pulls agent /api/system)
+    ├── collector/
+    │   ├── mod.rs              # HTTP poller (agent /api/system and /api/alerts)
+    │   └── application_poll.rs # Polls /api/applications
+    ├── application_wire.rs     # Scrape rounds as agents send them (frame and poll JSON)
+    ├── round_intake.rs         # Admits and stores a round from either source
     ├── applications.rs         # Scrape rounds: admission, freshness, metric points
     ├── retention.rs            # Periodic pruning of app:* points
     ├── push/
@@ -281,11 +285,17 @@ scrapes each one's Actuator every interval and serves the result on `GET /api/ap
 | `GET /api/summary` | GET | Aggregated stats (online/offline/alerts) |
 | `GET /api/systems/{id}/metrics?metric=cpu&limit=300` | GET | Time-series for a specific metric |
 | `GET /api/systems/{id}/history?limit=300` | GET | Combined CPU + memory history |
-| `GET /api/systems/{id}/applications` | GET | The system's latest Spring Boot scrape round (from push), with `received_at`, `age_secs` and `freshness` (`fresh`/`stale`) computed on the hub; all three `null` and `applications: []` when none is held. History: `/metrics?metric=app:<name>:<gauge>` |
+| `GET /api/systems/{id}/applications` | GET | The system's latest Spring Boot scrape round (pushed, or polled from the agent's `/api/applications`), with `received_at`, `age_secs` and `freshness` (`fresh`/`stale`) computed on the hub; all three `null` and `applications: []` when none is held. History: `/metrics?metric=app:<name>:<gauge>` |
 | `GET /api/alerts?acknowledged=false&limit=50` | GET | Alert history |
 | `POST /api/alerts/{id}/acknowledge` | POST | Acknowledge an alert |
 | `GET /api/stream/summary` | **SSE** | Live summary + system list + live metrics every 5s |
 | `GET /api/push` | **WebSocket** | Agent push endpoint (MessagePack) |
+
+**Polling** (`POST /api/systems` with a URL): every 30 s the hub GETs the agent's
+`/api/system`, `/api/alerts` and `/api/applications` with the system's token in
+`X-API-Key`. It follows **no redirects**: a registered URL that answers with a 3xx shows as
+offline, with the 3xx in `last_error`; register the final URL instead. An agent without
+`/api/applications` (404) or without a round simply has no applications.
 
 ### Push protocol (WebSocket + MessagePack)
 

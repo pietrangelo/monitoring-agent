@@ -57,9 +57,15 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 - Maintains a registry of known systems (`db.rs`, SQLite table `systems`) — name, URL, token,
   poll interval, last-known status/OS info.
 - Two ingestion modes, both able to run simultaneously per fleet:
-  - **HTTP poll** (`collector.rs`): hub periodically calls each registered agent's
-    `/api/system` endpoint on its configured interval. Used when the hub can reach the agent
-    (agent behind NAT/firewall from the hub's perspective is *not* this mode).
+  - **HTTP poll** (`collector/`): every 30 s the hub calls each enabled agent's
+    `/api/system`, then `/api/alerts` and `/api/applications` (it ignores
+    `poll_interval_secs`). No poll follows a redirect, so the per-system token never leaves
+    the registered host; a URL that redirects shows as offline, naming the 3xx. Used when the
+    hub can reach the agent (agent behind NAT/firewall from the hub's perspective is *not*
+    this mode). A polled scrape round is admitted and stored like a pushed one, under a pace
+    kept per system; a 404 (an older agent) or a `null` round forgets the shown round but keeps
+    the recent rounds; any other failure (another status, a body over 256 KiB, bad JSON, a
+    refused round) is logged and changes neither the shown round nor the system's status.
   - **WebSocket push** (`push/`): agents connect out to the hub's `/api/push` endpoint,
     authenticate with a shared token (`HUB_PUSH_TOKEN`), then stream MessagePack-encoded
     snapshots every `PUSH_INTERVAL` seconds, and application frames when the agent watches
@@ -72,7 +78,7 @@ Aggregates data from many `system-agent` instances. Responsibilities:
   `metric_retention` row or 24h.
 - Admits application rounds (`applications.rs`, RFC 0009 §8): an exact re-send of one of a
   system's last 8 accepted rounds (same round id and same content digest) is a duplicate, and
-  each source (one push connection) is paced by its own token bucket (2 rounds, then one per
+  each source (one push connection, or the poller for one system) is paced by its own token bucket (2 rounds, then one per
   8 s). The check and the store are one step under the database mutex
   (`Database::store_round`).
 - Holds each system's latest accepted scrape round in memory (`live_applications` in
@@ -89,7 +95,7 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 ```
 System Agent (:9090)                         System Hub (:9091)
 ┌───────────────────────┐                    ┌───────────────────────────┐
-│ collectors/ (bg loop)  │                    │ collector.rs (HTTP poll)  │
+│ collectors/ (bg loop)  │                    │ collector/ (HTTP poll)    │
 │   → state.rs (ring     │◄──── GET ──────────│   pulls /api/system on    │
 │     buffer history)    │      /api/system    │   each system's interval  │
 │   → alerts.rs          │                    │                            │
@@ -134,7 +140,7 @@ match those rules (listed under Open architectural questions below).
 | **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
 | **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`); `applications/round.rs` (`RoundId`, `RoundSequence`, `ScrapeRound`, `NamedReport`, `health_change`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version); `applications/scraper.rs` (the HTTP client: `Scraper`, `Timeouts`, the body cap); `applications/scrape_loop.rs` (`scrape_loop`, the round `watch` channel); `routes/applications.rs` (`GET /api/applications` and its JSON) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
-| **Ingestion** | hub | — | `collector.rs` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`, `ConnectionRounds` (a connection's pace and refusal count), `RefusedFrame`; `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `push/application_wire.rs` holds `ApplicationFrameDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` and `FrameRefusal`; `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
+| **Ingestion** | hub | — | `collector/` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`, `ConnectionRounds` (a connection's pace and refusal count), `RefusedFrame`; `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `refused_poll`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables and `store_round`, `state.rs` live cache and `live_applications`, `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`) | stored time series, alert history, retention, and each system's shown scrape round |
 
 **Published contracts between contexts** (both sides must change together, and a
@@ -155,11 +161,15 @@ mixed-version fleet must keep working):
   `[name, health, version | nil, {gauge: f64}]`, with `kind` = `"applications.v1"`; an
   incompatible later shape gets a new kind, which a v1 hub drops. Declared independently in
   `src/push/application_frame.rs` (with `src/applications/wire.rs`) and
-  `system-hub/src/push/application_wire.rs`, and tied by the golden bytes
+  `system-hub/src/application_wire.rs`, and tied by the golden bytes
   `testdata/application-frame-v1.msgpack`, which both crates' tests read. A frame and a
   snapshot never decode as each other (5 elements against 21).
-- *Poll responses*: the agent's `/api/system` and `/api/alerts` JSON → Ingestion
-  (`collector.rs`). `/api/alerts` is read field by field from untyped `serde_json::Value`.
+- *Poll responses*: the agent's `/api/system`, `/api/alerts` and `/api/applications` JSON →
+  Ingestion (`collector/`), none of them through a redirect. `/api/alerts` is read field by
+  field from untyped `serde_json::Value`. `/api/applications` is `{round: {run, seq} | null,
+  interval_secs, scraped_at, applications: [{name, health, version, gauges}]}`; the hub
+  ignores `scraped_at`, and the golden body `testdata/applications-v1.json` ties the two
+  declarations (`src/applications/wire.rs`, `system-hub/src/application_wire.rs`).
   Each active alert's `id` is its incident id, the same on every tick of the incident, and
   `fired_at` is the tick the incident became active. The hub treats the id as an opaque
   string.
@@ -188,7 +198,7 @@ mixed-version fleet must keep working):
 | **severity** | how serious an alert is (info / warning / critical). The hub stores it as a free `String`, defaulting to `"warning"` | `AlertSeverity` (agent), `AlertRecord.severity` (hub) |
 | **alert record** | the hub's stored copy of one alert incident, keyed by `<system id>_<incident id>` and inserted with `INSERT OR IGNORE`, so it keeps the values first seen | `AlertRecord`, `alerts` table |
 | **retention** | how long the hub keeps metric points per system per metric: a `metric_retention` row, else 24 h. For `app:*` metrics a negative (hand-set) row counts as none | `metric_retention` table, `APPLICATION_RETENTION_SECS` |
-| **poll** | the hub fetching a system's snapshot over HTTP on the system's interval | `collector.rs` |
+| **poll** | the hub fetching a system's snapshot, alerts and scrape round over HTTP, every 30 s, following no redirect | `collector/` |
 | **push** | an agent streaming snapshots and scrape rounds to the hub over WebSocket + MessagePack | `push/` (both crates) |
 | **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured. Unset or empty leaves push open; a value that isn't UTF-8 makes the hub refuse to start | `PushToken`, `PushAuth` (hub) |
 | **push handshake** | the JSON text exchange that authenticates a push connection. A *rejection* is an auth message the hub refuses by its content (shape, token or system id); a *refusal* is any `auth_error` answer: a rejection, or a handshake timeout | `AuthMessage`, `HandshakeRejection`, `Refusal`, `Handshake` (hub), `HubMessage` (agent) |
@@ -211,7 +221,7 @@ mixed-version fleet must keep working):
 | **application freshness** | whether a held round is still current: stale once more than two scrape intervals and 30 s have passed since it arrived | `Freshness`, `freshness` |
 | **round digest** | a keyed hash of a scrape round's content as the hub converted it (interval, and each application's name, health, version and gauges). One key per hub process, so no sender can compute one | `RoundDigest`, `RoundDigester` |
 | **recent rounds** | the last 8 (round id, round digest) pairs the hub accepted for a system; a round matching one of them exactly is a duplicate. Kept across disconnects | `RecentRounds` |
-| **source pace** | a token bucket per source of rounds (one push connection): 2 rounds, then one per 8 s, on the monotonic clock | `SourcePace`, `ConnectionRounds` |
+| **source pace** | a token bucket per source of rounds (one push connection, or the poller for one system): 2 rounds, then one per 8 s, on the monotonic clock. The poller's is read and spent inside the admission step, so overlapping polls share it | `SourcePace`, `ConnectionRounds`, `SystemApplications::poll_pace` |
 | **admission** | the hub's decision on a round: accept, duplicate, or too soon | `Admission`, `admit`, `RoundStored` |
 | **round id** | identifies a scrape round: the **agent run** and a sequence counting the run's rounds from 1, never rewinding. The hub parses the run as a UUID and compares ids only for equality | `RoundId` (both crates), `RoundSequence` |
 | **health change** | an application becoming unreachable, or recovering; a change among reported healths (up to down) is not one. The agent logs each: `warn` naming the scrape failure, `info` on recovery | `HealthChange`, `health_change` |
@@ -259,7 +269,10 @@ mixed-version fleet must keep working):
     marking. Log lines name a system id in `Debug` form, so a self-asserted id can't forge
     log lines.
 - **Hub → Agent (poll)**: hub sends the per-system token stored in `db.rs` (as configured via
-  `POST/PUT /api/systems`) as the agent's expected auth token.
+  `POST/PUT /api/systems`) as the agent's expected auth token, in `X-API-Key`. No poll
+  follows a redirect: reqwest strips only standard credential headers across hosts, so a
+  followed redirect would carry the token anywhere. The poll client still honours
+  environment proxies.
 - **Client → Hub**: no auth on the hub's own REST/SSE API in the current implementation — the
   hub is assumed to sit behind a trusted network boundary or reverse proxy (see "Deployment
   patterns" in `README.md`). Adding hub-side client auth would be an architectural change
@@ -355,9 +368,9 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
 - Route tests drive each module's `router`, not the production app: `main.rs` assembles
   that inline (merging the routers, `ServeDir` and CORS), so no test reaches a layer added
   there.
-- **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector.rs`) are
+- **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector/`) are
   tested against real (but temporary) SQLite files via the `tempfile` crate — never against the
-  real `system-hub.db`. `collector.rs`'s `poll_system` is tested against a small mock
+  real `system-hub.db`. `collector/`'s `poll_system` (including the applications poll and the no-redirect rule) is tested against a small mock
   `system-agent`-shaped `axum::serve` instance covering the success, JSON-parse-error,
   HTTP-error, and connection-refused branches.
 - **The hub dashboard** (`static/index.html`) has no JS unit-test harness. Its rendering rule
@@ -409,6 +422,14 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
 Tracked here so they aren't rediscovered from scratch; promote any of these to an RFC
 (`rfcs/`) before acting on them.
 
+- The poller ignores `poll_interval_secs` and polls every enabled system every 30 s, so with
+  the default 15 s scrape interval it stores about every other round: push is the path for
+  full resolution.
+- The hub's poll client honours environment proxies (`HTTP_PROXY` and friends), so polls,
+  and their per-system tokens, go through one when it is set.
+- A refused polled round creates a system's `live_applications` entry to remember when it
+  last warned; a poll racing `DELETE /api/systems/:id` can leave such an entry, holding only
+  that time, for a deleted system.
 - A snapshot series that stops receiving points (a disk unmounted, a system gone quiet) is
   never pruned: snapshot pruning runs only when that metric is inserted.
 - Anyone who can push as a system id (the push token, or anyone when it's unset) can push
@@ -465,7 +486,7 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - When a per-system fetch fails (the system was deleted between two refreshes, or its URL
   can't be served), the dashboard returns early and keeps showing the previously opened
   system's details and charts.
-- Alert-record ids are unbounded: `collector.rs` appends the agent's alert id to the system
+- Alert-record ids are unbounded: `collector/` appends the agent's alert id to the system
   id unchecked, so a long enough agent alert id makes its acknowledge URL hit
   `414 URI Too Long`.
 - The bundled SQLite enforces foreign keys (`SQLITE_DEFAULT_FOREIGN_KEYS=1` in
@@ -476,7 +497,7 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   error on an existing push system would replace it and lose its history.
 - The hub's `alerts` table has no retention. With one record per alert incident, a flapping
   rule adds a record for each incident a poll sees.
-- An agent alert without an `id` gets a random id on the hub (`collector.rs`), so it becomes a
+- An agent alert without an `id` gets a random id on the hub (`collector/`), so it becomes a
   new record on every poll.
 - An alert rule with no disk reading (a named mount point missing from the snapshot, or no
   disks reported at all) reads `0.0`. A mount that briefly disappears ends a `Gt` incident,
@@ -512,7 +533,7 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   its receive buffer. That's harmless now that the hub's write buffer is capped.
 - The snapshot → metric mapping (metric names `cpu`, `memory`, `swap`, `load1`, `load5`,
   `disk:<mount>`) is written twice: once in `push::metric_points` over the push DTO, and
-  once in `collector.rs` over the poll DTO. It belongs in one Fleet History domain function.
+  once in `collector/` over the poll DTO. It belongs in one Fleet History domain function.
 - The Fleet Registry rules applied on each push frame are decided inside the Ingestion
   adapter (`push::update_registry`). Those rules are: refill system info while its
   hostname or OS is missing, and mark the system online. Only the default-name rule lives
@@ -523,6 +544,6 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   no branch for it, so it enters its push loop, which returns `Ok(())` as soon as the
   socket closes, and `main` reconnects without backoff. After an oversize message the hub's
   30 s linger spaces those reconnects; after other drops nothing does.
-- Ingestion reads agent alerts from untyped `serde_json::Value` inside `collector.rs` and
+- Ingestion reads agent alerts from untyped `serde_json::Value` inside `collector/` and
   discards `insert_alert` errors (`let _ =`). Parsing, domain mapping and storage are
   interleaved in one poll function.

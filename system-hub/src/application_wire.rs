@@ -14,8 +14,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The application frame as it arrives (RFC 0009 §7), and its conversion into a
-//! `ScrapeRound`: the anti-corruption layer between what an agent sends and Fleet History.
+//! Scrape rounds as agents send them, pushed as an application frame (RFC 0009 §7) or polled
+//! from `/api/applications` (§6), and their conversion into a `ScrapeRound`: the
+//! anti-corruption layer between what an agent sends and Fleet History.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -48,6 +49,44 @@ pub struct ApplicationReportDto {
     gauges: BTreeMap<String, f64>,
 }
 
+/// The applications poll response as an agent serves it. `scraped_at` (the agent's clock) is
+/// ignored: the hub ages rounds by its own clock.
+#[derive(Debug, PartialEq, Deserialize)]
+pub struct ApplicationsResponseDto {
+    round: Option<RoundIdDto>,
+    interval_secs: Option<u64>,
+    #[serde(default)]
+    applications: Vec<ApplicationReportDto>,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct RoundIdDto {
+    run: String,
+    seq: u64,
+}
+
+/// What a poll of `/api/applications` answered: no round (applications off, or none yet), or
+/// one.
+#[derive(Debug, PartialEq)]
+pub enum PolledRound {
+    NoRound,
+    Round(ScrapeRound),
+}
+
+impl TryFrom<ApplicationsResponseDto> for PolledRound {
+    type Error = ScrapeRoundError;
+
+    fn try_from(response: ApplicationsResponseDto) -> Result<Self, Self::Error> {
+        let Some(round) = response.round else {
+            return Ok(Self::NoRound);
+        };
+        let interval_secs = response
+            .interval_secs
+            .ok_or(ScrapeRoundError::InvalidInterval)?;
+        build_round(&round.run, round.seq, interval_secs, response.applications).map(Self::Round)
+    }
+}
+
 /// Why an application frame was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameRefusal {
@@ -68,18 +107,31 @@ impl TryFrom<ApplicationFrameDto> for ScrapeRound {
         if frame.kind != APPLICATION_FRAME_KIND {
             return Err(FrameRefusal::UnknownKind);
         }
-        let round = || {
-            let id = RoundId::parse(&frame.run, frame.seq)?;
-            let interval = ScrapeInterval::from_secs(frame.interval_secs)?;
-            let applications = frame
-                .applications
-                .into_iter()
-                .map(ApplicationReport::try_from)
-                .collect::<Result<_, _>>()?;
-            ScrapeRound::new(id, interval, applications)
-        };
-        round().map_err(FrameRefusal::Round)
+        build_round(
+            &frame.run,
+            frame.seq,
+            frame.interval_secs,
+            frame.applications,
+        )
+        .map_err(FrameRefusal::Round)
     }
+}
+
+/// Builds a round from the fields both wire shapes carry, refusing it as a whole on the first
+/// broken rule.
+fn build_round(
+    run: &str,
+    seq: u64,
+    interval_secs: u64,
+    applications: Vec<ApplicationReportDto>,
+) -> Result<ScrapeRound, ScrapeRoundError> {
+    let id = RoundId::parse(run, seq)?;
+    let interval = ScrapeInterval::from_secs(interval_secs)?;
+    let applications = applications
+        .into_iter()
+        .map(ApplicationReport::try_from)
+        .collect::<Result<_, _>>()?;
+    ScrapeRound::new(id, interval, applications)
 }
 
 impl TryFrom<ApplicationReportDto> for ApplicationReport {
@@ -106,7 +158,7 @@ mod tests {
 
     /// Written by `testdata/generate_application_frame_v1.py`, an encoder independent of
     /// rmp-serde; the agent's test pins the same bytes.
-    const GOLDEN: &[u8] = include_bytes!("../../../testdata/application-frame-v1.msgpack");
+    const GOLDEN: &[u8] = include_bytes!("../../testdata/application-frame-v1.msgpack");
     const RUN: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 
     fn golden_dto() -> ApplicationFrameDto {
@@ -337,5 +389,99 @@ mod tests {
         assert_eq!(orders.version.as_ref().map(|v| v.as_str().len()), Some(64));
         let gauges: Vec<_> = orders.gauges.iter().map(|(g, _)| g.wire_name()).collect();
         assert_eq!(gauges, ["heap_used_bytes", "uptime_seconds"]);
+    }
+
+    const GOLDEN_JSON: &str = include_str!("../../testdata/applications-v1.json");
+
+    #[test]
+    fn the_golden_poll_body_decodes_to_exactly_the_agents_round() {
+        let decoded: ApplicationsResponseDto = serde_json::from_str(GOLDEN_JSON).unwrap();
+        let golden = golden_dto();
+        assert_eq!(
+            decoded,
+            ApplicationsResponseDto {
+                round: Some(RoundIdDto {
+                    run: golden.run.clone(),
+                    seq: golden.seq,
+                }),
+                interval_secs: Some(golden.interval_secs),
+                applications: golden.applications,
+            }
+        );
+    }
+
+    #[test]
+    fn a_polled_body_converts_like_the_frame_it_mirrors() {
+        let decoded: ApplicationsResponseDto = serde_json::from_str(GOLDEN_JSON).unwrap();
+        let from_frame = ScrapeRound::try_from(golden_dto()).unwrap();
+        assert_eq!(
+            PolledRound::try_from(decoded),
+            Ok(PolledRound::Round(from_frame))
+        );
+    }
+
+    #[test]
+    fn a_polled_body_without_a_round_is_no_round_and_a_broken_one_is_refused() {
+        use ScrapeRoundError::*;
+        let body = |json: &str| serde_json::from_str::<ApplicationsResponseDto>(json).unwrap();
+        let seventeen = format!(
+            r#"{{"round":{{"run":"{RUN}","seq":1}},"interval_secs":15,"applications":[{}]}}"#,
+            (0..17)
+                .map(|i| format!(r#"{{"name":"a{i}","health":"up","version":null,"gauges":{{}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let cases = [
+            (
+                "no round",
+                r#"{"round":null,"interval_secs":null,"scraped_at":null,"applications":[]}"#,
+                Ok(PolledRound::NoRound),
+            ),
+            (
+                "no round, fields missing",
+                r#"{"round":null}"#,
+                Ok(PolledRound::NoRound),
+            ),
+            (
+                "a round without an interval",
+                r#"{"round":{"run":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b","seq":1},"applications":[]}"#,
+                Err(InvalidInterval),
+            ),
+            (
+                "a run that isn't a UUID",
+                r#"{"round":{"run":"x","seq":1},"interval_secs":15,"applications":[]}"#,
+                Err(InvalidRun),
+            ),
+            (
+                "an invalid application name",
+                r#"{"round":{"run":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b","seq":1},"interval_secs":15,"applications":[{"name":"or ders","health":"up","version":null,"gauges":{}}]}"#,
+                Err(InvalidApplicationName),
+            ),
+            (
+                "a repeated application name",
+                r#"{"round":{"run":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b","seq":1},"interval_secs":15,"applications":[{"name":"a","health":"up","version":null,"gauges":{}},{"name":"a","health":"down","version":null,"gauges":{}}]}"#,
+                Err(DuplicateApplicationName),
+            ),
+            (
+                "17 applications",
+                seventeen.as_str(),
+                Err(TooManyApplications),
+            ),
+            (
+                "a far-future scraped_at is ignored",
+                r#"{"round":{"run":"6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b","seq":1},"interval_secs":15,"scraped_at":18446744073709551615,"applications":[]}"#,
+                Ok(PolledRound::Round(
+                    ScrapeRound::new(
+                        RoundId::parse("6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b", 1).unwrap(),
+                        ScrapeInterval::from_secs(15).unwrap(),
+                        vec![],
+                    )
+                    .unwrap(),
+                )),
+            ),
+        ];
+        for (case, json, expected) in cases {
+            assert_eq!(PolledRound::try_from(body(json)), expected, "case: {case}");
+        }
     }
 }

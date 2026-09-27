@@ -27,13 +27,13 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::application_wire;
 use crate::applications::{ScrapeRound, SourcePace};
 use crate::clock::unix_now;
 use crate::db::RoundStored;
 use crate::models::{SystemId, SystemIdError, SystemInfo, SystemStatus};
 use crate::round_intake::{self, Arrival};
 
-mod application_wire;
 mod config;
 use crate::state::{AppState, LiveMetrics};
 pub use config::{PushAuth, PushAuthError, PushConfig};
@@ -2108,7 +2108,8 @@ mod tests {
             let points = up_points(&state, "sys-app");
             assert_eq!(points.len(), 1, "one up point");
             assert!(
-                (before..=after).contains(&points[0].timestamp),
+                // Slack for a host clock that steps; the agent's clock says 1_700_000_000.
+                (before.saturating_sub(30)..=after + 30).contains(&points[0].timestamp),
                 "stored at the hub's time, not the agent's: {}",
                 points[0].timestamp
             );

@@ -16,8 +16,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use crate::applications::{HeldRound, RecentRounds, RoundDigester};
+use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
 use crate::db::Database;
 use crate::models::SystemInfo;
 use serde::Serialize;
@@ -51,6 +52,10 @@ pub struct SystemApplications {
     pub shown: Option<HeldRound>,
     /// The rounds accepted most recently, surviving disconnects, so a re-send is recognised.
     pub recent: RecentRounds,
+    /// The poller's pace for this system; `None` until its first stored round (a full bucket).
+    pub poll_pace: Option<SourcePace>,
+    /// When a refused polled round was last logged at `warn`.
+    pub poll_refusal_warned_at: Option<Instant>,
 }
 
 pub struct AppState {
