@@ -108,6 +108,90 @@ mod tests {
         assert_eq!(content_type, "text/event-stream");
     }
 
+    /// Reads the stream's first event, up to its blank line.
+    async fn first_event(state: Arc<AppState>) -> String {
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = res.into_body().into_data_stream();
+        let mut event = String::new();
+        while !event.contains("\n\n") {
+            let chunk = tokio::time::timeout(
+                Duration::from_secs(5),
+                futures_util::StreamExt::next(&mut body),
+            )
+            .await
+            .expect("an event within 5 s")
+            .expect("the stream goes on")
+            .unwrap();
+            event.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        event
+    }
+
+    /// Characterisation (RFC 0007, Testing plan): the summary event's bytes for a fixed state,
+    /// one system with live metrics. RFC 0007 keeps them as they are.
+    #[tokio::test]
+    async fn the_summary_event_for_a_fixed_state_keeps_its_bytes() {
+        let (state, _dir) = temp_state();
+        state
+            .db
+            .insert_system(&crate::models::SystemInfo {
+                id: "sys-1".into(),
+                name: "web-01".into(),
+                url: "push://".into(),
+                token: "secret".into(),
+                status: crate::models::SystemStatus::Online,
+                last_seen: "1m".into(),
+                last_error: None,
+                os: Some("Ubuntu".into()),
+                hostname: Some("web-01".into()),
+                kernel: None,
+                cpu_model: None,
+                cpu_cores: Some(4),
+                total_memory_display: Some("4 GB".into()),
+                total_memory_bytes: Some(4_000),
+                poll_interval_secs: 10,
+                enabled: true,
+            })
+            .unwrap();
+        plant_live_metrics(&state);
+
+        let event = first_event(state).await;
+
+        let expected_json = concat!(
+            r#"{"active_alerts":0,"live_metrics":{"sys-1":{"cpu_percent":11.5,"#,
+            r#""disks":[["/",50.25],["/home",70.0]],"load_one":0.5,"memory_percent":22.0,"#,
+            r#""updated_at":1700000000}},"offline_count":0,"online_count":1,"#,
+            r#""systems":[{"cpu_cores":4,"cpu_model":null,"enabled":true,"hostname":"web-01","#,
+            r#""id":"sys-1","kernel":null,"last_error":null,"last_seen":"1m","name":"web-01","#,
+            r#""os":"Ubuntu","poll_interval_secs":10,"status":"online","#,
+            r#""total_memory_bytes":4000,"total_memory_display":"4 GB","url":"push://"}],"#,
+            r#""total_systems":1,"type":"summary"}"#,
+        );
+        assert_eq!(event, format!("data: {expected_json}\nevent: summary\n\n"));
+    }
+
+    /// The live metrics `the_summary_event_for_a_fixed_state_keeps_its_bytes` shows.
+    fn plant_live_metrics(state: &AppState) {
+        state.live_metrics.write().unwrap().insert(
+            "sys-1".into(),
+            crate::state::LiveMetrics {
+                cpu_percent: 11.5,
+                memory_percent: 22.0,
+                load_one: 0.5,
+                disks: vec![("/".into(), 50.25), ("/home".into(), 70.0)],
+                updated_at: 1_700_000_000,
+            },
+        );
+    }
+
     #[tokio::test]
     async fn unknown_stream_path_is_not_found() {
         let (state, _dir) = temp_state();
