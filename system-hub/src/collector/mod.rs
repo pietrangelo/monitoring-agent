@@ -900,12 +900,10 @@ mod tests {
             ApplicationHealth, ApplicationName, ApplicationReport, Gauges, HeldRound, RecentRounds,
             RoundId, ScrapeInterval, ScrapeRound,
         };
-        use crate::collector::application_poll::{RefusedPoll, refused_poll};
         use crate::state::SystemApplications;
         use axum::http::{StatusCode, header};
         use axum::response::IntoResponse;
         use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::Instant;
 
         const RUN: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 
@@ -1297,37 +1295,6 @@ mod tests {
                         "case: {case}: names the 3xx: {error}"
                     );
                 }
-            }
-        }
-
-        #[test]
-        fn a_systems_refused_polls_warn_at_most_once_an_hour() {
-            let base = Instant::now();
-            let at = |secs: u64| base + Duration::from_secs(secs);
-            let cases = [
-                ("never warned", None, at(0), RefusedPoll::Warn),
-                (
-                    "warned a minute ago",
-                    Some(at(0)),
-                    at(60),
-                    RefusedPoll::Quiet,
-                ),
-                (
-                    "just under an hour",
-                    Some(at(0)),
-                    at(3_599),
-                    RefusedPoll::Quiet,
-                ),
-                ("exactly an hour", Some(at(0)), at(3_600), RefusedPoll::Warn),
-                (
-                    "a clock behind the last warning",
-                    Some(at(10)),
-                    at(0),
-                    RefusedPoll::Quiet,
-                ),
-            ];
-            for (case, last, now, expected) in cases {
-                assert_eq!(refused_poll(last, now), expected, "case: {case}");
             }
         }
     }

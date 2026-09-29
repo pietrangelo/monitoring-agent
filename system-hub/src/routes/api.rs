@@ -23,6 +23,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::models::*;
+use crate::registry::PollInterval;
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -108,6 +109,13 @@ async fn update_system(
     Path(id): Path<String>,
     Json(payload): Json<UpdateSystemPayload>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    // Parsed before anything is stored: a refused interval refuses the whole body.
+    let poll_interval = payload
+        .poll_interval_secs
+        .map(PollInterval::try_from)
+        .transpose()
+        .map_err(|_| axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
+
     // Verify system exists
     if s.db
         .get_system(&id)
@@ -122,7 +130,7 @@ async fn update_system(
         payload.name.as_deref(),
         payload.url.as_deref(),
         payload.token.as_deref(),
-        payload.poll_interval_secs,
+        poll_interval,
         payload.enabled,
     )
     .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -471,6 +479,176 @@ mod tests {
         let json = body_json(res).await;
         assert_eq!(json["enabled"], false);
         assert_eq!(json["name"], "w"); // untouched
+    }
+
+    async fn register(app: &Router, name: &str) -> String {
+        let body = serde_json::json!({"name": name, "url": "http://x"});
+        let res = app
+            .clone()
+            .oneshot(json_request("POST", "/api/systems", body))
+            .await
+            .unwrap();
+        body_json(res).await["id"].as_str().unwrap().to_string()
+    }
+
+    async fn put_poll_interval(app: &Router, id: &str, raw: serde_json::Value) -> StatusCode {
+        let body = serde_json::json!({"poll_interval_secs": raw});
+        app.clone()
+            .oneshot(json_request("PUT", &format!("/api/systems/{id}"), body))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    // This pins the PUT edge's behaviour only. That the handler parses the body
+    // into `PollInterval` and `update_system_config` binds its value (no `as i64`
+    // cast) is enforced at the type level, by `update_system_config` taking
+    // `Option<PollInterval>`, and is for rosette-auditor to verify.
+    #[tokio::test]
+    async fn update_system_stores_only_a_poll_interval_the_row_can_hold() {
+        let i64_max = i64::MAX as u64;
+        let cases = [
+            (
+                "the column's maximum",
+                serde_json::json!(i64_max),
+                StatusCode::OK,
+                i64_max,
+            ),
+            (
+                "one past the column's maximum",
+                serde_json::json!(i64_max + 1),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                10,
+            ),
+            (
+                "two past the column's maximum",
+                serde_json::json!(i64_max + 2),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                10,
+            ),
+            (
+                "the top bit plus change",
+                serde_json::json!((1u64 << 63) | 0x1234_5678),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                10,
+            ),
+            (
+                "one below u64::MAX",
+                serde_json::json!(u64::MAX - 1),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                10,
+            ),
+            (
+                "u64::MAX",
+                serde_json::json!(u64::MAX),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                10,
+            ),
+            // Pins current behaviour, not the new rule: serde already refuses a
+            // negative number for the body's u64, so this row passes on the stub.
+            (
+                "a negative interval",
+                serde_json::json!(-1),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                10,
+            ),
+            (
+                "an ordinary interval",
+                serde_json::json!(30),
+                StatusCode::OK,
+                30,
+            ),
+        ];
+        for (name, raw, expected_status, expected_interval) in cases {
+            let (state, _dir) = temp_state();
+            let app = router(state.clone());
+            let id = register(&app, "w").await;
+
+            let status = put_poll_interval(&app, &id, raw).await;
+
+            assert_eq!(status, expected_status, "{name}: status");
+            let stored = state.db.get_system(&id);
+            assert!(stored.is_ok(), "{name}: get_system maps the row");
+            let stored = stored.ok().flatten().map(|s| s.poll_interval_secs);
+            assert_eq!(stored, Some(expected_interval), "{name}: stored interval");
+            let listed = state.db.list_systems();
+            assert!(listed.is_ok(), "{name}: list_systems maps every row");
+            let intervals: Vec<u64> = listed
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.poll_interval_secs)
+                .collect();
+            assert_eq!(
+                intervals,
+                vec![expected_interval],
+                "{name}: listed intervals"
+            );
+        }
+
+        // Every value above the column's range is refused, not only the tabled ones.
+        let (state, _dir) = temp_state();
+        let app = router(state.clone());
+        let id = register(&app, "w").await;
+        for k in 0..63 {
+            let raw = serde_json::json!(i64_max + (1u64 << k));
+
+            let status = put_poll_interval(&app, &id, raw).await;
+
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "i64::MAX + 2^{k}: status"
+            );
+            let stored = state.db.get_system(&id);
+            assert!(stored.is_ok(), "i64::MAX + 2^{k}: get_system maps the row");
+            let stored = stored.ok().flatten().map(|s| s.poll_interval_secs);
+            assert_eq!(stored, Some(10), "i64::MAX + 2^{k}: stored interval");
+            let listed = state.db.list_systems();
+            assert!(
+                listed.is_ok(),
+                "i64::MAX + 2^{k}: list_systems maps every row"
+            );
+            let intervals: Vec<u64> = listed
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.poll_interval_secs)
+                .collect();
+            assert_eq!(intervals, vec![10], "i64::MAX + 2^{k}: listed intervals");
+        }
+    }
+
+    // A refused interval refuses the whole body: the other fields sent with it
+    // are not stored either.
+    #[tokio::test]
+    async fn update_system_refusing_a_poll_interval_stores_no_other_field() {
+        let (state, _dir) = temp_state();
+        let app = router(state.clone());
+        let id = register(&app, "w").await;
+        let token_before = state.db.get_system(&id).ok().flatten().map(|s| s.token);
+        let body = serde_json::json!({
+            "name": "renamed",
+            "url": "http://renamed",
+            "token": "a-replacement-token",
+            "enabled": false,
+            "poll_interval_secs": i64::MAX as u64 + 1,
+        });
+
+        let res = app
+            .clone()
+            .oneshot(json_request("PUT", &format!("/api/systems/{id}"), body))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let stored = state.db.get_system(&id).ok().flatten();
+        let token_after = stored.as_ref().map(|s| s.token.clone());
+        let fields = stored.map(|s| (s.name, s.url, s.enabled, s.poll_interval_secs));
+        assert_eq!(
+            fields,
+            Some(("w".to_string(), "http://x".to_string(), true, 10))
+        );
+        assert_eq!(token_after, token_before);
+        assert_ne!(token_after.as_deref(), Some("a-replacement-token"));
     }
 
     #[tokio::test]

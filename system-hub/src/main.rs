@@ -19,6 +19,7 @@ mod applications;
 mod clock;
 mod collector;
 mod db;
+mod hourly_warning;
 mod listen;
 mod models;
 mod push;
@@ -26,6 +27,7 @@ mod registry;
 mod retention;
 mod round_intake;
 mod routes;
+mod snapshot;
 mod state;
 
 use axum::Router;

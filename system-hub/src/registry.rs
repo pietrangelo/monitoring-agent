@@ -76,6 +76,40 @@ pub fn memory_capacity_refresh(
     reported.filter(|capacity| stored != Some(capacity))
 }
 
+/// How often the hub polls a system, in seconds: at most `i64::MAX`, the range of the
+/// `systems` row's column, so a stored interval always reads back. Held as the column's
+/// type, never negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollInterval(i64);
+
+/// A poll interval the `systems` row can't hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollIntervalOutOfRange;
+
+impl TryFrom<u64> for PollInterval {
+    type Error = PollIntervalOutOfRange;
+
+    fn try_from(secs: u64) -> Result<Self, Self::Error> {
+        i64::try_from(secs)
+            .map(Self)
+            .map_err(|_| PollIntervalOutOfRange)
+    }
+}
+
+impl From<PollInterval> for u64 {
+    /// The interval in seconds; exact, since a poll interval is never negative.
+    fn from(interval: PollInterval) -> Self {
+        interval.0.unsigned_abs()
+    }
+}
+
+impl PollInterval {
+    /// The value the `systems` row's column stores.
+    pub fn column_value(self) -> i64 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +119,44 @@ mod tests {
         MemoryCapacity {
             display: display.to_owned(),
             bytes,
+        }
+    }
+
+    #[test]
+    fn a_poll_interval_is_at_most_the_rows_range() {
+        let max = i64::MAX as u64;
+        let cases: [(&str, u64, Option<u64>); 12] = [
+            ("one second", 1, Some(1)),
+            ("POST's clamp floor", 5, Some(5)),
+            ("the default", 10, Some(10)),
+            ("half a minute", 30, Some(30)),
+            ("an hour", 3600, Some(3600)),
+            ("one below the column's maximum", max - 1, Some(max - 1)),
+            ("the column's maximum", max, Some(max)),
+            ("one past the column's maximum", max + 1, None),
+            ("two past the column's maximum", max + 2, None),
+            ("the top bit plus change", (1u64 << 63) | 0x1234_5678, None),
+            ("one below u64::MAX", u64::MAX - 1, None),
+            ("u64::MAX", u64::MAX, None),
+        ];
+        for (name, secs, expected) in cases {
+            let parsed = PollInterval::try_from(secs).map(u64::from);
+            assert_eq!(parsed.ok(), expected, "{name}");
+        }
+        // Every value max + 2^k for k in 0..63 lies above the column's range,
+        // so no finite list of refused literals can pass this sweep.
+        for k in 0..63 {
+            let secs = max + (1u64 << k);
+            let parsed = PollInterval::try_from(secs).map(u64::from);
+            assert_eq!(parsed.ok(), None, "max + 2^{k} = {secs}");
+        }
+        // Every value 2^k and max - 2^k for k in 0..63 lies within the column's
+        // range, so no finite list of accepted literals can pass this sweep.
+        for k in 0..63 {
+            for secs in [1u64 << k, max - (1u64 << k)] {
+                let parsed = PollInterval::try_from(secs).map(u64::from);
+                assert_eq!(parsed.ok(), Some(secs), "2^{k} sweep: {secs}");
+            }
         }
     }
 

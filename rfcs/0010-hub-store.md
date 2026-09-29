@@ -34,7 +34,7 @@ The hub keeps every metric point as a SQLite row, behind one `std::sync::Mutex<C
    the table). A year is out of reach, and a long-range chart reads hundreds of thousands of
    rows to draw 300 pixels.
 3. **Write path.** Each point is an `INSERT`, a `SELECT` and a `DELETE`, each its own commit
-   (RFC 0007 measured ~1.5 ms per point), under the mutex that async handlers also take on
+   (RFC 0007 measured about 9.7 ms per point on a table filled to 24 h), under the mutex that async handlers also take on
    runtime workers.
 4. **Pruning is incidental.** Rows are pruned only when a new point of the same series
    arrives, so series that stop are never pruned.

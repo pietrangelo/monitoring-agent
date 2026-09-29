@@ -67,7 +67,7 @@ doing this can be anyone.
   runs on every disconnect.
   - Today a failed answer is ignored, and the next `recv` on the broken socket ends the loop,
     which marks the system offline. So the only exit after registration that skips the
-    marking is the `JoinError` in `register_if_new`, which RFC 0008 handles.
+    marking is the `JoinError` in `register_if_new`, which RFC 0007 handles.
   - The answer is sent under `SEND_TIMEOUT = 5 s`. That is defence in depth: the answer is the
     first write, at most about 60 bytes, into an empty send buffer, so no test can make it
     block. It stays untested, and says so.
@@ -114,8 +114,8 @@ const _: PushSocketLimits = PushSocketLimits::PRODUCTION;
   handshake answer. That is the test's responsibility, and it's noted where they're built.
 - **Message and frame size:** both 512 KiB. The frame limit is checked on the frame header,
   before any payload is buffered. The message limit is checked on the reassembled message, so
-  a fragmented oversize message is refused too. 512 KiB fits the largest frame RFC 0007's disk
-  rule accepts (1024 disks with 256-byte mount points, about 290 KB). A push host above about
+  a fragmented oversize message is refused too. 512 KiB fits a frame of 1024 disks with
+  256-byte mount points (about 290 KB), the most RFC 0007's disk rule keeps. A push host above about
   4,000 typical Docker overlay mounts would still exceed it (see Rollout).
 - **Write buffer:** 8 KiB, capped at 64 KiB. The hub writes only handshake answers and pongs.
 - **An oversize message:** tungstenite returns an error, not a close frame. Then:
@@ -181,7 +181,7 @@ pub struct PushConfig {
     pub oversize_linger: Duration,
 }
 
-/// Why a handshake got no `auth_ok`. RFC 0008 adds registry outcomes.
+/// Why a handshake got no `auth_ok`. RFCs 0007 and 0008 add registry outcomes.
 enum Refusal {
     Rejected(HandshakeRejection), // shape, token, system id (wire messages unchanged)
     Timeout,                      // "handshake timeout"

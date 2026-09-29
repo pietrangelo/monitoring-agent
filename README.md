@@ -251,7 +251,7 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | `GET /api/systems` | GET | List registered systems |
 | `POST /api/systems` | POST | Register a system `{name, url, token, poll_interval_secs}` |
 | `GET /api/systems/{id}` | GET | System details |
-| `PUT /api/systems/{id}` | PUT | Update config |
+| `PUT /api/systems/{id}` | PUT | Update config (a `poll_interval_secs` above 2^63-1 is refused with 422 and nothing is stored) |
 | `DELETE /api/systems/{id}` | DELETE | Remove system + all data |
 | `GET /api/summary` | GET | Aggregated stats (online/offline/alerts) |
 | `GET /api/systems/{id}/metrics?metric=cpu&limit=300` | GET | Time-series for a specific metric |
