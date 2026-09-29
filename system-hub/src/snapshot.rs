@@ -88,6 +88,8 @@ impl TryFrom<String> for MountPoint {
 pub struct SnapshotTime(i64);
 
 /// A snapshot time above `i64::MAX`.
+// Wired into the adapters by RFC 0007 §2 (store_snapshot's callers).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotTimeOutOfRange;
 
@@ -97,6 +99,14 @@ impl SnapshotTime {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn seconds(self) -> i64 {
         self.0
+    }
+
+    /// The time `retention_secs` before this one, never before 0: a series' points older
+    /// than it are past their retention.
+    // Wired into the adapters by RFC 0007 §2 (store_snapshot).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn cutoff(self, retention_secs: u64) -> Self {
+        Self(self.0.saturating_sub_unsigned(retention_secs).max(0))
     }
 }
 
@@ -799,6 +809,32 @@ mod tests {
             let expected = i64::try_from(input).map_err(|_| SnapshotTimeOutOfRange);
             let time = SnapshotTime::try_from(input).map(SnapshotTime::seconds);
             assert_eq!(time, expected, "case: {case}");
+        }
+    }
+
+    #[test]
+    fn a_retention_cutoff_is_the_retention_before_the_time_and_never_before_zero() {
+        let max = i64::MAX as u64;
+        let cases = [
+            (
+                "a day before a 2026 time",
+                1_790_000_000,
+                86_400,
+                1_789_913_600,
+            ),
+            ("an hour before", 100_000, 3_600, 96_400),
+            ("no retention", 100_000, 0, 100_000),
+            ("exactly the time since 0", 86_400, 86_400, 0),
+            ("more than the time since 0", 5, 86_400, 0),
+            ("at 0", 0, 86_400, 0),
+            ("i64::MAX, no retention", max, 0, i64::MAX),
+            ("i64::MAX, a day", max, 86_400, i64::MAX - 86_400),
+            ("i64::MAX, all of it", max, max, 0),
+            ("u64::MAX of retention", 1_790_000_000, u64::MAX, 0),
+        ];
+        for (case, time, retention, expected) in cases {
+            let time = SnapshotTime::try_from(time).unwrap();
+            assert_eq!(time.cutoff(retention).seconds(), expected, "case: {case}");
         }
     }
 
