@@ -100,7 +100,6 @@ async fn register_system(
 
     s.db.insert_system(&sys)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    s.refresh_cache();
     Ok(Json(sys))
 }
 
@@ -135,8 +134,6 @@ async fn update_system(
     )
     .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    s.refresh_cache();
-
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -154,7 +151,6 @@ async fn delete_system(
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&id);
-    s.refresh_cache();
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
 

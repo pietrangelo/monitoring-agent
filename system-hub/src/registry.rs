@@ -190,6 +190,11 @@ impl PollInterval {
     }
 }
 
+/// The systems the poller polls: the enabled ones, in the registry's order.
+pub fn enabled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
+    systems.iter().filter(|system| system.enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +203,58 @@ mod tests {
         MemoryCapacity {
             display: display.to_owned(),
             bytes,
+        }
+    }
+
+    fn system(id: &str, enabled: bool) -> SystemInfo {
+        SystemInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            url: "http://example.com".to_owned(),
+            token: String::new(),
+            status: SystemStatus::Unknown,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn only_enabled_systems_are_polled_in_the_registrys_order() {
+        let cases: [(&str, Vec<SystemInfo>, Vec<&str>); 4] = [
+            ("none", vec![], vec![]),
+            (
+                "all enabled",
+                vec![system("a", true), system("b", true)],
+                vec!["a", "b"],
+            ),
+            (
+                "all disabled",
+                vec![system("a", false), system("b", false)],
+                vec![],
+            ),
+            (
+                "mixed",
+                vec![
+                    system("a", false),
+                    system("b", true),
+                    system("c", false),
+                    system("d", true),
+                ],
+                vec!["b", "d"],
+            ),
+        ];
+        for (case, systems, expected) in cases {
+            let polled: Vec<&str> = enabled_systems(&systems).map(|s| s.id.as_str()).collect();
+            assert_eq!(polled, expected, "case: {case}");
         }
     }
 

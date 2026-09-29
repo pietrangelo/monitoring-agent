@@ -1755,27 +1755,12 @@ mod tests {
         let disks: Vec<(&str, f32)> = live.snapshot.disks().collect();
         assert_eq!(disks, [("/", 50.0), ("/home", 70.0)]);
         assert_eq!(live.time.seconds(), 1_700_000_000);
-        let cached_name = |state: &AppState| {
-            let cache = state.systems_cache.read().unwrap();
-            let cached = cache.iter().find(|s| s.id == system_id).cloned().unwrap();
-            (cached.name, cached.status)
-        };
-        assert_eq!(
-            cached_name(&state),
-            ("host1".to_string(), SystemStatus::Online),
-            "systems cache is refreshed after the frame"
-        );
 
         push_frames_then_disconnect(&state, ws, system_id, &[]).await;
         let sys = state.db.get_system(system_id).unwrap().unwrap();
         assert_eq!(sys.last_error.as_deref(), Some("push disconnected"));
         // Pins current behaviour: going offline overwrites `last_seen` with "".
         assert_eq!(sys.last_seen, "");
-        assert_eq!(
-            cached_name(&state),
-            ("host1".to_string(), SystemStatus::Offline),
-            "systems cache is refreshed after the offline marking"
-        );
     }
 
     /// Sends one binary message and waits until the hub has handled it.

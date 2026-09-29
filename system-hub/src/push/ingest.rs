@@ -203,7 +203,6 @@ pub(super) fn ingest_frame(
     let stored = snapshot_intake::store_snapshot(app, system_id, reported, time, last_seen, now)?;
     if let SnapshotStored::Stored(_) = stored {
         update_registry(app, system_id, &info);
-        app.refresh_cache();
     }
     Ok(stored)
 }
@@ -247,7 +246,6 @@ pub(super) fn mark_offline(app: &AppState, system_id: &SystemId) {
         "",
         Some("push disconnected"),
     );
-    app.refresh_cache();
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::registry::{LastSeen, MemoryCapacity, memory_capacity_refresh};
+use crate::registry::{LastSeen, MemoryCapacity, enabled_systems, memory_capacity_refresh};
 use serde::Deserialize;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -95,21 +95,39 @@ fn now_iso() -> String {
 }
 
 pub fn start_collectors(state: Arc<AppState>) {
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        let mut refresh_tick = interval(Duration::from_secs(30));
-        loop {
-            refresh_tick.tick().await;
-            state_clone.refresh_cache();
-            let systems = state_clone.get_enabled_systems();
-            for system in systems {
-                let s = state_clone.clone();
-                tokio::spawn(async move {
-                    poll_system(s, &system).await;
-                });
-            }
+    tokio::spawn(poll_every(state, Duration::from_secs(30)));
+}
+
+/// Polls the registry's enabled systems every `period`. The registry is read at each tick, so
+/// no cache can go stale; a tick whose read fails polls the systems of the last read that
+/// succeeded (RFC 0007 §2).
+async fn poll_every(state: Arc<AppState>, period: Duration) {
+    let mut tick = interval(period);
+    let mut systems = Vec::new();
+    loop {
+        tick.tick().await;
+        systems = read_registry(&state, systems).await;
+        for system in enabled_systems(&systems) {
+            let (state, system) = (Arc::clone(&state), system.clone());
+            tokio::spawn(async move { poll_system(state, &system).await });
         }
-    });
+    }
+}
+
+/// The registry's systems, read on the blocking pool, or `last_read` when the read fails.
+async fn read_registry(state: &Arc<AppState>, last_read: Vec<SystemInfo>) -> Vec<SystemInfo> {
+    let app = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || app.db.list_systems()).await {
+        Ok(Ok(systems)) => systems,
+        Ok(Err(err)) => {
+            tracing::warn!("Couldn't read the registry; polling the last read's systems: {err}");
+            last_read
+        }
+        Err(err) => {
+            tracing::error!("Reading the registry failed; polling the last read's systems: {err}");
+            last_read
+        }
+    }
 }
 
 async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
@@ -649,6 +667,78 @@ mod tests {
         assert_eq!(point_count(&state, "cpu"), 0);
         assert!(!state.live_metrics.read().unwrap().contains_key("id-1"));
         assert!(state.db.get_system("id-1").unwrap().is_none());
+    }
+
+    /// A mock agent answering every `/api/system` poll with `{}`, and how many it answered.
+    async fn counted_agent() -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let polls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&polls);
+        let app = Router::new().route(
+            "/api/system",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Json(serde_json::json!({})) }
+            }),
+        );
+        (spawn_mock_agent(app).await, polls)
+    }
+
+    /// Whether `check` holds within 5 seconds.
+    async fn within_5_s(mut check: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn polls_seen(polls: &std::sync::atomic::AtomicU64) -> u64 {
+        polls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// RFC 0007 §2: the poller reads the registry at every tick, so a system inserted after
+    /// startup is polled on the next one.
+    #[tokio::test]
+    async fn a_system_inserted_after_startup_is_polled_on_the_next_tick() {
+        let (state, _dir) = temp_state();
+        let (url, polls) = counted_agent().await;
+        tokio::spawn(poll_every(state.clone(), Duration::from_millis(50)));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        state.db.insert_system(&sample_system("id-1", url)).unwrap();
+
+        assert!(within_5_s(|| polls_seen(&polls) > 0).await, "polled");
+    }
+
+    /// RFC 0007 §2: a tick whose registry read fails polls the systems of the last read that
+    /// succeeded. One row that no read can map fails the read for every row.
+    #[tokio::test]
+    async fn a_tick_whose_registry_read_fails_polls_the_last_reads_systems() {
+        let (state, dir) = temp_state();
+        let (url, polls) = counted_agent().await;
+        state.db.insert_system(&sample_system("id-1", url)).unwrap();
+        tokio::spawn(poll_every(state.clone(), Duration::from_millis(50)));
+        assert!(
+            within_5_s(|| polls_seen(&polls) > 0).await,
+            "polled at first"
+        );
+
+        state
+            .db
+            .insert_system(&sample_system("id-2", "http://127.0.0.1:9".into()))
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("test.db"))
+            .unwrap()
+            .execute_batch("UPDATE systems SET poll_interval_secs = -1 WHERE id = 'id-2'")
+            .unwrap();
+        assert!(state.db.list_systems().is_err(), "the registry read fails");
+        let before = polls_seen(&polls);
+
+        let still_polled = within_5_s(|| polls_seen(&polls) >= before + 3).await;
+        assert!(still_polled, "the last read's system is still polled");
     }
 
     /// RFC 0014 §8: a poll refreshes the memory capacity when its answer has both halves, and
