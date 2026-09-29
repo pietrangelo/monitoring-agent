@@ -1181,8 +1181,8 @@ hub gate.
 | `rosette-auditor` on the wiring (`918638e..71178dd`): its one VIOLATED and six AT-RISK fixed | done | `c70c7a1` |
 | §3 `TokenBucket` under `SourcePace`'s tests; the connection's state split into `push/connection.rs` | done | `7a96072`, `f77ac56` |
 | §3 decode budget (`DecodeBudget`, `PushConfig::decode_refill`), spent before either decode | done | `c9c3c51` |
-| §4 `end_connection`, eviction on delete | next | |
-| §5 SSE publisher (`watch`, `send_replace`) | to do | |
+| §4 `end_connection`, eviction on delete (`AppState::evict_live_metrics`) | done | `69d23f2` |
+| §5 SSE publisher (`watch`, `send_replace`) | next | |
 | README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
 
 Open items to settle on the way:
@@ -1254,6 +1254,23 @@ Open items to settle on the way:
   the zero refill (kept, as above); "decode budget" has no glossary entry yet (the docs row
   adds it with the RFC's other terms); `token_bucket.rs` has no tests of its own (both
   wrappers' tables cover it, at capacities 2 and 3 and periods of 8 s, 1 s, 100 ms and 0).
+- §4's eviction added `AppState::evict_live_metrics`, which both `end_connection` and the
+  delete handler call. It takes the id as a `&str`, not a `SystemId`, since the delete route
+  deliberately takes stored ids that break RFC 0005's rule. It hands the entry back, so the
+  caller drops it outside the live lock. `end_connection` now logs a failed offline marking at
+  `warn`, where `mark_offline` discarded it. It keeps the `""` it writes as `last_seen`, which
+  a characterisation pins; `StatusUpdate` has no offline form yet.
+- `red-test-adversary` on §4, as an in-process check with mutation runs in a sandbox:
+  EVIDENCE. These cheats were all killed: evicting only while the row exists, clearing every
+  entry, evicting without marking offline, also forgetting the applications, evicting in
+  `handle_push` instead of `end_connection`, and a delete that evicts only push systems, only
+  polled ones, or every entry. Two orders stay unpinned, since only a race harness could see
+  them: offline before the eviction in `end_connection`, and the row before the entry in the
+  delete. Each is a commented line.
+- `rosette-auditor` on §4, as an in-process check: no VIOLATED. Two AT-RISK, each decided:
+  the `&str` key and the `""` `last_seen`, both as above. The delete handler still calls
+  SQLite on the runtime, as every REST handler does; moving it alone would widen this RFC, and
+  RFC 0010 replaces that store.
 - Removing `ORDER BY timestamp` from the capped prune survives the tests: SQLite reads the
   subquery through `idx_metrics_system_time`, already in timestamp order. The `ORDER BY` stays,
   so oldest-first is a guarantee rather than a planner choice.
