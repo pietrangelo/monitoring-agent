@@ -15,13 +15,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! A token bucket on the monotonic clock, with its capacity and its refill period as
-//! parameters (RFC 0007 §3). Pure: the caller hands in the time. RFC 0009's source pace wraps
-//! one; the bucket has no domain term of its own.
+//! parameters (RFC 0007 §3). Pure: the caller hands in the time. RFC 0009's source pace and
+//! RFC 0007's decode budget each wrap one; the bucket has no domain term of its own.
 
 use std::num::NonZeroU8;
 use std::time::{Duration, Instant};
 
 /// How a token bucket fills: it holds at most `capacity` tokens, and gains one each `period`.
+/// A zero period refills it at every take, so it never refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refill {
     capacity: NonZeroU8,
@@ -64,14 +65,18 @@ impl TokenBucket {
     }
 
     /// Adds one token per whole period elapsed, keeping the remainder. A full bucket banks
-    /// nothing: its clock restarts at `now`.
+    /// nothing: its clock restarts at `now`. Past the capacity, or with a zero period, the
+    /// bucket is full.
     fn refill(self, now: Instant) -> Self {
         let capacity = self.refill.capacity.get();
         let missing = capacity.saturating_sub(self.tokens);
         let elapsed = now.saturating_duration_since(self.last_refill);
-        let periods = elapsed.as_nanos() / self.refill.period.as_nanos();
-        match u8::try_from(periods) {
-            Ok(periods) if periods < missing => Self {
+        // A zero period has no quotient: the bucket refills at every take, so it never refuses.
+        let periods = elapsed
+            .as_nanos()
+            .checked_div(self.refill.period.as_nanos());
+        match periods.map(u8::try_from) {
+            Some(Ok(periods)) if periods < missing => Self {
                 tokens: self.tokens + periods,
                 last_refill: self.last_refill + self.refill.period * u32::from(periods),
                 ..self

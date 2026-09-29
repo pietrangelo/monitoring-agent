@@ -39,7 +39,7 @@ mod connection;
 mod ingest;
 use crate::state::AppState;
 pub use config::{PushAuth, PushAuthError, PushConfig};
-use connection::{ConnectionState, warn_first};
+use connection::{ConnectionState, OutOfBudget, warn_first};
 use ingest::{PushPayload, SnapshotFrame, ingest_frame, mark_offline, register_if_new};
 
 /// The push handshake's first message. No `Debug`: `token` holds the presented secret.
@@ -289,7 +289,7 @@ async fn send_answer(socket: &mut WebSocket, answer: String) -> Answer {
 /// deadline, sends an oversize message, or ingestion fails. tungstenite answers pings on its
 /// own, so the hub never awaits a send here.
 async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &SystemId) {
-    let mut connection = ConnectionState::new(Instant::now());
+    let mut connection = ConnectionState::new(Instant::now(), ctx.config.decode_refill);
     receive_until_end(socket, ctx, system_id, &mut connection).await;
     connection.log_counts(system_id);
 }
@@ -345,7 +345,8 @@ enum IngestStop {
     SystemGone,
 }
 
-/// Decodes and stores one data frame. Frames that don't decode are dropped, as documented in
+/// Spends the connection's decode budget, then decodes and stores one data frame (RFC 0007 §3).
+/// A message past the budget, and a frame that doesn't decode, are dropped, as documented in
 /// ARCHITECTURE.md; only a failed unit of storage work is an error.
 async fn ingest(
     ctx: &PushContext,
@@ -353,6 +354,9 @@ async fn ingest(
     data: &[u8],
     connection: &mut ConnectionState,
 ) -> Result<(), IngestStop> {
+    if let Err(OutOfBudget) = connection.spend_decode_budget(Instant::now()) {
+        return Ok(());
+    }
     if let Ok(payload) = rmp_serde::from_slice::<PushPayload>(data) {
         return ingest_snapshot(ctx, system_id, payload, connection).await;
     }
@@ -1169,6 +1173,8 @@ mod tests {
                 c.handshake_timeout = Duration::from_millis(300);
                 c.idle_timeout = Duration::from_millis(300);
                 c.oversize_linger = Duration::from_millis(300);
+                // Ten messages a second: past the decode budget, which isn't under test here.
+                c.decode_refill = Duration::ZERO;
             });
             let addr = serve_push_with(state.clone(), config).await;
             let mut ws = connect_authenticated(addr, "sys-alive").await;
@@ -2104,12 +2110,12 @@ mod tests {
         use futures_util::SinkExt;
         use std::collections::BTreeMap;
 
-        const RUN: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+        pub(super) const RUN: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 
-        type Report = (String, String, Option<String>, BTreeMap<String, f64>);
+        pub(super) type Report = (String, String, Option<String>, BTreeMap<String, f64>);
 
         /// Mirrors the agent's application frame: positional, like every push frame.
-        fn application_frame(kind: &str, seq: u64, heap: f64) -> Vec<u8> {
+        pub(super) fn application_frame(kind: &str, seq: u64, heap: f64) -> Vec<u8> {
             let orders: Report = (
                 "orders".into(),
                 "up".into(),
@@ -2119,11 +2125,11 @@ mod tests {
             rmp_serde::to_vec(&(kind, RUN, seq, 15u64, vec![orders])).unwrap()
         }
 
-        fn frame(seq: u64) -> Vec<u8> {
+        pub(super) fn frame(seq: u64) -> Vec<u8> {
             application_frame("applications.v1", seq, 300.0)
         }
 
-        fn up_points(state: &AppState, system: &str) -> Vec<crate::models::MetricPoint> {
+        pub(super) fn up_points(state: &AppState, system: &str) -> Vec<crate::models::MetricPoint> {
             state
                 .db
                 .get_metrics(system, "app:orders:up", 1000, None)
@@ -2343,6 +2349,153 @@ mod tests {
         #[test]
         fn the_test_run_id_is_a_uuid() {
             assert!(RoundId::parse(RUN, 1).is_ok());
+        }
+    }
+
+    /// RFC 0007 §3: every binary message spends the connection's decode budget before it is
+    /// decoded, whatever its kind: 3, then one per refill period.
+    mod decode_budget {
+        use super::applications::{RUN, Report, frame, up_points};
+        use super::*;
+        use futures_util::SinkExt;
+        use std::collections::BTreeMap;
+
+        const SECOND: Duration = Duration::from_secs(1);
+
+        async fn serve_with_refill(state: Arc<AppState>, refill: Duration) -> std::net::SocketAddr {
+            serve_push_with(state, config_with(|c| c.decode_refill = refill)).await
+        }
+
+        /// Sends each message 10 ms after the previous one, then waits until the hub caught up.
+        async fn send_spaced(ws: &mut AgentSocket, messages: Vec<Vec<u8>>) {
+            for bytes in messages {
+                ws.send(WsMessage::Binary(bytes)).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            wait_until_hub_caught_up(ws).await;
+        }
+
+        /// An application frame that decodes, and that `ScrapeRound::try_from` refuses.
+        fn too_many_applications() -> Vec<u8> {
+            let reports: Vec<Report> = (0..17)
+                .map(|i| (format!("app{i}"), "up".into(), None, BTreeMap::new()))
+                .collect();
+            let bytes = rmp_serde::to_vec(&("applications.v1", RUN, 1u64, 15u64, reports)).unwrap();
+            let refused = application_wire::decode(&bytes).map(ScrapeRound::try_from);
+            assert!(
+                matches!(
+                    refused,
+                    Some(Err(application_wire::FrameRefusal::Round(
+                        crate::applications::ScrapeRoundError::TooManyApplications
+                    )))
+                ),
+                "the fixture decodes and is refused by TryFrom"
+            );
+            bytes
+        }
+
+        #[tokio::test]
+        async fn four_snapshot_frames_10_ms_apart_store_three_and_a_refill_stores_the_next() {
+            let (state, _dir) = temp_state();
+            let addr = serve_with_refill(state.clone(), SECOND).await;
+            let mut ws = connect_authenticated(addr, "sys-budget").await;
+            send_spaced(&mut ws, (0..4).map(|_| frame_bytes("host1")).collect()).await;
+            assert_eq!(
+                points(&state, "sys-budget", "cpu"),
+                3,
+                "the fourth is dropped"
+            );
+            let mut another = connect_authenticated(addr, "sys-budget").await;
+            send_spaced(&mut another, vec![frame_bytes("host1")]).await;
+            assert_eq!(
+                points(&state, "sys-budget", "cpu"),
+                4,
+                "another connection of the system has a budget of its own"
+            );
+            tokio::time::sleep(SECOND).await;
+            send_spaced(&mut ws, vec![frame_bytes("host1")]).await;
+            assert_eq!(
+                points(&state, "sys-budget", "cpu"),
+                5,
+                "a drop leaves the connection open, and a second refills a token"
+            );
+            drop(another);
+
+            let addr = serve_with_refill(state.clone(), Duration::from_millis(100)).await;
+            let mut ws = connect_authenticated(addr, "sys-refill").await;
+            send_spaced(&mut ws, (0..3).map(|_| frame_bytes("host1")).collect()).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            send_spaced(&mut ws, vec![frame_bytes("host1")]).await;
+            assert_eq!(
+                points(&state, "sys-refill", "cpu"),
+                4,
+                "a fourth frame 150 ms after three, with a refill of 100 ms"
+            );
+        }
+
+        /// Messages that fail to decode, or decode and are refused, spend the budget too: a
+        /// budget spent after decoding, or on snapshot frames alone, would store the snapshot.
+        #[tokio::test]
+        async fn three_messages_that_store_nothing_leave_no_token_for_a_snapshot() {
+            let cases = [
+                ("garbage that decodes as nothing", vec![0xc1_u8]),
+                (
+                    "application frames TryFrom refuses",
+                    too_many_applications(),
+                ),
+            ];
+            for (case, message) in cases {
+                let (state, _dir) = temp_state();
+                let addr = serve_with_refill(state.clone(), SECOND).await;
+                let mut ws = connect_authenticated(addr, "sys-budget").await;
+                let mut messages = vec![message; 3];
+                messages.push(frame_bytes("host1"));
+                send_spaced(&mut ws, messages).await;
+                assert_eq!(points(&state, "sys-budget", "cpu"), 0, "case: {case}");
+            }
+        }
+
+        /// An honest agent's neighbouring messages all fit the budget, the handshake burst
+        /// included: a round, the first snapshot and the next round, back to back.
+        #[tokio::test]
+        async fn an_honest_agents_neighbouring_messages_are_all_stored() {
+            let snapshot = || frame_bytes("host1");
+            let cases = [
+                ("a snapshot after a round", vec![frame(1), snapshot()], 1, 1),
+                (
+                    "a snapshot after a refused round",
+                    vec![too_many_applications(), snapshot()],
+                    0,
+                    1,
+                ),
+                ("a round after a snapshot", vec![snapshot(), frame(1)], 1, 1),
+            ];
+            for (case, messages, rounds, snapshots) in cases {
+                let (state, _dir) = temp_state();
+                let addr = serve_with_refill(state.clone(), SECOND).await;
+                let mut ws = connect_authenticated(addr, "sys-honest").await;
+                send_spaced(&mut ws, messages).await;
+                assert_eq!(
+                    up_points(&state, "sys-honest").len(),
+                    rounds,
+                    "case: {case}"
+                );
+                assert_eq!(
+                    points(&state, "sys-honest", "cpu"),
+                    snapshots,
+                    "case: {case}"
+                );
+            }
+
+            let (state, _dir) = temp_state();
+            let addr = serve_with_refill(state.clone(), SECOND).await;
+            let mut ws = connect_authenticated(addr, "sys-burst").await;
+            for bytes in [frame(1), snapshot(), frame(2)] {
+                ws.send(WsMessage::Binary(bytes)).await.unwrap();
+            }
+            wait_until_hub_caught_up(&mut ws).await;
+            assert_eq!(up_points(&state, "sys-burst").len(), 2, "both rounds");
+            assert_eq!(points(&state, "sys-burst", "cpu"), 1, "the snapshot");
         }
     }
 }
