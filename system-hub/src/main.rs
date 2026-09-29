@@ -27,6 +27,7 @@ mod registry;
 mod retention;
 mod round_intake;
 mod routes;
+mod snapshot;
 mod state;
 
 use axum::Router;

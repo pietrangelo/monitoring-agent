@@ -624,9 +624,11 @@ mod tests {
         let (state, _dir) = temp_state();
         let app = router(state.clone());
         let id = register(&app, "w").await;
+        let token_before = state.db.get_system(&id).ok().flatten().map(|s| s.token);
         let body = serde_json::json!({
             "name": "renamed",
             "url": "http://renamed",
+            "token": "a-replacement-token",
             "enabled": false,
             "poll_interval_secs": i64::MAX as u64 + 1,
         });
@@ -639,11 +641,14 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let stored = state.db.get_system(&id).ok().flatten();
+        let token_after = stored.as_ref().map(|s| s.token.clone());
         let fields = stored.map(|s| (s.name, s.url, s.enabled, s.poll_interval_secs));
         assert_eq!(
             fields,
             Some(("w".to_string(), "http://x".to_string(), true, 10))
         );
+        assert_eq!(token_after, token_before);
+        assert_ne!(token_after.as_deref(), Some("a-replacement-token"));
     }
 
     #[tokio::test]
