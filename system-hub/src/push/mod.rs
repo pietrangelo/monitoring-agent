@@ -126,6 +126,21 @@ enum Refusal {
     Rejected(HandshakeRejection),
     /// No first message within the handshake deadline.
     Timeout,
+    /// The authenticated id couldn't be checked or registered (RFC 0007 §4). The agent
+    /// retries any `auth_error` after 5 s, so a failing registry is never retried at once.
+    RegistryUnavailable {
+        id: SystemId,
+        failure: RegistryFailure,
+    },
+}
+
+/// Why registering a push id failed.
+#[derive(Debug)]
+enum RegistryFailure {
+    /// The database couldn't check or insert the row.
+    Database(rusqlite::Error),
+    /// The registration unit panicked; `on_blocking_pool` logged the `JoinError`.
+    Panicked,
 }
 
 impl Refusal {
@@ -133,6 +148,23 @@ impl Refusal {
         match self {
             Self::Rejected(rejection) => rejection.message(),
             Self::Timeout => "handshake timeout",
+            Self::RegistryUnavailable { .. } => "registry unavailable",
+        }
+    }
+
+    /// Logs the refusal at `warn`, one line per handshake: a registry failure names the id in
+    /// `Debug` form and the error, and no refusal names the token.
+    fn log(&self) {
+        match self {
+            Self::Rejected(_) | Self::Timeout => tracing::warn!("Push handshake refused: {self:?}"),
+            Self::RegistryUnavailable {
+                id,
+                failure: RegistryFailure::Database(err),
+            } => tracing::warn!("Push registration of {:?} failed: {err}", id.as_str()),
+            Self::RegistryUnavailable {
+                id,
+                failure: RegistryFailure::Panicked,
+            } => tracing::warn!("Push registration of {:?} panicked", id.as_str()),
         }
     }
 }
@@ -144,8 +176,7 @@ enum Handshake {
     /// Answered with an `auth_error`; nothing was registered.
     Refused(Refusal),
     /// The socket ended, errored, sent an oversize message, or sent a first message that
-    /// isn't text; or registration's blocking task failed (a `JoinError`, which RFC 0008
-    /// answers as `registry unavailable`). No answer.
+    /// isn't text. No answer.
     Closed,
 }
 
@@ -158,10 +189,7 @@ async fn handle_push(mut socket: WebSocket, ctx: PushContext) {
     tracing::info!("Push client connected");
     let (system_id, answer) = match handshake(&mut socket, &ctx).await {
         Handshake::Authenticated { id, answer } => (id, answer),
-        Handshake::Refused(refusal) => {
-            tracing::warn!("Push handshake refused: {refusal:?}");
-            return;
-        }
+        Handshake::Refused(refusal) => return refusal.log(),
         Handshake::Closed => return,
     };
     tracing::info!("Push client authenticated: {:?}", system_id.as_str());
@@ -218,17 +246,26 @@ async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
         Ok(system_id) => system_id,
         Err(rejection) => return refuse(socket, Refusal::Rejected(rejection)).await,
     };
-    if on_blocking_pool(&ctx.app, &system_id, register_if_new)
-        .await
-        .is_err()
-    {
-        return Handshake::Closed;
+    if let Err(failure) = register(ctx, &system_id).await {
+        let refusal = Refusal::RegistryUnavailable {
+            id: system_id,
+            failure,
+        };
+        return refuse(socket, refusal).await;
     }
     let answer = send_answer(socket, r#"{"type":"auth_ok"}"#.to_string()).await;
     Handshake::Authenticated {
         id: system_id,
         answer,
     }
+}
+
+/// Registers the authenticated id off the async runtime.
+async fn register(ctx: &PushContext, system_id: &SystemId) -> Result<(), RegistryFailure> {
+    on_blocking_pool(&ctx.app, system_id, register_if_new)
+        .await
+        .map_err(|_| RegistryFailure::Panicked)?
+        .map_err(RegistryFailure::Database)
 }
 
 async fn refuse(socket: &mut WebSocket, refusal: Refusal) -> Handshake {
@@ -843,6 +880,85 @@ mod tests {
             );
             assert!(state.db.get_system(system_id).unwrap().is_none(), "{name}");
         }
+    }
+
+    /// A second connection to the test hub's database file, for planting what no `Database`
+    /// method writes.
+    fn raw_connection(dir: &tempfile::TempDir) -> rusqlite::Connection {
+        rusqlite::Connection::open(dir.path().join("test.db")).unwrap()
+    }
+
+    fn registry_unavailable() -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "auth_error", "message": "registry unavailable"}))
+    }
+
+    /// RFC 0007 §4: a registration that fails is answered, so the agent retries after 5 s.
+    #[tokio::test]
+    async fn a_failed_registration_answers_registry_unavailable_and_a_known_id_still_gets_auth_ok()
+    {
+        let (state, dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let (_known, answer) = connect_and_auth(addr, "known", "").await;
+        assert_eq!(answer.unwrap()["type"], "auth_ok", "registered first");
+        raw_connection(&dir)
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE INSERT ON systems
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+
+        let (_new, new_answer) = connect_and_auth(addr, "new", "").await;
+        let (_again, known_answer) = connect_and_auth(addr, "known", "").await;
+
+        assert_eq!(new_answer, registry_unavailable(), "a new id");
+        assert!(
+            state.db.get_system("new").unwrap().is_none(),
+            "nothing added"
+        );
+        assert_eq!(known_answer.unwrap()["type"], "auth_ok", "a known id");
+    }
+
+    /// RFC 0007 §4: a registration unit that panics (here on a poisoned database mutex) is
+    /// answered too, rather than closing the handshake with no answer.
+    #[tokio::test]
+    async fn a_registration_that_panics_answers_registry_unavailable() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        state.db.poison_for_test();
+
+        let (_ws, answer) = connect_and_auth(addr, "sys-poisoned", "").await;
+
+        assert_eq!(answer, registry_unavailable());
+    }
+
+    /// RFC 0007 §4: a known push id whose row no read can map keeps its row: its name and its
+    /// points. A lookup that fails no longer counts as "not registered".
+    #[tokio::test]
+    async fn registration_never_replaces_a_known_row() {
+        let (state, dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let (_first, answer) = connect_and_auth(addr, "sys-kept", "").await;
+        assert_eq!(answer.unwrap()["type"], "auth_ok", "registered first");
+        let raw = raw_connection(&dir);
+        raw.execute_batch(
+            "UPDATE systems SET name = 'web-01', poll_interval_secs = -1 WHERE id = 'sys-kept';
+             INSERT INTO metrics (system_id, metric, value, timestamp)
+                 VALUES ('sys-kept', 'cpu', 1.0, 100);",
+        )
+        .unwrap();
+
+        let (_again, answer) = connect_and_auth(addr, "sys-kept", "").await;
+
+        assert_eq!(answer.unwrap()["type"], "auth_ok");
+        let row: (String, i64) = raw
+            .query_row(
+                "SELECT name, (SELECT COUNT(*) FROM metrics WHERE system_id = systems.id)
+                 FROM systems WHERE id = 'sys-kept'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("web-01".to_string(), 1), "name and points kept");
     }
 
     /// Polls `check` until it holds or 5 seconds pass; the hub processes frames on its

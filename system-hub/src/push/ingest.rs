@@ -70,18 +70,10 @@ struct ProcessItem {
     memory_percent: f32,
 }
 
-/// Registers a system the hub hasn't seen before, under its default name.
-pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) {
-    if app
-        .db
-        .get_system(system_id.as_str())
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return;
-    }
-    let sys = SystemInfo {
+/// Registers a system the hub hasn't seen before, under its default name. A known id is
+/// never written, and a database that can't check or insert returns its error (RFC 0007 §4).
+pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) -> Result<(), rusqlite::Error> {
+    app.db.insert_system_if_absent(&SystemInfo {
         id: system_id.as_str().to_string(),
         name: system_id.default_name(),
         url: "push://".to_string(),
@@ -98,8 +90,7 @@ pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) {
         total_memory_bytes: None,
         poll_interval_secs: 10,
         enabled: true,
-    };
-    let _ = app.db.insert_system(&sys);
+    })
 }
 
 pub(super) fn ingest_frame(app: &AppState, system_id: &SystemId, payload: &PushPayload) {
@@ -374,6 +365,24 @@ pub(super) mod tests {
             rmp_serde::from_slice::<PushPayload>(&snapshot).is_ok(),
             "the snapshot itself decodes"
         );
+    }
+
+    /// RFC 0007 §4: registration keeps `Database`'s one lock convention, and panics on a
+    /// poisoned mutex, so the handshake answers the `JoinError` rather than accepting an agent
+    /// whose every frame would then panic its store.
+    #[test]
+    fn registration_panics_on_a_poisoned_database_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = std::sync::Arc::new(crate::db::Database::new(path.to_str().unwrap()).unwrap());
+        let app = AppState::new(db);
+        let id = SystemId::try_from("sys-poisoned".to_string()).unwrap();
+        app.db.poison_for_test();
+
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| register_if_new(&app, &id)));
+
+        assert!(outcome.is_err(), "registration panicked");
     }
 
     #[test]
