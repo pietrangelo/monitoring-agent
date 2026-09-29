@@ -672,8 +672,10 @@ tier names, and is an open read like the rest of the hub API.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.
     *Behaviour change: today a push system's `last_seen` holds its agent's uptime display, and a
     failed poll updates it.*
-  - At open every system has its recovered `last_contact` and `Unknown`; one not heard from
-    within **120 s** becomes `Offline { since: last_contact }`, or the open time if it has none.
+  - At open every system has its recovered `last_contact` and `Unknown` (RFC 0016 §4's startup
+    reset). A polled system not heard from within **120 s** becomes `Offline { since:
+    last_contact }`, or the open time if it has none. A push system goes offline only through
+    its current connection's end or RFC 0016's disconnection sweep.
 - **RFC 0007 §2's cache rule, carried forward.** The per-frame `refresh_cache()` goes. The
   in-memory Registry (0011) is maintained by the commit hook, so there is no cache to refresh.
 - **Metric queries.** Every `limit` is **clamped** to 10,000, never refused, and `limit=0` still
