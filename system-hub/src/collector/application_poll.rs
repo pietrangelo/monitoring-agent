@@ -18,11 +18,12 @@
 //! successful system poll, admitted and stored like a pushed one under the system's poll pace.
 
 use std::sync::{Arc, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::application_wire::{ApplicationsResponseDto, PolledRound};
 use crate::applications::{ScrapeRound, ScrapeRoundError};
 use crate::clock::unix_now;
+use crate::hourly_warning::{HourlyWarning, hourly_warning};
 use crate::models::{SystemId, SystemInfo};
 use crate::round_intake::{self, Arrival};
 use crate::state::AppState;
@@ -171,31 +172,13 @@ fn log_refused_round(state: &AppState, id: &SystemId, err: ScrapeRoundError) {
         .write()
         .unwrap_or_else(PoisonError::into_inner);
     let entry = live.entry(system_id.to_string()).or_default();
-    match refused_poll(entry.poll_refusal_warned_at, now) {
-        RefusedPoll::Warn => {
+    match hourly_warning(entry.poll_refusal_warned_at, now) {
+        HourlyWarning::Warn => {
             entry.poll_refusal_warned_at = Some(now);
             tracing::warn!("Refused a polled round from {system_id:?}: {err:?}");
         }
-        RefusedPoll::Quiet => tracing::debug!("Refused a polled round from {system_id:?}: {err:?}"),
+        HourlyWarning::Quiet => {
+            tracing::debug!("Refused a polled round from {system_id:?}: {err:?}")
+        }
     }
 }
-
-/// How loudly to log a refused polled round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RefusedPoll {
-    /// The system's first refusal in the last hour: logged at `warn`.
-    Warn,
-    /// Logged at `debug`.
-    Quiet,
-}
-
-/// A system's refused polled rounds are logged at `warn` at most once an hour.
-pub(super) fn refused_poll(last_warned: Option<Instant>, now: Instant) -> RefusedPoll {
-    match last_warned {
-        Some(at) if now.saturating_duration_since(at) < REFUSAL_WARNING_EVERY => RefusedPoll::Quiet,
-        _ => RefusedPoll::Warn,
-    }
-}
-
-/// How often a system's refused polled rounds may be logged at `warn`.
-const REFUSAL_WARNING_EVERY: Duration = Duration::from_secs(3_600);

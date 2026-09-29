@@ -19,6 +19,7 @@ mod applications;
 mod clock;
 mod collector;
 mod db;
+mod hourly_warning;
 mod listen;
 mod models;
 mod push;
