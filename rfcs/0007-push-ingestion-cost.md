@@ -1179,8 +1179,9 @@ hub gate.
 | §1 the 4 MiB poll body; the poll's offline marking on the blocking pool | done | `42b0241` |
 | §2 no systems cache: the poller reads the registry each tick (`enabled_systems`) | done | `71178dd` |
 | `rosette-auditor` on the wiring (`918638e..71178dd`): its one VIOLATED and six AT-RISK fixed | done | `c70c7a1` |
-| §3 decode budget (`TokenBucket`, `DecodeBudget`) | next | |
-| §4 `end_connection`, eviction on delete | to do | |
+| §3 `TokenBucket` under `SourcePace`'s tests; the connection's state split into `push/connection.rs` | done | `7a96072`, `f77ac56` |
+| §3 decode budget (`DecodeBudget`, `PushConfig::decode_refill`), spent before either decode | done | `c9c3c51` |
+| §4 `end_connection`, eviction on delete | next | |
 | §5 SSE publisher (`watch`, `send_replace`) | to do | |
 | README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
 
@@ -1222,9 +1223,37 @@ Open items to settle on the way:
   connection at `warn`: it landed with the refusal, before the budget.
 - `Database::plant_point`, test-only, replaces `insert_metric` wherever a test needs history in
   place.
-- `push/mod.rs` has 529 lines before its tests, 415 of them code. §3 adds the budget there; if
-  it nears 500 lines of code, the connection's state (`ConnectionState`, `Tally`,
-  `DecodeBudget`) splits out along that seam.
+- The connection's state split out of `push/mod.rs` (529 lines before its tests) before §3
+  grew it: `push/connection.rs` holds `ConnectionState`, `Tally`, `Occurrence`, `warn_first`
+  and the budget. `push/mod.rs` has 466 lines before its tests.
+- §3 added names the design doesn't have:
+  - `Refill` is a bucket's capacity (`NonZeroU8`) and its period, so a bucket that never holds a
+    token can't be built. `token_bucket::Empty` is the bucket's refusal, which `SourcePace` maps
+    to `TooSoon` and `DecodeBudget` to `OutOfBudget`;
+  - `ConnectionState::spend_decode_budget` spends the budget and counts a drop in one step, so
+    no caller can drop a message without counting it. `ingest` calls it first, with the time the
+    message was read;
+  - `DECODE_REFILL` sits in `push/config.rs` with the other production timings, and
+    `DECODE_BURST` beside `DecodeBudget`.
+- A zero period has no quotient (`checked_div`), and the bucket is full at every take. That is
+  the rule's limit, not a sentinel, and `Refill` and `PushConfig::decode_refill` document it.
+- `an_authenticated_client_that_only_sends_frames_or_pongs_stays_connected` sends ten messages
+  a second, so it uses a zero refill, as §3 foresaw for tests that send several frames. None
+  of the others needed one.
+- The budget's real-server tests add one row the plan doesn't list: a second connection of
+  the same system, opened after the first dropped a message, stores its first frame at once.
+  The budget is per connection, and a budget shared by a system's connections passed every
+  other row.
+- `red-test-adversary` on §3, as an in-process check with mutation runs in a sandbox: the pure
+  table was `DECORATION` twice before it held. A budget that ignored its period (1 s
+  hard-coded, zero special-cased) passed, until a 100 ms row. An uncapped partial refill
+  passed, until a 5 s quiet row. The wiring's tests killed spending on snapshot frames only,
+  spending after decoding, closing the connection when out of budget, ignoring
+  `decode_refill`, a burst of 2, a budget shared across connections, and an uncounted drop.
+- `rosette-auditor` on §3, as an in-process check: no VIOLATED. Three AT-RISK, each decided:
+  the zero refill (kept, as above); "decode budget" has no glossary entry yet (the docs row
+  adds it with the RFC's other terms); `token_bucket.rs` has no tests of its own (both
+  wrappers' tables cover it, at capacities 2 and 3 and periods of 8 s, 1 s, 100 ms and 0).
 - Removing `ORDER BY timestamp` from the capped prune survives the tests: SQLite reads the
   subquery through `idx_metrics_system_time`, already in timestamp order. The `ORDER BY` stays,
   so oldest-first is a guarantee rather than a planner choice.
