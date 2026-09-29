@@ -129,7 +129,7 @@ mod tests {
             enabled: true,
         })
         .unwrap();
-        (AppState::new(db), dir)
+        (AppState::new(db).unwrap(), dir)
     }
 
     fn id(id: &str) -> SystemId {

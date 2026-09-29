@@ -48,6 +48,7 @@ enum StartupError {
     Listen(listen::ListenAddressError),
     StaticDir(StaticDirError),
     Database(rusqlite::Error),
+    FirstSummary(routes::sse::SummaryFailure),
     Bind(SocketAddr, std::io::Error),
     Serve(std::io::Error),
 }
@@ -59,6 +60,7 @@ impl std::fmt::Display for StartupError {
             Self::Listen(err) => write!(f, "{err}; refusing to start"),
             Self::StaticDir(err) => write!(f, "{err}; refusing to start"),
             Self::Database(err) => write!(f, "Failed to open database system-hub.db: {err}"),
+            Self::FirstSummary(failure) => write!(f, "{failure}; refusing to start"),
             Self::Bind(addr, err) => write!(f, "Failed to bind {addr}: {err}"),
             Self::Serve(err) => write!(f, "Server failed: {err}"),
         }
@@ -91,11 +93,16 @@ async fn run() -> Result<(), StartupError> {
     let db = Arc::new(db::Database::new("system-hub.db").map_err(StartupError::Database)?);
     tracing::info!("📁 Database initialized: system-hub.db");
 
-    let app_state = state::AppState::new(db);
+    // The first summary reads the database, so the state is built on the blocking pool.
+    let app_state = tokio::task::spawn_blocking(move || state::AppState::new(db))
+        .await
+        .map_err(|err| StartupError::FirstSummary(routes::sse::SummaryFailure::Task(err)))?
+        .map_err(|err| StartupError::FirstSummary(routes::sse::SummaryFailure::Serialise(err)))?;
 
     // Start background pollers (for HTTP-polled systems)
     collector::start_collectors(app_state.clone());
     retention::start(app_state.clone());
+    routes::sse::start_publisher(app_state.clone());
 
     let app = app(app_state, push_auth, &static_dir);
 
@@ -295,7 +302,7 @@ mod tests {
     async fn the_dashboard_is_served_from_the_configured_static_dir() {
         let data = tempfile::tempdir().unwrap();
         let db = Arc::new(db::Database::new(data.path().join("hub.db").to_str().unwrap()).unwrap());
-        let state = state::AppState::new(db);
+        let state = state::AppState::new(db).unwrap();
         // Two directories with different pages, so only the configured one can answer.
         let dirs: Vec<(tempfile::TempDir, String)> = ["image-marker", "volume-marker"]
             .into_iter()
@@ -334,7 +341,7 @@ mod tests {
         let db = Arc::new(db::Database::new(data.path().join("hub.db").to_str().unwrap()).unwrap());
         let static_dir = tempfile::tempdir().unwrap();
         let app = app(
-            state::AppState::new(db),
+            state::AppState::new(db).unwrap(),
             push::PushAuth::Open,
             &served(static_dir.path()).await,
         );

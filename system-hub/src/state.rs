@@ -18,8 +18,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
+use tokio::sync::watch;
+
 use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
 use crate::db::Database;
+use crate::routes::sse::Summary;
 use crate::snapshot::LiveMetrics;
 
 /// What the hub holds in memory of one system's applications (RFC 0009 §8).
@@ -46,16 +49,24 @@ pub struct AppState {
     pub live_applications: RwLock<HashMap<String, SystemApplications>>,
     /// The one digest key every ingestion path shares.
     pub digester: RoundDigester,
+    /// The latest summary (RFC 0007 §5): the publisher replaces it, and every SSE subscriber
+    /// watches it.
+    pub summary: watch::Sender<Summary>,
 }
 
 impl AppState {
-    pub fn new(db: Arc<Database>) -> Arc<Self> {
-        Arc::new(Self {
+    /// Builds the hub's state with its first summary, so the channel never holds an empty
+    /// value. The summary reads the database, so `main` runs this on the blocking pool.
+    pub fn new(db: Arc<Database>) -> Result<Arc<Self>, serde_json::Error> {
+        let live_metrics = RwLock::new(HashMap::new());
+        let summary = watch::Sender::new(Summary::build(&db, &live_metrics)?);
+        Ok(Arc::new(Self {
             db,
-            live_metrics: RwLock::new(HashMap::new()),
+            live_metrics,
             live_applications: RwLock::new(HashMap::new()),
             digester: RoundDigester::new(),
-        })
+            summary,
+        }))
     }
 
     /// Removes a system's live metrics (RFC 0007 §4) and hands the entry back, so the caller
@@ -77,7 +88,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-        (AppState::new(db), dir)
+        (AppState::new(db).unwrap(), dir)
     }
 
     fn plant(app: &AppState, system_id: &str) -> Arc<LiveMetrics> {

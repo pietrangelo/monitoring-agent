@@ -513,6 +513,49 @@ async fn the_running_hub_serves_the_configured_dashboard_and_the_full_router() {
     );
 }
 
+/// RFC 0007 §5: the running hub publishes a new summary every 5 s, so a system registered
+/// after the startup summary reaches a subscriber within one tick.
+#[tokio::test]
+async fn the_running_hub_publishes_a_summary_every_5_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut hub = hub_listening_at(dir.path(), "127.0.0.1:0");
+    let bound = bound_address(&mut hub).await;
+    assert!(bound.is_ok(), "the hub serves: {bound:?}");
+    let base = format!("http://{}", bound.unwrap());
+    let client = reqwest::Client::new();
+    wait_for(&client, &format!("{base}/api/health"), &mut hub).await;
+    // Nothing listens on the discard port, so the poller's fetch fails at once.
+    let registered = client
+        .post(format!("{base}/api/systems"))
+        .json(&serde_json::json!({ "name": "sse-marker", "url": "http://127.0.0.1:9" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), 200, "the system is registered");
+
+    let mut stream = client
+        .get(format!("{base}/api/stream/summary"))
+        .send()
+        .await
+        .unwrap();
+    let mut seen = String::new();
+    let listed = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Ok(Some(chunk)) = stream.chunk().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            if seen.contains("sse-marker") {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        listed.ok(),
+        Some(true),
+        "a summary lists the system within one tick: {seen}"
+    );
+}
+
 /// For each marker in turn, the rest of the first later line of the hub's stdout that holds
 /// it, up to whitespace, read within 10 s; else why not. A task then keeps draining stdout,
 /// so a full pipe never blocks the hub's logging.

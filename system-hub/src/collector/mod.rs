@@ -490,7 +490,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-        let state = AppState::new(db);
+        let state = AppState::new(db).unwrap();
         (state, dir)
     }
 

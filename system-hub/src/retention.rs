@@ -105,7 +105,7 @@ mod tests {
             db.insert_system(&sys).unwrap();
             db.plant_point(id, "cpu", 1.0, now).unwrap();
         }
-        let app = AppState::new(db);
+        let app = AppState::new(db).unwrap();
         for id in ["a", "b", "disabled"] {
             for (metric, ts) in [
                 ("app:x:up", now - 86_401),
