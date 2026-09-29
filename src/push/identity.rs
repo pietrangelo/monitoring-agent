@@ -161,11 +161,18 @@ fn persist_new_id(_path: &Path, resolved: ResolvedId) -> Result<ResolvedId, Agen
     Ok(resolved)
 }
 
+/// What a failed `hard_link` of the new id file means: a filesystem without hard links (`EPERM`,
+/// or an unsupported operation), else a failed write.
+fn link_failure(err: io::Error) -> AgentIdError {
+    AgentIdError::Unwritable(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
+    use std::sync::{Arc, Barrier};
 
     /// A directory of its own under the system's temp directory, removed on drop.
     struct Scratch(PathBuf);
@@ -187,6 +194,12 @@ mod tests {
             path
         }
 
+        fn dir(&self, name: &str) -> PathBuf {
+            let path = self.path(name);
+            fs::create_dir(&path).unwrap();
+            path
+        }
+
         /// The names in the directory, sorted.
         fn names(&self) -> Vec<String> {
             let mut names: Vec<String> = fs::read_dir(&self.0)
@@ -204,22 +217,32 @@ mod tests {
         }
     }
 
-    /// Sources under `scratch`: each written when given, missing when `None`.
-    fn sources(
-        scratch: &Scratch,
-        machine_id: Option<&[u8]>,
-        dbus: Option<&[u8]>,
-        host: Option<&[u8]>,
-    ) -> IdSources {
-        let place = |name: &str, content: Option<&[u8]>| match content {
-            Some(content) => scratch.write(name, content),
-            None => scratch.path(name),
+    /// What a test puts at a source's path.
+    #[derive(Clone, Copy)]
+    enum Plant<'a> {
+        Missing,
+        File(&'a [u8]),
+        /// What Docker's `-v /etc/machine-id:/etc/machine-id` makes on a host without the file.
+        Directory,
+    }
+
+    /// Sources under `scratch`, each planted as asked.
+    fn sources(scratch: &Scratch, machine_id: Plant, dbus: Plant, host: Plant) -> IdSources {
+        let place = |name: &str, plant: Plant| match plant {
+            Plant::Missing => scratch.path(name),
+            Plant::File(content) => scratch.write(name, content),
+            Plant::Directory => scratch.dir(name),
         };
         IdSources {
             machine_id: place("machine-id", machine_id),
             dbus_machine_id: place("dbus-machine-id", dbus),
             host_name: place("hostname", host),
         }
+    }
+
+    /// Only a host name, in its own scratch directory.
+    fn host_only(scratch: &Scratch, host: &[u8]) -> IdSources {
+        sources(scratch, Plant::Missing, Plant::Missing, Plant::File(host))
     }
 
     /// Built directly, so these tests don't depend on `from_env`, which has its own.
@@ -232,8 +255,8 @@ mod tests {
         AgentId(id.to_owned())
     }
 
-    /// RFC 0016 §6: the hub's `SystemId` rule (RFC 0005), on the value after trimming, so the
-    /// agent never presents an id the hub refuses.
+    /// RFC 0016 §6: the hub's `SystemId` rule (RFC 0005), on the value after trimming ASCII
+    /// whitespace, so the agent never presents an id the hub refuses.
     #[test]
     fn an_agent_id_follows_the_hubs_system_id_rule_after_trimming() {
         let ascii_255 = "a".repeat(255);
@@ -250,11 +273,11 @@ mod tests {
                 "0123456789abcdef0123456789abcdef\n",
                 Ok("0123456789abcdef0123456789abcdef"),
             ),
-            (
-                "uuid",
-                "123e4567-e89b-12d3-a456-426614174000",
-                Ok("123e4567-e89b-12d3-a456-426614174000"),
-            ),
+            ("a CRLF line", "abc\r\n", Ok("abc")),
+            // ASCII trimming only: a no-break space and a vertical tab aren't ASCII
+            // whitespace for `trim_ascii`, and stay part of the id, as the hub would keep them.
+            ("a no-break space is kept", "\u{a0}id", Ok("\u{a0}id")),
+            ("a vertical tab is kept", "\x0bid", Ok("\x0bid")),
             ("single dot", ".", Err(AgentIdRule::DotSegment)),
             ("double dot", "..", Err(AgentIdRule::DotSegment)),
             ("double dot, padded", " ..\n", Err(AgentIdRule::DotSegment)),
@@ -262,7 +285,11 @@ mod tests {
             ("dotted hostname", "a.b", Ok("a.b")),
             ("leading dot", ".hidden", Ok(".hidden")),
             ("inner space kept", "a b", Ok("a b")),
-            ("255 ascii bytes", ascii_255.as_str(), Ok(ascii_255.as_str())),
+            (
+                "255 ascii bytes",
+                ascii_255.as_str(),
+                Ok(ascii_255.as_str()),
+            ),
             (
                 "255 bytes once trimmed",
                 padded_255.as_str(),
@@ -273,7 +300,11 @@ mod tests {
                 multi_byte_255.as_str(),
                 Ok(multi_byte_255.as_str()),
             ),
-            ("256 ascii bytes", ascii_256.as_str(), Err(AgentIdRule::TooLong)),
+            (
+                "256 ascii bytes",
+                ascii_256.as_str(),
+                Err(AgentIdRule::TooLong),
+            ),
             (
                 "256 bytes in 255 characters",
                 multi_byte_256.as_str(),
@@ -295,7 +326,7 @@ mod tests {
     #[test]
     fn the_id_file_variable_is_unset_empty_or_an_absolute_path() {
         let not_utf8 = OsString::from_vec(b"/var/lib/agent-\xff/id".to_vec());
-        let cases: [(&str, Option<OsString>, Result<Option<PathBuf>, ()>); 6] = [
+        let cases: [(&str, Option<OsString>, Result<Option<PathBuf>, ()>); 7] = [
             ("unset", None, Ok(None)),
             ("empty", Some(OsString::new()), Ok(None)),
             (
@@ -305,6 +336,7 @@ mod tests {
             ),
             ("relative", Some("system-agent/id".into()), Err(())),
             ("bare name", Some("id".into()), Err(())),
+            ("a space is a value, not unset", Some(" ".into()), Err(())),
             (
                 "absolute, not UTF-8",
                 Some(not_utf8.clone()),
@@ -324,86 +356,96 @@ mod tests {
     }
 
     /// RFC 0016 §6: with no id file, the machine id, the dbus machine id, the host name, then a
-    /// random UUID; a source that is missing, empty or breaks the rule is skipped. The host name
-    /// is converted lossily, as the `hostname` binary's output was.
+    /// random UUID; a source that is missing, unreadable, not UTF-8 (the machine ids), empty or
+    /// breaking the rule is skipped. The host name is converted lossily, as the `hostname`
+    /// binary's output was.
     #[test]
     fn with_no_id_file_the_first_usable_source_gives_the_id() {
+        use Plant::{Directory, File, Missing};
         let host_64 = "h".repeat(64);
         let too_long = "m".repeat(256);
-        type Case<'a> = (
-            &'a str,
-            Option<&'a [u8]>,
-            Option<&'a [u8]>,
-            Option<&'a [u8]>,
-            IdSource,
-            Option<&'a str>,
-        );
-        let cases: [Case; 9] = [
+        let host = File(b"host\n");
+        let cases: [(&str, Plant, Plant, Plant, IdSource, &str); 10] = [
             (
                 "every source present",
-                Some(b"machine\n"),
-                Some(b"dbus\n"),
-                Some(b"host\n"),
+                File(b"machine\n"),
+                File(b"dbus\n"),
+                host,
                 IdSource::MachineId,
-                Some("machine"),
+                "machine",
             ),
             (
                 "an empty machine id",
-                Some(b"\n"),
-                Some(b"dbus\n"),
-                Some(b"host\n"),
+                File(b"\n"),
+                File(b"dbus\n"),
+                host,
                 IdSource::DbusMachineId,
-                Some("dbus"),
+                "dbus",
             ),
             (
                 "a machine id over 255 bytes",
-                Some(too_long.as_bytes()),
-                Some(b"dbus\n"),
-                Some(b"host\n"),
+                File(too_long.as_bytes()),
+                File(b"dbus\n"),
+                host,
                 IdSource::DbusMachineId,
-                Some("dbus"),
+                "dbus",
             ),
             (
-                "no machine ids",
-                None,
-                Some(b"  \n"),
-                Some(b"host\n"),
-                IdSource::HostName,
-                Some("host"),
-            ),
-            (
-                "a 64-byte host name",
-                None,
-                None,
-                Some(host_64.as_bytes()),
-                IdSource::HostName,
-                Some(host_64.as_str()),
-            ),
-            (
-                "a host name that isn't UTF-8",
-                None,
-                None,
-                Some(b"host-\xff\n"),
-                IdSource::HostName,
-                Some("host-\u{fffd}"),
-            ),
-            (
-                "a host name that is a dot segment",
-                None,
-                None,
-                Some(b"..\n"),
-                IdSource::Random,
-                None,
+                "a machine id that is a directory",
+                Directory,
+                File(b"dbus\n"),
+                host,
+                IdSource::DbusMachineId,
+                "dbus",
             ),
             (
                 "a machine id that isn't UTF-8",
-                Some(b"\xff\xfe"),
-                None,
-                Some(b"host\n"),
+                File(b"\xff\xfe"),
+                Missing,
+                host,
                 IdSource::HostName,
-                Some("host"),
+                "host",
             ),
-            ("no source at all", None, None, None, IdSource::Random, None),
+            (
+                "a blank dbus machine id",
+                Missing,
+                File(b"  \n"),
+                host,
+                IdSource::HostName,
+                "host",
+            ),
+            (
+                "a dbus machine id that is a dot segment",
+                Missing,
+                File(b"..\n"),
+                host,
+                IdSource::HostName,
+                "host",
+            ),
+            (
+                "a dbus machine id that isn't UTF-8",
+                Missing,
+                File(b"\xc3"),
+                host,
+                IdSource::HostName,
+                "host",
+            ),
+            (
+                "a 64-byte host name",
+                Missing,
+                Missing,
+                File(host_64.as_bytes()),
+                IdSource::HostName,
+                host_64.as_str(),
+            ),
+            (
+                "a host name that isn't UTF-8",
+                Missing,
+                Directory,
+                File(b"host-\xff\n"),
+                IdSource::HostName,
+                "host-\u{fffd}",
+            ),
         ];
         for (name, machine_id, dbus, host, source, id) in cases {
             let scratch = Scratch::new();
@@ -413,15 +455,60 @@ mod tests {
                 panic!("case {name}: {err:?}");
             });
 
-            assert_eq!(resolved.resolution, Resolution::Resolved(source), "case {name}");
-            match id {
-                Some(id) => assert_eq!(resolved.id.as_str(), id, "case {name}"),
-                None => assert!(
-                    uuid::Uuid::parse_str(resolved.id.as_str()).is_ok(),
-                    "case {name}: a UUID, got {:?}",
+            assert_eq!(
+                resolved,
+                ResolvedId {
+                    id: agent_id(id),
+                    resolution: Resolution::Resolved(source),
+                },
+                "case {name}"
+            );
+        }
+    }
+
+    /// RFC 0016 §6: with no usable source, a random (v4) UUID, a new one for each resolution:
+    /// a fixed fallback would make every such host one system on the hub.
+    #[test]
+    fn with_no_usable_source_each_resolution_draws_a_new_random_uuid() {
+        use Plant::{Directory, File, Missing};
+        let cases: [(&str, Plant, Plant, Plant); 3] = [
+            ("no source at all", Missing, Missing, Missing),
+            (
+                "a host name that is a dot segment",
+                Missing,
+                Missing,
+                File(b"..\n"),
+            ),
+            (
+                "unreadable machine ids, a blank host name",
+                Directory,
+                Directory,
+                File(b" \n"),
+            ),
+        ];
+        for (name, machine_id, dbus, host) in cases {
+            let scratch = Scratch::new();
+            let sources = sources(&scratch, machine_id, dbus, host);
+
+            let first = resolve_push_id(None, &sources).unwrap();
+            let second = resolve_push_id(None, &sources).unwrap();
+
+            for resolved in [&first, &second] {
+                assert_eq!(
+                    resolved.resolution,
+                    Resolution::Resolved(IdSource::Random),
+                    "case {name}"
+                );
+                let uuid = uuid::Uuid::parse_str(resolved.id.as_str());
+                assert_eq!(
+                    uuid.ok().and_then(|uuid| uuid.get_version()),
+                    Some(uuid::Version::Random),
+                    "case {name}: a v4 UUID, got {:?}",
                     resolved.id
-                ),
+                );
+                assert_eq!(resolved.id.as_str().len(), 36, "case {name}: hyphenated");
             }
+            assert_ne!(first.id, second.id, "case {name}: a new UUID each time");
         }
     }
 
@@ -431,7 +518,7 @@ mod tests {
     fn a_missing_id_file_is_written_once_and_then_wins() {
         let scratch = Scratch::new();
         let file = id_file(scratch.path("id"));
-        let first = sources(&scratch, None, None, Some(b"first-host\n"));
+        let first = host_only(&scratch, b"first-host\n");
 
         let written = resolve_push_id(Some(&file), &first).unwrap();
 
@@ -450,7 +537,12 @@ mod tests {
             "no temporary file is left"
         );
 
-        let second = sources(&scratch, Some(b"a-machine-id\n"), None, Some(b"second-host\n"));
+        let second = sources(
+            &scratch,
+            Plant::File(b"a-machine-id\n"),
+            Plant::Missing,
+            Plant::File(b"second-host\n"),
+        );
         let read = resolve_push_id(Some(&file), &second).unwrap();
 
         assert_eq!(
@@ -463,104 +555,281 @@ mod tests {
         );
     }
 
-    /// RFC 0016 §6: an id file that can't be used refuses startup, with the error saying why:
-    /// a refused value (78) or an I/O failure (1).
+    /// RFC 0016 §6: agents racing to create one id file all end up with one id, the one the file
+    /// holds, and no file is ever replaced or left half-written: whoever links first wins, and
+    /// every other reads what it linked.
+    #[test]
+    fn agents_racing_for_a_missing_id_file_all_end_up_with_the_one_it_holds() {
+        const RACERS: usize = 8;
+        for round in 0..20 {
+            let shared = Scratch::new();
+            let path = shared.path("id");
+            let start = Arc::new(Barrier::new(RACERS));
+            let racers: Vec<_> = (0..RACERS)
+                .map(|racer| {
+                    let (path, start) = (path.clone(), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        let own = Scratch::new();
+                        let host = format!("host-{racer}\n");
+                        let sources = host_only(&own, host.as_bytes());
+                        start.wait();
+                        resolve_push_id(Some(&id_file(path)), &sources)
+                    })
+                })
+                .collect();
+            let results: Vec<ResolvedId> = racers
+                .into_iter()
+                .map(|racer| racer.join().unwrap().unwrap())
+                .collect();
+
+            let stored = fs::read_to_string(&path);
+            assert!(stored.is_ok(), "round {round}: the file was written: {stored:?}");
+            let winner = agent_id(stored.unwrap_or_default().trim());
+            assert!(
+                results.iter().all(|resolved| resolved.id == winner),
+                "round {round}: every racer holds the file's id {winner:?}: {results:?}"
+            );
+            let written = results
+                .iter()
+                .filter(|resolved| matches!(resolved.resolution, Resolution::Written(_)))
+                .count();
+            assert_eq!(written, 1, "round {round}: one racer wrote it: {results:?}");
+            assert_eq!(
+                shared.names(),
+                ["id"],
+                "round {round}: no temporary file is left"
+            );
+        }
+    }
+
+    /// RFC 0016 §6: an id file that can't be used refuses startup, and the error says why,
+    /// never with the path.
     #[test]
     fn an_unusable_id_file_refuses_startup() {
-        // (case, what to plant at the id path, is it a refused value)
-        let cases: [(&str, fn(&Scratch) -> PathBuf, fn(&AgentIdError) -> bool, bool); 5] = [
+        // (case, what to plant at the id path, the expected error, what its message says)
+        type Check = fn(&AgentIdError) -> bool;
+        let cases: [(&str, fn(&Scratch) -> PathBuf, Check, &str); 7] = [
             (
                 "a dot segment",
                 |s| s.write("id", b"..\n"),
                 |e| matches!(e, AgentIdError::Invalid(AgentIdRule::DotSegment)),
-                true,
+                "`.` or `..`",
             ),
             (
                 "only whitespace",
                 |s| s.write("id", b" \n"),
                 |e| matches!(e, AgentIdError::Invalid(AgentIdRule::Empty)),
-                true,
+                "an empty id",
+            ),
+            (
+                "a zero-byte file",
+                |s| s.write("id", b""),
+                |e| matches!(e, AgentIdError::Invalid(AgentIdRule::Empty)),
+                "an empty id",
+            ),
+            (
+                "an id over 255 bytes",
+                |s| s.write("id", "i".repeat(256).as_bytes()),
+                |e| matches!(e, AgentIdError::Invalid(AgentIdRule::TooLong)),
+                "longer than 255 bytes",
             ),
             (
                 "not UTF-8",
                 |s| s.write("id", b"\xff\xfe\n"),
                 |e| matches!(e, AgentIdError::NotUtf8),
-                true,
+                "UTF-8",
             ),
             (
                 "a directory",
-                |s| {
-                    let path = s.path("id");
-                    fs::create_dir(&path).unwrap();
-                    path
-                },
+                |s| s.dir("id"),
                 |e| matches!(e, AgentIdError::Unreadable(_)),
-                false,
+                "couldn't be read",
             ),
             (
                 "in a directory that doesn't exist",
                 |s| s.path("missing").join("id"),
                 |e| matches!(e, AgentIdError::Unwritable(_)),
-                false,
+                "couldn't be written",
             ),
         ];
-        for (name, plant, is_expected, refused_value) in cases {
+        for (name, plant, is_expected, says) in cases {
             let scratch = Scratch::new();
-            let file = id_file(plant(&scratch));
-            let sources = sources(&scratch, Some(b"machine\n"), None, None);
+            let path = plant(&scratch);
+            let before = fs::read(&path).ok();
+            let sources = sources(
+                &scratch,
+                Plant::File(b"machine\n"),
+                Plant::Missing,
+                Plant::Missing,
+            );
 
-            let err = resolve_push_id(Some(&file), &sources).expect_err(name);
+            let err = resolve_push_id(Some(&id_file(path.clone())), &sources).expect_err(name);
 
             assert!(is_expected(&err), "case {name}: got {err:?}");
-            assert_eq!(err.is_refused_value(), refused_value, "case {name}");
             let message = err.to_string();
             assert!(
-                message.contains(ID_FILE_VARIABLE),
-                "case {name}: names the variable: {message}"
+                message.contains(ID_FILE_VARIABLE) && message.contains(says),
+                "case {name}: names the variable and says {says:?}: {message}"
             );
             assert!(
                 !message.contains(&*scratch.0.to_string_lossy()),
                 "case {name}: never the path: {message}"
             );
+            assert_eq!(
+                fs::read(&path).ok(),
+                before,
+                "case {name}: the file is untouched"
+            );
         }
     }
 
-    /// RFC 0016 §6: when another process links the file first, its id is read, the file is
-    /// never replaced, and the temporary file is removed.
+    /// RFC 0016 §6: which refusals are refused values (exit 78) and which are I/O failures
+    /// (exit 1), and what each message says.
     #[test]
-    fn an_id_file_created_by_another_process_first_is_read_not_replaced() {
-        let scratch = Scratch::new();
-        let path = scratch.write("id", b"the-other-process\n");
-        let ours = ResolvedId {
-            id: agent_id("ours"),
-            resolution: Resolution::Written(IdSource::HostName),
-        };
-
-        let resolved = persist_new_id(&path, ours).unwrap();
-
-        assert_eq!(
-            resolved,
-            ResolvedId {
-                id: agent_id("the-other-process"),
-                resolution: Resolution::FromFile,
-            }
-        );
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "the-other-process\n",
-            "never replaced"
-        );
-        assert_eq!(scratch.names(), ["id"], "no temporary file is left");
+    fn each_refusal_is_a_refused_value_or_an_io_failure() {
+        let io = || io::Error::other("boom");
+        let cases = [
+            (
+                "not absolute",
+                AgentIdError::NotAbsolute,
+                true,
+                "absolute path",
+            ),
+            ("not UTF-8", AgentIdError::NotUtf8, true, "UTF-8"),
+            (
+                "breaking the rule",
+                AgentIdError::Invalid(AgentIdRule::DotSegment),
+                true,
+                "`.` or `..`",
+            ),
+            (
+                "unreadable",
+                AgentIdError::Unreadable(io()),
+                false,
+                "couldn't be read: boom",
+            ),
+            (
+                "unwritable",
+                AgentIdError::Unwritable(io()),
+                false,
+                "couldn't be written: boom",
+            ),
+            (
+                "no hard links",
+                AgentIdError::NoHardLinks(io()),
+                false,
+                "may not support hard links: boom",
+            ),
+        ];
+        for (name, err, refused_value, says) in cases {
+            assert_eq!(err.is_refused_value(), refused_value, "case {name}");
+            let message = err.to_string();
+            assert!(
+                message.starts_with(ID_FILE_VARIABLE) && message.contains(says),
+                "case {name}: says {says:?}: {message}"
+            );
+        }
     }
 
-    /// RFC 0016 §6: a dangling symlink at the id path reads as missing, then its link attempt
-    /// finds the name taken, and the read after that is final: `Unreadable`, never a loop.
+    /// RFC 0016 §6: a `link(2)` refused the way a filesystem without hard links refuses is
+    /// reported as such, so the operator doesn't chase ownership; any other failure is a failed
+    /// write.
     #[test]
-    fn a_dangling_symlink_at_the_id_path_is_unreadable_after_one_attempt() {
+    fn a_link_refused_for_want_of_hard_links_is_named() {
+        const EPERM: i32 = 1;
+        const EACCES: i32 = 13;
+        const ENOSPC: i32 = 28;
+        let cases: [(&str, io::Error, bool); 4] = [
+            ("EPERM", io::Error::from_raw_os_error(EPERM), true),
+            (
+                "unsupported",
+                io::Error::from(io::ErrorKind::Unsupported),
+                true,
+            ),
+            ("EACCES", io::Error::from_raw_os_error(EACCES), false),
+            ("ENOSPC", io::Error::from_raw_os_error(ENOSPC), false),
+        ];
+        for (name, err, no_hard_links) in cases {
+            let got = link_failure(err);
+            assert_eq!(
+                matches!(got, AgentIdError::NoHardLinks(_)),
+                no_hard_links,
+                "case {name}: {got:?}"
+            );
+            assert_eq!(
+                matches!(got, AgentIdError::Unwritable(_)),
+                !no_hard_links,
+                "case {name}: {got:?}"
+            );
+        }
+    }
+
+    /// RFC 0016 §6: when another process linked the file first, the read that follows is final
+    /// and applies the file's rules: its id is used and never replaced; an invalid one is
+    /// refused as a value; a dangling symlink is `Unreadable`, never another write.
+    #[test]
+    fn after_losing_the_link_the_read_is_final() {
+        type Check = fn(&Result<ResolvedId, AgentIdError>) -> bool;
+        let cases: [(&str, fn(&Scratch) -> PathBuf, Check); 3] = [
+            (
+                "a valid file",
+                |s| s.write("id", b"the-other-process\n"),
+                |r| {
+                    matches!(r, Ok(ResolvedId { id, resolution: Resolution::FromFile })
+                        if id.as_str() == "the-other-process")
+                },
+            ),
+            (
+                "an invalid file",
+                |s| s.write("id", b"..\n"),
+                |r| matches!(r, Err(AgentIdError::Invalid(AgentIdRule::DotSegment))),
+            ),
+            (
+                "a dangling symlink",
+                |s| {
+                    let path = s.path("id");
+                    std::os::unix::fs::symlink(s.path("nowhere"), &path).unwrap();
+                    path
+                },
+                |r| {
+                    matches!(r, Err(AgentIdError::Unreadable(io))
+                        if io.kind() == io::ErrorKind::NotFound)
+                },
+            ),
+        ];
+        for (name, plant, is_expected) in cases {
+            let scratch = Scratch::new();
+            let path = plant(&scratch);
+            let before = fs::read(&path).ok();
+            let ours = ResolvedId {
+                id: agent_id("ours"),
+                resolution: Resolution::Written(IdSource::HostName),
+            };
+
+            let got = persist_new_id(&path, ours);
+
+            assert!(is_expected(&got), "case {name}: got {got:?}");
+            assert_eq!(fs::read(&path).ok(), before, "case {name}: never replaced");
+            assert_eq!(
+                scratch.names(),
+                ["id"],
+                "case {name}: no temporary file is left"
+            );
+            assert!(
+                !scratch.path("nowhere").exists(),
+                "case {name}: nothing written through the symlink"
+            );
+        }
+    }
+
+    /// RFC 0016 §6: the whole resolution over a dangling symlink at the id path: it reads as
+    /// missing, the link finds the name taken, and the read after that is final.
+    #[test]
+    fn a_dangling_symlink_at_the_id_path_is_unreadable() {
         let scratch = Scratch::new();
         let path = scratch.path("id");
         std::os::unix::fs::symlink(scratch.path("nowhere"), &path).unwrap();
-        let sources = sources(&scratch, None, None, Some(b"host\n"));
+        let sources = host_only(&scratch, b"host\n");
 
         let err = resolve_push_id(Some(&id_file(path)), &sources).expect_err("refused");
 
@@ -568,7 +837,14 @@ mod tests {
             matches!(&err, AgentIdError::Unreadable(io) if io.kind() == io::ErrorKind::NotFound),
             "got {err:?}"
         );
-        assert!(!err.is_refused_value(), "an I/O failure, exit 1");
-        assert_eq!(scratch.names(), ["hostname", "id"], "no temporary file is left");
+        assert_eq!(
+            scratch.names(),
+            ["hostname", "id"],
+            "no temporary file is left"
+        );
+        assert!(
+            !scratch.path("nowhere").exists(),
+            "nothing written through it"
+        );
     }
 }

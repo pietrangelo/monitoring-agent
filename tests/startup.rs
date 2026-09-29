@@ -521,9 +521,24 @@ fn an_unusable_id_file_refuses_startup_before_anything_starts_when_pushing() {
     std::fs::write(&invalid, "..\n").unwrap();
     let invalid = invalid.to_str().unwrap().to_owned();
     let cases = [
-        ("a relative path, pushing", true, "leak-marker-relative/id", Some(EX_CONFIG)),
-        ("a file breaking the rule, pushing", true, invalid.as_str(), Some(EX_CONFIG)),
-        ("a relative path, not pushing", false, "leak-marker-relative/id", None),
+        (
+            "a relative path, pushing",
+            true,
+            "leak-marker-relative/id",
+            Some(EX_CONFIG),
+        ),
+        (
+            "a file breaking the rule, pushing",
+            true,
+            invalid.as_str(),
+            Some(EX_CONFIG),
+        ),
+        (
+            "a relative path, not pushing",
+            false,
+            "leak-marker-relative/id",
+            None,
+        ),
     ];
     for (name, pushing, value, code) in cases {
         let hub = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -554,7 +569,10 @@ fn an_unusable_id_file_refuses_startup_before_anything_starts_when_pushing() {
             !output.contains(FIRST_RUNTIME_LINE) && !output.contains(STARTED),
             "case {name}: refused before the runtime: {output}"
         );
-        assert_eq!(hub_connections, 0, "case {name}: refused before the push client");
+        assert_eq!(
+            hub_connections, 0,
+            "case {name}: refused before the push client"
+        );
     }
 }
 
