@@ -657,21 +657,25 @@ tier names, and is an open read like the rest of the hub API.
       liveness: Liveness,
       last_contact: Option<u64>,       // hub time of the last successful frame or poll
       last_error: Option<String>,      // ≤ 256 bytes
-      connection: Option<u64>,         // RFC 0008's connection number, push systems only
+      connection: Option<u64>,         // RFC 0016's connection number, push systems only
   }
   pub enum Liveness { Online, Offline { since: u64 }, Unknown }
   ```
 
   - `Liveness` is one enum, so "online with an offline time" can't be represented.
   - **Set only by contact and by transitions.** A successful frame or poll sets `Online` and
-    `last_contact`. A failed poll, the end of the current push connection (RFC 0008 §5), and
-    RFC 0008's staleness sweep set `Offline { since: now }` unless already offline. Shutdown
+    `last_contact`. A failed poll, the end of the current push connection (RFC 0016 §2), and
+    RFC 0016's disconnection sweep (a push system with no current connection, once the store
+    has been open 120 s) set `Offline { since: now }` unless already offline. `last_contact`
+    is a display value, not a liveness rule: a connection that pushes every 300 s is online. Shutdown
     touches nothing.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.
     *Behaviour change: today a push system's `last_seen` holds its agent's uptime display, and a
     failed poll updates it.*
-  - At open every system has its recovered `last_contact` and `Unknown`; one not heard from
-    within **120 s** becomes `Offline { since: last_contact }`, or the open time if it has none.
+  - At open every system has its recovered `last_contact` and `Unknown` (RFC 0016 §4's startup
+    reset). A polled system not heard from within **120 s** becomes `Offline { since:
+    last_contact }`, or the open time if it has none. A push system goes offline only through
+    its current connection's end or RFC 0016's disconnection sweep.
 - **RFC 0007 §2's cache rule, carried forward.** The per-frame `refresh_cache()` goes. The
   in-memory Registry (0011) is maintained by the commit hook, so there is no cache to refresh.
 - **Metric queries.** Every `limit` is **clamped** to 10,000, never refused, and `limit=0` still

@@ -180,7 +180,7 @@ the Registry:
 - The check runs where RFC 0008 §4 puts it: after the token and the `SystemId` rule, before
   registration.
 - **A behaviour change.** A system registered by `POST` for polling can no longer also push under
-  its UUID. Agents push under their machine id (or RFC 0008's other sources), never under a
+  its UUID. Agents push under their machine id (or RFC 0016's other sources), never under a
   hub-minted UUID, so an honest fleet is unaffected. An operator moving a host from poll to push
   deletes the polled entry (admin); the agent registers itself on its first push.
 

@@ -495,6 +495,110 @@ fn a_listen_address_that_isnt_utf8_refuses_startup_before_anything_starts() {
     assert_eq!(connections(&hub), 0, "refused before the push client");
 }
 
+/// A directory of its own under the system's temp directory, removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("agent-startup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn an_unusable_id_file_refuses_startup_before_anything_starts_when_pushing() {
+    // (case, whether PUSH_TO is set, SYSTEM_AGENT_ID_FILE's value, the file's content if any,
+    // the exit code, or `None` for an agent that starts)
+    let scratch = Scratch::new();
+    let invalid = scratch.0.join("leak-marker-invalid");
+    std::fs::write(&invalid, "..\n").unwrap();
+    let invalid = invalid.to_str().unwrap().to_owned();
+    let cases = [
+        (
+            "a relative path, pushing",
+            true,
+            "leak-marker-relative/id",
+            Some(EX_CONFIG),
+        ),
+        (
+            "a file breaking the rule, pushing",
+            true,
+            invalid.as_str(),
+            Some(EX_CONFIG),
+        ),
+        (
+            "a relative path, not pushing",
+            false,
+            "leak-marker-relative/id",
+            None,
+        ),
+    ];
+    for (name, pushing, value, code) in cases {
+        let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+        hub.set_nonblocking(true).unwrap();
+        let push_to = format!("ws://{}", hub.local_addr().unwrap());
+        let run = run_with(
+            pushing.then_some(push_to.as_str()),
+            &[("SYSTEM_AGENT_ID_FILE", value)],
+            Some(STARTED),
+        );
+        let hub_connections = connections(&hub);
+        let output = &run.output;
+
+        assert_eq!(run.code, code, "case {name}: {output}");
+        if code.is_none() {
+            assert!(output.contains(STARTED), "case {name}: started: {output}");
+            continue;
+        }
+        assert!(
+            output.contains("SYSTEM_AGENT_ID_FILE"),
+            "case {name}: the refusal names the variable: {output}"
+        );
+        assert!(
+            !output.contains("leak-marker"),
+            "case {name}: never the path: {output}"
+        );
+        assert!(
+            !output.contains(FIRST_RUNTIME_LINE) && !output.contains(STARTED),
+            "case {name}: refused before the runtime: {output}"
+        );
+        assert_eq!(
+            hub_connections, 0,
+            "case {name}: refused before the push client"
+        );
+    }
+}
+
+#[test]
+fn a_missing_id_file_is_written_at_startup() {
+    let scratch = Scratch::new();
+    let file = scratch.0.join("id");
+    let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    let push_to = format!("ws://{}", hub.local_addr().unwrap());
+
+    let run = run_with(
+        Some(&push_to),
+        &[("SYSTEM_AGENT_ID_FILE", file.to_str().unwrap())],
+        Some(STARTED),
+    );
+
+    let output = &run.output;
+    assert!(output.contains(STARTED), "the agent started: {output}");
+    let id = std::fs::read_to_string(&file).unwrap_or_default();
+    let id = id.trim();
+    assert!(
+        !id.is_empty() && id.len() <= 255 && id != "." && id != "..",
+        "the file holds an id the hub accepts: {id:?}; {output}"
+    );
+}
+
 /// Where a client reaches a service bound at `bound`: an unspecified IP can't be connected
 /// to, so its family's loopback stands in.
 fn reachable(bound: std::net::SocketAddr) -> std::net::SocketAddr {

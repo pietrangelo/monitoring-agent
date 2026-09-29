@@ -48,6 +48,7 @@ use tower_http::services::ServeDir;
 enum StartupError {
     Config(applications::config::ApplicationsConfigError),
     Listen(listen::ListenAddressError),
+    PushId(push::identity::AgentIdError),
     Runtime(std::io::Error),
     Scraper(applications::scraper::ScraperError),
     Collector(tokio::task::JoinError),
@@ -61,7 +62,8 @@ impl StartupError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) | Self::Listen(_) => 78,
-            Self::Runtime(_)
+            Self::PushId(_)
+            | Self::Runtime(_)
             | Self::Scraper(_)
             | Self::Collector(_)
             | Self::Bind(..)
@@ -75,6 +77,7 @@ impl fmt::Display for StartupError {
         match self {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
             Self::Listen(err) => write!(f, "{err}; refusing to start"),
+            Self::PushId(err) => write!(f, "{err}; refusing to start"),
             Self::Runtime(err) => write!(f, "Failed to start the async runtime: {err}"),
             Self::Scraper(err) => write!(f, "Failed to start scraping applications: {err}"),
             Self::Collector(err) => write!(f, "Failed to read the system: {err}"),
@@ -301,6 +304,7 @@ async fn serve(app: Router, listen: ListenAddress) -> Result<(), StartupError> {
 mod tests {
     use super::*;
     use applications::config::ApplicationsConfigError;
+    use push::identity::{AgentIdError, AgentIdRule};
 
     async fn panicked() -> tokio::task::JoinError {
         tokio::spawn(async { panic!("boom") })
@@ -322,6 +326,36 @@ mod tests {
                 "a refused listen address",
                 StartupError::Listen(listen::ListenAddressError::Invalid),
                 78,
+            ),
+            (
+                "a relative id file",
+                StartupError::PushId(AgentIdError::NotAbsolute),
+                78,
+            ),
+            (
+                "an id file that isn't UTF-8",
+                StartupError::PushId(AgentIdError::NotUtf8),
+                78,
+            ),
+            (
+                "an id file breaking the rule",
+                StartupError::PushId(AgentIdError::Invalid(AgentIdRule::TooLong)),
+                78,
+            ),
+            (
+                "an unreadable id file",
+                StartupError::PushId(AgentIdError::Unreadable(io())),
+                1,
+            ),
+            (
+                "an unwritable id file",
+                StartupError::PushId(AgentIdError::Unwritable(io())),
+                1,
+            ),
+            (
+                "an id file on a filesystem without hard links",
+                StartupError::PushId(AgentIdError::NoHardLinks(io())),
+                1,
             ),
             ("no runtime", StartupError::Runtime(io()), 1),
             (

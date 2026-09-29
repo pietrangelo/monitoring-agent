@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::registry::{
-    LastSeen, MemoryCapacity, enabled_systems, memory_capacity_refresh, needs_system_info,
+    LastSeen, MemoryCapacity, memory_capacity_refresh, needs_system_info, polled_systems,
 };
 use serde::Deserialize;
 use std::ops::ControlFlow;
@@ -101,7 +101,7 @@ async fn poll_every(state: Arc<AppState>, period: Duration) {
     loop {
         tick.tick().await;
         systems = read_registry(&state, systems).await;
-        for system in enabled_systems(&systems) {
+        for system in polled_systems(&systems) {
             let (state, system) = (Arc::clone(&state), system.clone());
             tokio::spawn(async move { poll_system(state, &system).await });
         }

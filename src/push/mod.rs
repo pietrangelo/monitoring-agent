@@ -29,6 +29,7 @@ use crate::models::SystemSnapshot;
 use crate::snapshot::{PublishedSnapshot, SnapshotFreshness, SnapshotSeq};
 
 mod application_frame;
+pub mod identity;
 
 /// Payload pushed to the hub every interval.
 #[derive(Debug, Serialize)]
@@ -247,6 +248,11 @@ fn hub_hung_up<E>(incoming: &Option<Result<Message, E>>) -> bool {
     matches!(incoming, Some(Ok(Message::Close(_)) | Err(_)) | None)
 }
 
+/// The line logged when the hub accepts the handshake.
+fn authenticated_line(system_id: &str) -> String {
+    format!("✅ Push authenticated — system_id={system_id}")
+}
+
 /// Sends the auth message and reads the hub's answer; `Err` on an `auth_error`.
 async fn authenticate<S>(ws: &mut S, system_id: &str, token: &str) -> Result<(), String>
 where
@@ -268,7 +274,7 @@ where
         && let Ok(msg) = serde_json::from_str::<HubMessage>(&resp)
     {
         if msg.msg_type == "auth_ok" {
-            tracing::info!("✅ Push authenticated — system_id={system_id}");
+            tracing::info!("{}", authenticated_line(system_id));
         } else {
             tracing::error!("❌ Push auth failed: {}", msg.message);
             return Err(format!("auth failed: {}", msg.message));
@@ -654,6 +660,19 @@ mod tests {
         // or a random UUID fallback -- it should never be empty.
         let id = get_persistent_id();
         assert!(!id.is_empty());
+    }
+
+    /// RFC 0016 §6: the accepted handshake's line prints the id in `Debug` form, so an id holding
+    /// a control character is escaped and can't start a forged log line.
+    #[test]
+    fn the_authenticated_line_prints_the_id_escaped() {
+        let line = authenticated_line("host\nforged: line");
+
+        assert!(!line.contains('\n'), "no raw newline: {line:?}");
+        assert!(
+            line.contains(r#""host\nforged: line""#),
+            "the id in Debug form: {line:?}"
+        );
     }
 
     mod client {
