@@ -1578,6 +1578,14 @@ Median of 20 frames, or of 5 for today's 1024-disk frame, with the slowest in br
   handlers, the SSE summary and the polls take their share.
 - Steady state held: after the last run the measured system's `cpu` series held 43,201
   points, one window's worth, as the fill left it.
+- The capped prune's worst case (§2), through this RFC's hub, on a second fill with a 12 h
+  `metric_retention` row on each of the measured system's series: half of each series was
+  expired at once, so every snapshot pruned the most it may, 16 rows per point. A 1024-disk
+  snapshot, which deletes 16,464 rows, took 192.8 ms (333.6), against 63.7 ms steady; a
+  5-disk one 10.1 ms (17.9), against 5.7 ms. The `cpu` series went from 43,201 to 42,541
+  points over the 44 frames, exactly 15 a frame (16 pruned, one inserted), so the cap held
+  on every frame. At 1024 disks that is three times the steady cost, the ratio the fourth
+  `rfc-adversary` pass measured from Python (136–147 ms against 45–51 ms).
 - A smoke run on a table of one row per series, before the fill (3 to 5 frames, so only
   indicative): 4.6 ms against today's 17.2 ms at 5 disks, and 22 ms against 1,634 ms at 1024.
 
