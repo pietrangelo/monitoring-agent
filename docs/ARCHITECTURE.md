@@ -767,8 +767,10 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   the hostname) are unbounded, and reach every SSE summary: push writes them once per
   registration, poll on every poll.
 - The single SQLite mutex bounds a fleet's aggregate load: every snapshot store, round store,
-  REST handler and summary build takes it in turn. RFC 0007's Appendix measures one
-  snapshot's store end to end.
+  REST handler and summary build takes it in turn. RFC 0007's Appendix measured a store's
+  hold at about 2 ms for a 5-disk snapshot and 54 ms for a 1024-disk one, on a disk where a
+  commit costs about 1 ms: by itself the mutex admits about 1,000 such five-disk systems, or
+  37 with 1024 disks, pushing every 2 s.
 - SSE subscribers are unbounded. Each tick is serialised once and shared, but each
   subscriber's event still copies the summary's bytes.
 - Any connection presenting an id evicts that system's live metrics when it ends, even while
