@@ -1178,6 +1178,7 @@ hub gate.
 | §1/§2 both adapters through the rule and `store_snapshot` (`snapshot_intake.rs`), with §4's `Arc<LiveMetrics>` value, its left-out warning time, `SystemGone` ending the push connection, and push store errors counted | done | `920e28a` |
 | §1 the 4 MiB poll body; the poll's offline marking on the blocking pool | done | `42b0241` |
 | §2 no systems cache: the poller reads the registry each tick (`enabled_systems`) | done | `71178dd` |
+| `rosette-auditor` on the wiring (`918638e..71178dd`): its one VIOLATED and six AT-RISK fixed | done | `c70c7a1` |
 | §3 decode budget (`TokenBucket`, `DecodeBudget`) | next | |
 | §4 `end_connection`, eviction on delete | to do | |
 | §5 SSE publisher (`watch`, `send_replace`) | to do | |
@@ -1191,6 +1192,11 @@ Open items to settle on the way:
     the rule, then `store_snapshot`, then the live metrics entry (`keep_live_metrics`, the
     `on_stored` of both paths) and the left-out log. The warning time's carry-over and the
     replaced entry (`Arc::ptr_eq`) are tested there;
+  - `LiveMetrics` lives in `snapshot.rs`, and its fields are private, unlike §4's block: it is
+    built only by `LiveMetrics::following(previous, snapshot, time, &left_out, now)`, which
+    takes the warning time from `left_out_log` and the entry it follows, so no entry can
+    start from a default;
+  - `registry::needs_system_info`: the fill rule both adapters apply (hostname or OS missing);
   - `SnapshotFrame` / `PushedInfo` (push) and `PolledAnswer` / `PolledInfo` (poll): each edge's
     parsed frame, with the system info the registry fill reads;
   - `Snapshot::scalar` and `Snapshot::disks`, read by the SSE summary's `LiveMetricsDto`. The DTO
@@ -1202,6 +1208,16 @@ Open items to settle on the way:
     `PollFailure`, the poll's offline causes. A transport error while reading the body now
     shows as itself instead of `JSON parse error: …`, and a body that isn't JSON shows
     serde's message.
+- The poll parses the system's id once, before its fetch. A row whose id breaks the rule
+  (stored before RFC 0005) is marked offline with `invalid system id` and never fetched, where
+  the fetch of its `push://` URL used to fail with reqwest's error.
+- **The SSE summary's `load_one` keeps its bytes.** The summary goes through `serde_json::Value`,
+  which widens an `f32` to `f64`, so a load the agent sent as 0.52 (an `f64`) would have shown
+  as 0.5199999809265137 once kept as `f32`. `LiveMetricsDto` shows the kept load as the `f64` its
+  shortest decimal names, and the characterisation pins a load of 0.52. The percentages were
+  `f32` on the wire already, and keep their widened bytes. §5's publisher must keep the
+  characterised bytes too: serialising a struct with `serde_json::to_string` would print the
+  percentages' shortest form and change their bytes.
 - A refused snapshot frame (its timestamp) is counted and logged as §3 describes, the first per
   connection at `warn`: it landed with the refusal, before the budget.
 - `Database::plant_point`, test-only, replaces `insert_metric` wherever a test needs history in
@@ -1217,8 +1233,12 @@ Open items to settle on the way:
 - `POST /api/systems` accepts a `poll_interval_secs` above `i64::MAX` and answers 500; it should
   parse through `PollInterval` too. A `PUT` of 0 is still stored while `POST` clamps to 5 (out
   of this RFC's scope; an open question).
-- `rosette-auditor` hasn't returned a verdict on any step yet; it is running on the wiring's diff
-  (`918638e..71178dd`).
+- `rosette-auditor` ran on the wiring (`918638e..71178dd`): one VIOLATED (the poll parsed the
+  system id twice, after the fetch) and six AT-RISK (the `load_one` bytes, `LiveMetrics`'s public
+  fields, the fill rule written in both adapters, the registry fill's discarded errors, no test
+  of a poll whose store fails, and a frame's strings copied rather than moved). All seven were
+  fixed in `c70c7a1`. The closest call was the `load_one` bytes. It hasn't run on the steps
+  before the wiring; the last row runs it on the whole diff.
 
 ## Rollout / migration notes
 
