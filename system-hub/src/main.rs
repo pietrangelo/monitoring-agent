@@ -30,6 +30,7 @@ mod routes;
 mod snapshot;
 mod snapshot_intake;
 mod state;
+mod token_bucket;
 
 use axum::Router;
 use std::ffi::OsString;

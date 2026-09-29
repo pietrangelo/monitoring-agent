@@ -20,9 +20,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
+use std::num::NonZeroU8;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
+
+use crate::token_bucket::{Empty, Refill, TokenBucket};
 
 /// How long the hub keeps an `app:*` point without a `metric_retention` row of its own.
 pub const APPLICATION_RETENTION_SECS: u64 = 86_400;
@@ -354,15 +357,18 @@ impl RecentRounds {
 pub const MIN_ROUND_SPACING: Duration = Duration::from_secs(8);
 
 /// The most tokens a source's pace holds: one round, plus one early round after a reconnect.
-const PACE_BURST: u8 = 2;
+const PACE_BURST: NonZeroU8 = match NonZeroU8::new(2) {
+    Some(burst) => burst,
+    None => panic!("PACE_BURST is not zero"),
+};
+
+/// How a source's pace fills.
+const PACE: Refill = Refill::new(PACE_BURST, MIN_ROUND_SPACING);
 
 /// A token bucket for one source of rounds (one push connection, or the poller for one
 /// system), on the monotonic clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourcePace {
-    tokens: u8,
-    last_refill: Instant,
-}
+pub struct SourcePace(TokenBucket);
 
 /// A source sent a round before its pace allowed one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,43 +377,12 @@ pub struct TooSoon;
 impl SourcePace {
     /// A new source's pace: a full bucket.
     pub fn new(now: Instant) -> Self {
-        Self {
-            tokens: PACE_BURST,
-            last_refill: now,
-        }
+        Self(TokenBucket::full(PACE, now))
     }
 
     /// Refills for the time elapsed, then spends one token.
     pub fn take(self, now: Instant) -> Result<Self, TooSoon> {
-        let refilled = self.refill(now);
-        let tokens = refilled.tokens.checked_sub(1).ok_or(TooSoon)?;
-        Ok(Self { tokens, ..refilled })
-    }
-
-    /// Adds one token per whole `MIN_ROUND_SPACING` elapsed, keeping the remainder. A full
-    /// bucket banks nothing: its clock restarts at `now`.
-    fn refill(self, now: Instant) -> Self {
-        if self.tokens >= PACE_BURST {
-            return Self {
-                tokens: PACE_BURST,
-                last_refill: now.max(self.last_refill),
-            };
-        }
-        let elapsed = now.saturating_duration_since(self.last_refill);
-        let periods = elapsed.as_nanos() / MIN_ROUND_SPACING.as_nanos();
-        let missing = u128::from(PACE_BURST - self.tokens);
-        if periods >= missing {
-            return Self {
-                tokens: PACE_BURST,
-                last_refill: now,
-            };
-        }
-        // `periods < missing <= PACE_BURST`, so both conversions are exact.
-        let periods = periods as u32;
-        Self {
-            tokens: self.tokens + periods as u8,
-            last_refill: self.last_refill + MIN_ROUND_SPACING * periods,
-        }
+        self.0.take(now).map(Self).map_err(|Empty| TooSoon)
     }
 }
 
