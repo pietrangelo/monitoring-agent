@@ -53,7 +53,8 @@ impl UptimeDisplay {
     }
 }
 
-/// What a system's `last_seen` column shows. Two meanings today, until RFC 0010's contact time.
+/// What a stored snapshot writes as a system's last seen. The offline markings write the
+/// column too (a failed poll its time, a push disconnect a blank), until RFC 0010's contact time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LastSeen {
     /// Push: the frame's `uptime_display`, when it follows the display rule.

@@ -20,10 +20,10 @@ use crate::registry::{
 use serde::Deserialize;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::time::{Duration, interval};
 
-use crate::clock::unix_now;
+use crate::clock::{now_iso, unix_now};
 use crate::db::SnapshotStored;
 use crate::models::{AlertRecord, SystemId, SystemInfo, SystemStatus};
 use crate::snapshot::{LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime};
@@ -88,14 +88,6 @@ struct AgentDisk {
 
 // ── Collector ──────────────────────────────────────────
 
-fn now_iso() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    unix_to_iso8601(secs)
-}
-
 pub fn start_collectors(state: Arc<AppState>) {
     tokio::spawn(poll_every(state, Duration::from_secs(30)));
 }
@@ -144,7 +136,12 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
     };
     let agent = match fetch_system(&client, system).await {
         Ok(agent) => agent,
-        Err(failure) => return mark_offline(&state, system, now, failure.last_error()).await,
+        Err(failure) => {
+            // Dropped before the marking's await: a client holds its CA store, and a woken
+            // poll can queue behind the rest of the tick's polls.
+            drop(client);
+            return mark_offline(&state, system, now, failure.last_error()).await;
+        }
     };
     if store_answer(&state, system, &id, PolledAnswer::from(agent), now)
         .await
@@ -441,50 +438,13 @@ fn alert_record(
     }
 }
 
-fn unix_to_iso8601(secs: u64) -> String {
-    let days_since_epoch = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let mins = (time_of_day % 3600) / 60;
-    let s = time_of_day % 60;
-
-    let mut y = 1970i64;
-    let mut d = days_since_epoch as i64;
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if d < days_in_year {
-            break;
-        }
-        d -= days_in_year;
-        y += 1;
-    }
-    let month_days = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 1;
-    for &md in &month_days {
-        if d < md as i64 {
-            break;
-        }
-        d -= md as i64;
-        m += 1;
-    }
-    let day = d + 1;
-    format!("{y:04}-{m:02}-{day:02}T{hours:02}:{mins:02}:{s:02}Z")
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
     use crate::snapshot::Scalar;
     use axum::{Json, Router, routing::get};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -1131,6 +1091,46 @@ mod tests {
         assert!(updated.last_error.is_some());
     }
 
+    /// Characterisation (`rosette-auditor` on RFC 0007): every offline marking of a poll writes
+    /// the poll's own time as `last_seen`, so a polled system's last seen moves on while it is
+    /// down. RFC 0010's contact time is where that changes.
+    #[tokio::test]
+    async fn a_failed_poll_writes_its_own_time_as_last_seen() {
+        let (state, _dir) = temp_state();
+        let failing = Router::new().route(
+            "/api/system",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let refused = "http://127.0.0.1:1".to_string();
+        let cases = [
+            (
+                "an HTTP error",
+                "http-error",
+                spawn_mock_agent(failing).await,
+            ),
+            ("a connection error", "refused", refused.clone()),
+            ("an id that breaks the rule", "..", refused),
+        ];
+        for (name, id, url) in cases {
+            let system = SystemInfo {
+                last_seen: "before the poll".into(),
+                ..sample_system(id, url)
+            };
+            state.db.insert_system(&system).unwrap();
+
+            let before = now_iso();
+            poll_system(state.clone(), &system).await;
+            let after = now_iso();
+
+            let seen = state.db.get_system(id).unwrap().unwrap().last_seen;
+            let polled = before.as_str()..=after.as_str();
+            assert!(
+                polled.contains(&seen.as_str()),
+                "{name}: last seen {seen:?}"
+            );
+        }
+    }
+
     /// RFC 0007 §1: the poll's edge maps what the agent reported, and nothing it didn't:
     /// a value missing from the answer stays `None`, never `0.0`, and so does a mount point.
     #[test]
@@ -1191,24 +1191,6 @@ mod tests {
         let resp: AgentResponse =
             serde_json::from_str(r#"{"cpu":{"usage_percent":42.0}}"#).unwrap();
         assert_eq!(resp.cpu.unwrap().usage_percent, Some(42.0));
-    }
-
-    #[test]
-    fn unix_to_iso8601_epoch_zero() {
-        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn unix_to_iso8601_leap_day_boundary() {
-        assert_eq!(unix_to_iso8601(1_709_251_200), "2024-03-01T00:00:00Z");
-    }
-
-    #[test]
-    fn is_leap_rules() {
-        assert!(is_leap(2000));
-        assert!(!is_leap(1900));
-        assert!(is_leap(2024));
-        assert!(!is_leap(2023));
     }
 
     mod applications {
