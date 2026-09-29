@@ -190,6 +190,13 @@ impl PollInterval {
     }
 }
 
+/// Whether a system's info is still to be filled from what its agent reports: while its
+/// hostname or its OS is missing. Filled once, unlike the memory capacity, which follows the
+/// agent.
+pub fn needs_system_info(system: &SystemInfo) -> bool {
+    system.hostname.is_none() || system.os.is_none()
+}
+
 /// The systems the poller polls: the enabled ones, in the registry's order.
 pub fn enabled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
     systems.iter().filter(|system| system.enabled)
@@ -255,6 +262,22 @@ mod tests {
         for (case, systems, expected) in cases {
             let polled: Vec<&str> = enabled_systems(&systems).map(|s| s.id.as_str()).collect();
             assert_eq!(polled, expected, "case: {case}");
+        }
+    }
+
+    #[test]
+    fn system_info_is_filled_while_the_hostname_or_the_os_is_missing() {
+        let cases = [
+            ("neither", None, None, true),
+            ("no os", Some("web-01"), None, true),
+            ("no hostname", None, Some("Ubuntu"), true),
+            ("both", Some("web-01"), Some("Ubuntu"), false),
+        ];
+        for (case, hostname, os, expected) in cases {
+            let mut known = system("a", true);
+            known.hostname = hostname.map(str::to_owned);
+            known.os = os.map(str::to_owned);
+            assert_eq!(needs_system_info(&known), expected, "case: {case}");
         }
     }
 

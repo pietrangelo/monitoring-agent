@@ -14,7 +14,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::registry::{LastSeen, MemoryCapacity, enabled_systems, memory_capacity_refresh};
+use crate::registry::{
+    LastSeen, MemoryCapacity, enabled_systems, memory_capacity_refresh, needs_system_info,
+};
 use serde::Deserialize;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -131,22 +133,27 @@ async fn read_registry(state: &Arc<AppState>, last_read: Vec<SystemInfo>) -> Vec
 }
 
 async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
+    let now = now_iso();
+    // Parsed once, first. Only a row stored before RFC 0005 can fail; no agent can push to it
+    // again, so without this marking it would keep its last status for good.
+    let Ok(id) = SystemId::try_from(system.id.clone()) else {
+        return mark_offline(&state, system, now, "invalid system id".to_string()).await;
+    };
     let Some(client) = poll_client(system) else {
         return;
     };
-    let now = now_iso();
     let agent = match fetch_system(&client, system).await {
         Ok(agent) => agent,
         Err(failure) => return mark_offline(&state, system, now, failure.last_error()).await,
     };
-    if store_answer(&state, system, PolledAnswer::from(agent), now)
+    if store_answer(&state, system, &id, PolledAnswer::from(agent), now)
         .await
         .is_break()
     {
         return;
     }
     store_agent_alerts(&state, system, &client).await;
-    poll_applications(&state, system, &client).await;
+    poll_applications(&state, system, &id, &client).await;
 }
 
 /// The largest `/api/system` answer the hub reads: eight times the push message limit, so
@@ -306,20 +313,15 @@ fn reported_snapshot(agent: AgentResponse) -> ReportedSnapshot {
 async fn store_answer(
     state: &Arc<AppState>,
     system: &SystemInfo,
+    id: &SystemId,
     answer: PolledAnswer,
     polled_at: String,
 ) -> ControlFlow<()> {
-    // Parsed once, as the applications poll does; only a push row stored before RFC 0005 can
-    // fail, and its `push://` poll fails before it gets here.
-    let Ok(id) = SystemId::try_from(system.id.clone()) else {
-        tracing::debug!("Not storing a poll of an invalid system id");
-        return ControlFlow::Break(());
-    };
     let Ok(time) = SnapshotTime::try_from(unix_now()) else {
         tracing::warn!("Poll of {:?}: the hub's clock is past i64::MAX", system.id);
         return ControlFlow::Break(());
     };
-    let (app, sys) = (Arc::clone(state), system.clone());
+    let (app, sys, id) = (Arc::clone(state), system.clone(), id.clone());
     let unit = move || store_polled(&app, &sys, &id, answer, time, polled_at);
     match tokio::task::spawn_blocking(unit).await {
         Ok(Ok(SnapshotStored::Stored(_))) => ControlFlow::Continue(()),
@@ -355,7 +357,7 @@ fn store_polled(
     let now = Instant::now();
     let stored = snapshot_intake::store_snapshot(app, id, answer.reported, time, last_seen, now)?;
     if let SnapshotStored::Stored(_) = stored {
-        if system.hostname.is_none() || system.os.is_none() {
+        if needs_system_info(system) {
             record_system_info(app, system, &answer.info);
         }
         refresh_memory_capacity(app, system, answer.memory);
@@ -574,7 +576,7 @@ mod tests {
         assert_eq!(disk_points.len(), 1);
 
         let live = state.live_metrics.read().unwrap();
-        let cpu = live.get("id-1").unwrap().snapshot.scalar(Scalar::Cpu);
+        let cpu = live.get("id-1").unwrap().snapshot().scalar(Scalar::Cpu);
         assert_eq!(cpu, Some(12.5));
     }
 
@@ -647,10 +649,66 @@ mod tests {
             .get("id-1")
             .cloned()
             .unwrap();
-        assert_eq!(live.snapshot.scalar(Scalar::Cpu), None, "live cpu left out");
-        assert_eq!(live.snapshot.disks().count(), 1024, "live disks");
+        assert_eq!(
+            live.snapshot().scalar(Scalar::Cpu),
+            None,
+            "live cpu left out"
+        );
+        assert_eq!(live.snapshot().disks().count(), 1024, "live disks");
         let sys = state.db.get_system("id-1").unwrap().unwrap();
         assert_eq!(sys.status, SystemStatus::Online);
+    }
+
+    /// RFC 0007 §1: the poll parses the system's id once, before anything else. An id that
+    /// breaks the rule (a row stored before RFC 0005) is marked offline, naming why, and is
+    /// never fetched.
+    #[tokio::test]
+    async fn a_system_whose_id_breaks_the_rule_is_marked_offline_without_a_fetch() {
+        let (state, _dir) = temp_state();
+        let (url, polls) = counted_agent().await;
+        let system = sample_system("..", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(polls_seen(&polls), 0, "never fetched");
+        let sys = state.db.get_system("..").unwrap().unwrap();
+        let status = (sys.status, sys.last_error.as_deref());
+        assert_eq!(status, (SystemStatus::Offline, Some("invalid system id")));
+    }
+
+    /// RFC 0007 §4: a snapshot that fails to store (here, a trigger aborts every metric
+    /// insert) leaves no point and no online status, and the poll goes on to the alerts.
+    #[tokio::test]
+    async fn a_failed_snapshot_store_writes_nothing_and_the_poll_goes_on() {
+        let (state, dir) = temp_state();
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(|| async { Json(serde_json::json!({"cpu": {"usage_percent": 12.5}})) }),
+            )
+            .route(
+                "/api/alerts",
+                get(|| async { Json(serde_json::json!({"active": [agent_alert("inc-1", 95.0)]})) }),
+            );
+        let system = sample_system("id-1", spawn_mock_agent(app).await);
+        state.db.insert_system(&system).unwrap();
+        rusqlite::Connection::open(dir.path().join("test.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON metrics
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 0, "nothing stored");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Unknown, "not marked online");
+        assert!(!state.live_metrics.read().unwrap().contains_key("id-1"));
+        let alerts = state.db.get_alerts(Some("id-1"), None, 10).unwrap();
+        assert_eq!(alerts.len(), 1, "the alerts are still polled");
     }
 
     /// RFC 0007 §4: a poll racing a delete writes nothing, not even live metrics.

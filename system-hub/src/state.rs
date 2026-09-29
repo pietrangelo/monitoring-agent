@@ -20,17 +20,7 @@ use std::time::Instant;
 
 use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
 use crate::db::Database;
-use crate::snapshot::{Snapshot, SnapshotTime};
-
-/// A system's latest snapshot, as the snapshot rule kept it, held for the dashboard (RFC 0007
-/// §4). Shared as an `Arc`, so a reader copies a pointer, never a disk.
-#[derive(Debug)]
-pub struct LiveMetrics {
-    pub snapshot: Snapshot,
-    pub time: SnapshotTime,
-    /// When this system's left-out values were last logged at `warn` (RFC 0007 §1).
-    pub left_out_warned_at: Option<Instant>,
-}
+use crate::snapshot::LiveMetrics;
 
 /// What the hub holds in memory of one system's applications (RFC 0009 §8).
 #[derive(Debug, Default)]

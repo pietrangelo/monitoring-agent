@@ -24,8 +24,9 @@ use tokio::time::interval;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 
+use crate::snapshot::LiveMetrics;
 use crate::snapshot::Scalar;
-use crate::state::{AppState, LiveMetrics};
+use crate::state::AppState;
 
 /// A system's live metrics as the summary event shows them: a value the snapshot rule left out
 /// is `null`, as a non-finite one always serialised.
@@ -33,19 +34,26 @@ use crate::state::{AppState, LiveMetrics};
 struct LiveMetricsDto<'a> {
     cpu_percent: Option<f32>,
     memory_percent: Option<f32>,
-    load_one: Option<f32>,
+    load_one: Option<f64>,
     disks: Vec<(&'a str, f32)>,
     updated_at: i64,
+}
+
+/// A kept load as the `f64` its shortest decimal names. The agent sends loads as `f64`, and the
+/// summary showed them as sent (0.52); the `f32` the snapshot keeps would widen to
+/// 0.5199999809265137. The percentages were `f32` on the wire already, and keep their bytes.
+fn shortest_decimal(value: f32) -> f64 {
+    value.to_string().parse().unwrap_or(f64::from(value))
 }
 
 impl<'a> From<&'a LiveMetrics> for LiveMetricsDto<'a> {
     fn from(live: &'a LiveMetrics) -> Self {
         Self {
-            cpu_percent: live.snapshot.scalar(Scalar::Cpu),
-            memory_percent: live.snapshot.scalar(Scalar::Memory),
-            load_one: live.snapshot.scalar(Scalar::Load1),
-            disks: live.snapshot.disks().collect(),
-            updated_at: live.time.seconds(),
+            cpu_percent: live.snapshot().scalar(Scalar::Cpu),
+            memory_percent: live.snapshot().scalar(Scalar::Memory),
+            load_one: live.snapshot().scalar(Scalar::Load1).map(shortest_decimal),
+            disks: live.snapshot().disks().collect(),
+            updated_at: live.time().seconds(),
         }
     }
 }
@@ -196,7 +204,7 @@ mod tests {
 
         let expected_json = concat!(
             r#"{"active_alerts":0,"live_metrics":{"sys-1":{"cpu_percent":11.5,"#,
-            r#""disks":[["/",50.25],["/home",70.0]],"load_one":0.5,"memory_percent":22.0,"#,
+            r#""disks":[["/",50.25],["/home",70.0]],"load_one":0.52,"memory_percent":22.0,"#,
             r#""updated_at":1700000000}},"offline_count":0,"online_count":1,"#,
             r#""systems":[{"cpu_cores":4,"cpu_model":null,"enabled":true,"hostname":"web-01","#,
             r#""id":"sys-1","kernel":null,"last_error":null,"last_seen":"1m","name":"web-01","#,
@@ -221,18 +229,18 @@ mod tests {
             cpu,
             memory: Some(22.0),
             swap: Some(33.0),
-            load1: Some(0.5),
+            // A load as an agent reads it from /proc/loadavg: two decimals, not exact in f32.
+            load1: Some(0.52),
             load5: Some(0.25),
             disks: vec![disk("/", 50.25), disk("/home", 70.0)],
         }
     }
 
     fn plant(state: &AppState, reported: ReportedSnapshot) {
-        let live = LiveMetrics {
-            snapshot: snapshot_rule(reported).0,
-            time: SnapshotTime::try_from(1_700_000_000).unwrap(),
-            left_out_warned_at: None,
-        };
+        let (snapshot, left_out) = snapshot_rule(reported);
+        let time = SnapshotTime::try_from(1_700_000_000).unwrap();
+        let now = std::time::Instant::now();
+        let (live, _) = LiveMetrics::following(None, snapshot, time, &left_out, now);
         let mut entries = state.live_metrics.write().unwrap();
         entries.insert("sys-1".into(), Arc::new(live));
     }
@@ -256,11 +264,26 @@ mod tests {
             serde_json::json!({
                 "cpu_percent": null,
                 "memory_percent": 22.0,
-                "load_one": 0.5,
+                "load_one": 0.52,
                 "disks": [["/", 50.25], ["/home", 70.0]],
                 "updated_at": 1_700_000_000,
             })
         );
+    }
+
+    #[test]
+    fn a_live_load_shows_as_the_decimal_the_agent_sent() {
+        let cases = [
+            ("two decimals", 0.52_f32, 0.52_f64),
+            ("another", 1.07, 1.07),
+            ("exact in f32", 0.5, 0.5),
+            ("zero", 0.0, 0.0),
+            ("a busy host", 123.45, 123.45),
+            ("the largest f32", f32::MAX, 3.402_823_5e38),
+        ];
+        for (case, kept, shown) in cases {
+            assert_eq!(shortest_decimal(kept), shown, "case: {case}");
+        }
     }
 
     #[tokio::test]

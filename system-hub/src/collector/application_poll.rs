@@ -35,22 +35,17 @@ use crate::state::AppState;
 pub async fn poll_applications(
     state: &Arc<AppState>,
     system: &SystemInfo,
+    id: &SystemId,
     client: &reqwest::Client,
 ) {
-    // Parsed once, so every live entry this poll touches is keyed by a valid id. A stored id
-    // that breaks today's rule can't be pushed to either, and keeps no rounds.
-    let Ok(id) = SystemId::try_from(system.id.clone()) else {
-        tracing::debug!("Not polling applications of an invalid system id");
-        return;
-    };
     match fetch_applications(client, system).await {
         ApplicationsAnswer::Absent | ApplicationsAnswer::Polled(PolledRound::NoRound) => {
-            forget_shown_round(state, &id)
+            forget_shown_round(state, id)
         }
         ApplicationsAnswer::Polled(PolledRound::Round(round)) => {
-            store_polled_round(state, id, round).await
+            store_polled_round(state, id.clone(), round).await
         }
-        ApplicationsAnswer::Unusable(Unusable::Refused(err)) => log_refused_round(state, &id, err),
+        ApplicationsAnswer::Unusable(Unusable::Refused(err)) => log_refused_round(state, id, err),
         ApplicationsAnswer::Unusable(Unusable::Status(code)) => {
             tracing::debug!(
                 "Applications poll of {:?} answered HTTP {code}",

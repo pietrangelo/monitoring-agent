@@ -22,7 +22,9 @@ use std::time::Instant;
 
 use crate::db::SnapshotStored;
 use crate::models::{SystemId, SystemInfo, SystemStatus};
-use crate::registry::{LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh};
+use crate::registry::{
+    LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh, needs_system_info,
+};
 use crate::snapshot::{
     LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime, SnapshotTimeOutOfRange,
 };
@@ -110,25 +112,49 @@ impl TryFrom<PushPayload> for SnapshotFrame {
     type Error = SnapshotRefusal;
 
     /// Every scalar of a push frame is reported; the uptime display becomes the last seen only
-    /// under the display rule, else the stored one is kept.
+    /// under the display rule, else the stored one is kept. Moves what it keeps: a frame's
+    /// mount points can add up to its 512 KiB.
     fn try_from(payload: PushPayload) -> Result<Self, Self::Error> {
-        let time = SnapshotTime::try_from(payload.timestamp)
+        let PushPayload {
+            hostname,
+            os_name,
+            kernel,
+            cpu_percent,
+            cpu_cores,
+            cpu_model,
+            memory_percent,
+            memory_total_display,
+            memory_total_bytes,
+            swap_percent,
+            load_one,
+            load_five,
+            uptime_display,
+            disks,
+            timestamp,
+            ..
+        } = payload;
+        let time = SnapshotTime::try_from(timestamp)
             .map_err(|SnapshotTimeOutOfRange| SnapshotRefusal::TimestampOutOfRange)?;
-        let last_seen = UptimeDisplay::try_from(payload.uptime_display.clone())
-            .map_or(LastSeen::Unchanged, LastSeen::Uptime);
-        let memory = MemoryCapacity::reported(
-            Some(&payload.memory_total_display),
-            Some(payload.memory_total_bytes),
-        );
-        let reported = reported_snapshot(&payload);
+        let reported = ReportedSnapshot {
+            cpu: Some(cpu_percent),
+            memory: Some(memory_percent),
+            swap: Some(swap_percent),
+            load1: Some(load_one),
+            load5: Some(load_five),
+            disks: disks.into_iter().map(ReportedDisk::from).collect(),
+        };
+        let memory =
+            MemoryCapacity::reported(Some(&memory_total_display), Some(memory_total_bytes));
         let info = PushedInfo {
-            hostname: payload.hostname,
-            os_name: payload.os_name,
-            kernel: payload.kernel,
-            cpu_model: payload.cpu_model,
-            cpu_cores: payload.cpu_cores,
+            hostname,
+            os_name,
+            kernel,
+            cpu_model,
+            cpu_cores,
             memory,
         };
+        let last_seen =
+            UptimeDisplay::try_from(uptime_display).map_or(LastSeen::Unchanged, LastSeen::Uptime);
         Ok(Self {
             reported,
             time,
@@ -138,23 +164,12 @@ impl TryFrom<PushPayload> for SnapshotFrame {
     }
 }
 
-/// The snapshot a push frame reports, before the snapshot rule.
-fn reported_snapshot(payload: &PushPayload) -> ReportedSnapshot {
-    let disks = payload
-        .disks
-        .iter()
-        .map(|disk| ReportedDisk {
-            mount_point: Some(disk.mount_point.clone()),
+impl From<DiskItem> for ReportedDisk {
+    fn from(disk: DiskItem) -> Self {
+        Self {
+            mount_point: Some(disk.mount_point),
             usage_percent: Some(disk.usage_percent),
-        })
-        .collect();
-    ReportedSnapshot {
-        cpu: Some(payload.cpu_percent),
-        memory: Some(payload.memory_percent),
-        swap: Some(payload.swap_percent),
-        load1: Some(payload.load_one),
-        load5: Some(payload.load_five),
-        disks,
+        }
     }
 }
 
@@ -211,10 +226,16 @@ pub(super) fn ingest_frame(
 /// and replaces a default name with the frame's hostname. The status went into the store.
 fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
     let id = system_id.as_str();
-    let Some(sys) = app.db.get_system(id).ok().flatten() else {
-        return;
+    let sys = match app.db.get_system(id) {
+        Ok(Some(sys)) => sys,
+        Ok(None) => return,
+        Err(err) => {
+            // A row no read can map (RFC 0007 §4): its snapshot is stored, its fill skipped.
+            tracing::debug!("Push from {id:?}: skipping the registry fill: {err}");
+            return;
+        }
     };
-    if (sys.hostname.is_none() || sys.os.is_none())
+    if needs_system_info(&sys)
         && let Err(err) = app.db.update_system_info(
             id,
             Some(&info.os_name),
@@ -232,10 +253,12 @@ fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
     {
         tracing::warn!("Push from {id:?}: couldn't refresh the memory capacity: {err}");
     }
-    if system_id.is_default_name(&sys.name) {
-        let _ = app
-            .db
-            .update_system_config(id, Some(&info.hostname), None, None, None, None);
+    if system_id.is_default_name(&sys.name)
+        && let Err(err) =
+            app.db
+                .update_system_config(id, Some(&info.hostname), None, None, None, None)
+    {
+        tracing::warn!("Push from {id:?}: couldn't rename the system to its hostname: {err}");
     }
 }
 

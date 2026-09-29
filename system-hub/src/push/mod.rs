@@ -1747,14 +1747,14 @@ mod tests {
             Scalar::Load1,
             Scalar::Load5,
         ]
-        .map(|scalar| live.snapshot.scalar(scalar));
+        .map(|scalar| live.snapshot().scalar(scalar));
         assert_eq!(
             scalars,
             [Some(11.0), Some(22.0), Some(33.0), Some(0.1), Some(0.2)]
         );
-        let disks: Vec<(&str, f32)> = live.snapshot.disks().collect();
+        let disks: Vec<(&str, f32)> = live.snapshot().disks().collect();
         assert_eq!(disks, [("/", 50.0), ("/home", 70.0)]);
-        assert_eq!(live.time.seconds(), 1_700_000_000);
+        assert_eq!(live.time().seconds(), 1_700_000_000);
 
         push_frames_then_disconnect(&state, ws, system_id, &[]).await;
         let sys = state.db.get_system(system_id).unwrap().unwrap();
@@ -1815,8 +1815,12 @@ mod tests {
         }
         let live = state.live_metrics.read().unwrap().get("sys-rule").cloned();
         let live = live.expect("live metrics written");
-        assert_eq!(live.snapshot.scalar(Scalar::Cpu), None, "live cpu left out");
-        assert_eq!(live.snapshot.disks().count(), 1024, "live disks");
+        assert_eq!(
+            live.snapshot().scalar(Scalar::Cpu),
+            None,
+            "live cpu left out"
+        );
+        assert_eq!(live.snapshot().disks().count(), 1024, "live disks");
     }
 
     /// RFC 0007 §1: a timestamp SQLite can't hold refuses the frame whole; the connection

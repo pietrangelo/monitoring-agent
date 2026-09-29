@@ -26,9 +26,9 @@ use crate::db::SnapshotStored;
 use crate::models::SystemId;
 use crate::registry::{LastSeen, StatusUpdate};
 use crate::snapshot::{
-    LeftOut, LeftOutLog, ReportedSnapshot, Snapshot, SnapshotTime, left_out_log, snapshot_rule,
+    LeftOut, LeftOutLog, LiveMetrics, ReportedSnapshot, Snapshot, SnapshotTime, snapshot_rule,
 };
-use crate::state::{AppState, LiveMetrics};
+use crate::state::AppState;
 
 /// Stores what an agent reported through the snapshot rule, marks the system online, seen as
 /// `last_seen` says, and moves the kept snapshot into the system's live metrics. Logs what the
@@ -74,16 +74,12 @@ fn keep_live_metrics(
         .live_metrics
         .write()
         .unwrap_or_else(PoisonError::into_inner);
-    let previous = live
-        .get(system_id.as_str())
-        .and_then(|entry| entry.left_out_warned_at);
-    let (log, left_out_warned_at) = left_out_log(previous, left_out, now);
-    let entry = Arc::new(LiveMetrics {
-        snapshot,
-        time,
-        left_out_warned_at,
-    });
-    (log, live.insert(system_id.as_str().to_owned(), entry))
+    let previous = live.get(system_id.as_str()).map(Arc::as_ref);
+    let (entry, log) = LiveMetrics::following(previous, snapshot, time, left_out, now);
+    (
+        log,
+        live.insert(system_id.as_str().to_owned(), Arc::new(entry)),
+    )
 }
 
 /// Logs what the snapshot rule left out, by reason, with the id in `Debug` form and never a
@@ -203,9 +199,9 @@ mod tests {
         let status = (system.status, system.last_seen.as_str(), system.last_error);
         assert_eq!(status, (SystemStatus::Online, "3d 4h 5m", None));
         let entry = live(&app, "sys-1").expect("live metrics written");
-        assert_eq!(entry.snapshot, snapshot_rule(reported(f32::NAN)).0);
-        assert_eq!(entry.snapshot.scalar(Scalar::Cpu), None);
-        assert_eq!(entry.time, at(1_000));
+        assert_eq!(entry.snapshot(), &snapshot_rule(reported(f32::NAN)).0);
+        assert_eq!(entry.snapshot().scalar(Scalar::Cpu), None);
+        assert_eq!(entry.time(), at(1_000));
     }
 
     /// RFC 0007 §4: every entry takes its warning time from `left_out_log`, so a host leaving
@@ -240,7 +236,7 @@ mod tests {
                 SnapshotStored::Stored(expected_log),
                 "step: {step}"
             );
-            let warned_at = live(&app, "sys-1").unwrap().left_out_warned_at;
+            let warned_at = live(&app, "sys-1").unwrap().left_out_warned_at();
             assert_eq!(
                 warned_at,
                 Some(start),
@@ -295,6 +291,6 @@ mod tests {
             "the first entry comes back"
         );
         let after = live(&app, "sys-1").unwrap();
-        assert_eq!((&after.snapshot, after.time), (&second, at(2)));
+        assert_eq!((after.snapshot(), after.time()), (&second, at(2)));
     }
 }

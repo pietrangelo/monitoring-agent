@@ -260,6 +260,52 @@ pub fn left_out_log(
     }
 }
 
+/// A system's latest snapshot, as the snapshot rule kept it, held for the dashboard (RFC 0007
+/// §4), with when its left-out values were last logged at `warn`. Built only by `following`,
+/// so no entry starts its warning time from a default.
+#[derive(Debug)]
+pub struct LiveMetrics {
+    snapshot: Snapshot,
+    time: SnapshotTime,
+    left_out_warned_at: Option<Instant>,
+}
+
+impl LiveMetrics {
+    /// The entry that follows `previous` with a newly stored snapshot, and how the snapshot's
+    /// left-out values are logged. The warning time comes from `left_out_log` alone, so a host
+    /// leaving something out of every snapshot warns once an hour, not every snapshot.
+    pub fn following(
+        previous: Option<&LiveMetrics>,
+        snapshot: Snapshot,
+        time: SnapshotTime,
+        left_out: &LeftOut,
+        now: Instant,
+    ) -> (Self, LeftOutLog) {
+        let warned_at = previous.and_then(|entry| entry.left_out_warned_at);
+        let (log, left_out_warned_at) = left_out_log(warned_at, left_out, now);
+        let entry = Self {
+            snapshot,
+            time,
+            left_out_warned_at,
+        };
+        (entry, log)
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    pub fn time(&self) -> SnapshotTime {
+        self.time
+    }
+
+    /// When this system's left-out values were last logged at `warn`.
+    #[cfg(test)]
+    pub fn left_out_warned_at(&self) -> Option<Instant> {
+        self.left_out_warned_at
+    }
+}
+
 /// The retention of a metric with no valid `metric_retention` row: a day, in seconds.
 const DEFAULT_RETENTION_SECS: u64 = 86_400;
 
@@ -962,6 +1008,78 @@ mod tests {
             (LeftOutLog::Debug, Some(at(100))),
             "case: {case}"
         );
+    }
+
+    /// RFC 0007 §1, §4: an entry takes its warning time from the entry it follows, through
+    /// `left_out_log`, never from a default.
+    #[test]
+    fn a_live_metrics_entry_carries_the_warning_time_over_from_the_one_it_follows() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(10);
+        let entry = |warned_at: Option<Instant>| LiveMetrics {
+            snapshot: Snapshot::default(),
+            time: SnapshotTime(1),
+            left_out_warned_at: warned_at,
+        };
+        let one_left_out = LeftOut {
+            not_finite: 1,
+            ..LeftOut::default()
+        };
+        let an_hour_before_now = now - Duration::from_secs(3_600);
+        let cases = [
+            (
+                "first entry, nothing left out",
+                None,
+                LeftOut::default(),
+                (LeftOutLog::Nothing, None),
+            ),
+            (
+                "first entry, left out",
+                None,
+                one_left_out,
+                (LeftOutLog::Warn, Some(now)),
+            ),
+            (
+                "never warned, left out",
+                Some(entry(None)),
+                one_left_out,
+                (LeftOutLog::Warn, Some(now)),
+            ),
+            (
+                "warned 10 s ago, left out",
+                Some(entry(Some(start))),
+                one_left_out,
+                (LeftOutLog::Debug, Some(start)),
+            ),
+            (
+                "warned 10 s ago, nothing left out",
+                Some(entry(Some(start))),
+                LeftOut::default(),
+                (LeftOutLog::Nothing, Some(start)),
+            ),
+            (
+                "warned an hour ago, left out",
+                Some(entry(Some(an_hour_before_now))),
+                one_left_out,
+                (LeftOutLog::Warn, Some(now)),
+            ),
+        ];
+        for (case, previous, left_out, expected) in cases {
+            let kept = kept(&[(Scalar::Cpu, 1.0)], &[("/", 2.0)]);
+            let (next, log) = LiveMetrics::following(
+                previous.as_ref(),
+                kept.clone(),
+                SnapshotTime(7),
+                &left_out,
+                now,
+            );
+            assert_eq!((log, next.left_out_warned_at()), expected, "case: {case}");
+            assert_eq!(
+                (next.snapshot(), next.time()),
+                (&kept, SnapshotTime(7)),
+                "case: {case}"
+            );
+        }
     }
 
     #[test]
