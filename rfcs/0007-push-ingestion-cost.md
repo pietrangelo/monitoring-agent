@@ -1161,8 +1161,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
 ## Implementation progress
 
 On branch `feat/push-ingestion-cost`, continued on `claude/peaceful-einstein-acohge`, in the
-order Rollout sets. Each step went through `red-test-adversary` (EVIDENCE; for §2 as an
-in-process check at medium effort, with mutation runs) and the hub gate.
+order Rollout sets. Each step went through `red-test-adversary` (EVIDENCE; from §2 on as an
+in-process check at medium effort, with mutation runs: every cheat tried was killed) and the
+hub gate.
 
 | Step | State | Commit |
 |---|---|---|
@@ -1172,22 +1173,42 @@ in-process check at medium effort, with mutation runs) and the hub gate.
 | `hourly_warning` moved into a pure module | done | `9f0ff1d` |
 | §1 the snapshot rule (`snapshot.rs`) | done, not yet wired into the adapters | `0059304` |
 | §2 `store_snapshot`, capped prune, `LastSeen`/`UptimeDisplay`/`StatusUpdate`, `MemoryCapacity` bounds | done, `store_snapshot` not yet wired into the adapters | `3d7d610` |
-| §1/§2/§4 wiring both adapters: push and poll through the rule and `store_snapshot`, poll on the blocking pool, 4 MiB poll body, no systems cache, `insert_system_if_absent`, `registry unavailable` | next | |
-| §3 decode budget (`TokenBucket`, `DecodeBudget`) | to do | |
-| §4 `Arc<LiveMetrics>`, `end_connection`, eviction on delete | to do | |
+| §4 registration: `insert_system_if_absent`, `registry unavailable` for a returned error and for a `JoinError` | done | `5d43dcc` |
+| Characterisation of the SSE `summary` event's bytes | done | `e90812d` |
+| §1/§2 both adapters through the rule and `store_snapshot` (`snapshot_intake.rs`), with §4's `Arc<LiveMetrics>` value, its left-out warning time, `SystemGone` ending the push connection, and push store errors counted | done | `920e28a` |
+| §1 the 4 MiB poll body; the poll's offline marking on the blocking pool | done | `42b0241` |
+| §2 no systems cache: the poller reads the registry each tick (`enabled_systems`) | done | `71178dd` |
+| §3 decode budget (`TokenBucket`, `DecodeBudget`) | next | |
+| §4 `end_connection`, eviction on delete | to do | |
 | §5 SSE publisher (`watch`, `send_replace`) | to do | |
 | README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
 
 Open items to settle on the way:
-- `snapshot.rs`, `registry.rs` (`LastSeen`, `StatusUpdate`) and `db/history.rs`
-  (`store_snapshot`) have temporary `#[cfg_attr(not(test), allow(dead_code))]` attributes, to
-  be removed once the adapters use the items. `SnapshotTimeOutOfRange` gained one in §2: Rust
-  1.98's dead-code lint flags it until the push edge converts a frame's timestamp.
 - §2 added `SnapshotTime::cutoff` (the retention cutoff, never before 0), a pure rule the RFC's
   text leaves inside `store_snapshot`; it keeps the arithmetic out of the SQL adapter.
-- Still to test with the wiring (Testing plan, `store_snapshot`): the warning time carrying
-  over through the push path's own `on_stored`, and `on_stored` returning the replaced entry
-  (`Arc::ptr_eq`). Both need §4's `LiveMetrics`.
+- The wiring added names the design doesn't have:
+  - `snapshot_intake.rs` (Ingestion, beside `round_intake.rs`): the one step both paths share,
+    the rule, then `store_snapshot`, then the live metrics entry (`keep_live_metrics`, the
+    `on_stored` of both paths) and the left-out log. The warning time's carry-over and the
+    replaced entry (`Arc::ptr_eq`) are tested there;
+  - `SnapshotFrame` / `PushedInfo` (push) and `PolledAnswer` / `PolledInfo` (poll): each edge's
+    parsed frame, with the system info the registry fill reads;
+  - `Snapshot::scalar` and `Snapshot::disks`, read by the SSE summary's `LiveMetricsDto`. The DTO
+    lands in `routes/sse.rs` now, not with §5, since `LiveMetrics` stopped being the wire shape;
+  - `ConnectionRounds` became `ConnectionState`, with one `Tally` per count (refused application
+    frames, refused snapshot frames, store errors); `Occurrence` replaces `RefusedFrame`.
+    `ARCHITECTURE.md` still names the old two, until the docs row;
+  - `collector/capped_body.rs` (`read_capped`, `CappedBodyError`), now shared by both polls, and
+    `PollFailure`, the poll's offline causes. A transport error while reading the body now
+    shows as itself instead of `JSON parse error: …`, and a body that isn't JSON shows
+    serde's message.
+- A refused snapshot frame (its timestamp) is counted and logged as §3 describes, the first per
+  connection at `warn`: it landed with the refusal, before the budget.
+- `Database::plant_point`, test-only, replaces `insert_metric` wherever a test needs history in
+  place.
+- `push/mod.rs` has 529 lines before its tests, 415 of them code. §3 adds the budget there; if
+  it nears 500 lines of code, the connection's state (`ConnectionState`, `Tally`,
+  `DecodeBudget`) splits out along that seam.
 - Removing `ORDER BY timestamp` from the capped prune survives the tests: SQLite reads the
   subquery through `idx_metrics_system_time`, already in timestamp order. The `ORDER BY` stays,
   so oldest-first is a guarantee rather than a planner choice.
@@ -1196,7 +1217,8 @@ Open items to settle on the way:
 - `POST /api/systems` accepts a `poll_interval_secs` above `i64::MAX` and answers 500; it should
   parse through `PollInterval` too. A `PUT` of 0 is still stored while `POST` clamps to 5 (out
   of this RFC's scope; an open question).
-- `rosette-auditor` hasn't run on any step yet.
+- `rosette-auditor` hasn't returned a verdict on any step yet; it is running on the wiring's diff
+  (`918638e..71178dd`).
 
 ## Rollout / migration notes
 
