@@ -2,7 +2,7 @@
 
 - Status: Draft
 - Author: Claude (pairing with pietrangelomasalaMD)
-- Date: 2026-09-29 (revised the same day for two `rfc-adversary` passes; see Review)
+- Date: 2026-09-29 (revised the same day for two `rfc-adversary` passes; a third pass's findings are open; see Review)
 - Affects: `system-hub` (a push connection's end, a disconnection sweep, the poller), and
   `system-agent` (its push system id, its `Dockerfile`)
 - **Split from RFC 0008 §5 and §7 (owner's decision, recorded in RFC 0007's header):** this RFC
@@ -675,3 +675,23 @@ database mutex or a live lock; none needs the presence lock after them.
 Came closest among the rejected: the lease's premise that a panicking task drops its locals,
 checked against axum's `on_upgrade` (`tokio::spawn`) and tokio's harness (the future is dropped
 inside its panic guard).
+
+`rfc-adversary`, third pass, on the second revision (5fe04f6). **None of these is resolved yet,
+so the RFC stays `Draft`.** The red tests in 6842329 and 0fe18c2 were written against that
+revision and have to follow whatever these findings change:
+
+| Finding | Verdict | Cheapest fix proposed (open) |
+|---|---|---|
+| a new id registers `Online` with no snapshot (`push/ingest.rs:184`), so the startup reset only covers rows that exist at startup, and a new host whose frames never decode reads online for good | CONFIRMED | `register_if_new` registers `Unknown`; flip the handshake-table row, the assertion in `push_handshake_with_the_configured_token_is_accepted_and_registers_system` and ARCHITECTURE's "registered online at its handshake" |
+| the undecodable-after-restart test's barrier (the `info` line at the close) comes before `end_connection`'s offline write, so it passes without the reset; the in-crate harness captures no logs | CONFIRMED | after the undecodable frames, `wait_until_hub_caught_up` while the connection is open, then assert exactly `Unknown`; check the count separately |
+| RFC 0010 §10 still flushes `connection: Option<u64>` in `LiveStatus` and sweeps on "no current connection", not "no live current connection" | CONFIRMED | take `connection` out of the flushed `LiveStatus`, keep the in-memory `PushPresence` with its liveness, say "live current connection", and add the presence lock to 0010's lock order (or keep registration outside it) |
+| A01 overclaims: a handshake that presents a polled system's id becomes current, and its close writes `Offline` and evicts live metrics, so anyone with the push token (or anyone, when it is unset) keeps a polled system offline | CONFIRMED | the handshake unit reads the `url` with the existence check and never makes a connection current for a `Poll` source; otherwise restate A01 |
+| nothing tests that `main` runs the reset before serving, or starts the sweep | CONFIRMED | one binary test: plant an `online` `push://` row, start the hub, after "listening" `GET /api/systems/<id>` returns `unknown`; state that the sweep's start is untested at binary level (the 120 s grace can't be injected) |
+| RFC 0008 §5 still paraphrases the rejected currency rule | CONFIRMED | point to 0016 §2 instead of paraphrasing it |
+| the impact list misses ARCHITECTURE's "silently drops" (§ Data flow, § Domain model), `CLAUDE.md`'s same sentence (the owner's to change), and the README note on `unknown` after each restart | CONFIRMED (minor) | add these sections to Impact |
+| a dead entry, or an end whose offline write fails, lets a connection that only pings take currency and freeze a stale `online` | PLAUSIBLE | record in `Current` whether the connection has claimed; the sweep treats `Online` + a live current connection that never claimed as disconnected; units carry `(ConnectionNumber, Weak)`, and `end` takes the lease by value |
+| the first SSE summary is built before the reset, so pre-restart `online` shows for up to 5 s | PLAUSIBLE | run the reset before `AppState::new` |
+
+Came closest among the rejected: the honest reconnect that hasn't claimed yet. `end` holds the
+presence lock across its offline write, and the agent's first tick is immediate, so the result
+is a short offline blip.
