@@ -28,16 +28,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::application_wire;
-use crate::applications::{ScrapeRound, SourcePace};
+use crate::applications::ScrapeRound;
 use crate::clock::unix_now;
 use crate::db::{RoundStored, SnapshotStored};
 use crate::models::{SystemId, SystemIdError};
 use crate::round_intake::{self, Arrival};
 
 mod config;
+mod connection;
 mod ingest;
 use crate::state::AppState;
 pub use config::{PushAuth, PushAuthError, PushConfig};
+use connection::{ConnectionState, warn_first};
 use ingest::{PushPayload, SnapshotFrame, ingest_frame, mark_offline, register_if_new};
 
 /// The push handshake's first message. No `Debug`: `token` holds the presented secret.
@@ -331,75 +333,6 @@ async fn receive_until_end(
                 return;
             }
         }
-    }
-}
-
-/// What one push connection keeps between messages: its rounds' pace, and how many of its
-/// frames it refused or failed to store.
-struct ConnectionState {
-    pace: SourcePace,
-    refused_application_frames: Tally,
-    refused_snapshot_frames: Tally,
-    store_errors: Tally,
-}
-
-impl ConnectionState {
-    fn new(now: Instant) -> Self {
-        Self {
-            pace: SourcePace::new(now),
-            refused_application_frames: Tally::default(),
-            refused_snapshot_frames: Tally::default(),
-            store_errors: Tally::default(),
-        }
-    }
-
-    /// Logs each count the connection ended with at `info`, beside the per-frame lines.
-    fn log_counts(&self, system_id: &SystemId) {
-        let counts = [
-            (
-                self.refused_application_frames,
-                "application frame(s) refused",
-            ),
-            (self.refused_snapshot_frames, "snapshot frame(s) refused"),
-            (self.store_errors, "snapshot(s) that failed to store"),
-        ];
-        for (Tally(count), what) in counts.into_iter().filter(|(tally, _)| tally.0 > 0) {
-            tracing::info!(
-                "Push connection of {:?}: {count} {what}",
-                system_id.as_str()
-            );
-        }
-    }
-}
-
-/// How often one thing happened on a connection.
-#[derive(Debug, Clone, Copy, Default)]
-struct Tally(u64);
-
-impl Tally {
-    /// Counts one more, and says whether it is the connection's first.
-    fn note(&mut self) -> Occurrence {
-        self.0 += 1;
-        match self.0 {
-            1 => Occurrence::First,
-            _ => Occurrence::Repeat,
-        }
-    }
-}
-
-/// Whether something happened on a connection for the first time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Occurrence {
-    First,
-    Repeat,
-}
-
-/// Logs a connection's first occurrence of something at `warn`, and the rest at `debug`, so a
-/// sender can't flood the log.
-fn warn_first(occurrence: Occurrence, message: &str) {
-    match occurrence {
-        Occurrence::First => tracing::warn!("{message}"),
-        Occurrence::Repeat => tracing::debug!("{message}"),
     }
 }
 
@@ -2405,37 +2338,6 @@ mod tests {
                     .contains_key("sys-gone"),
                 "no entry is recreated for a gone system"
             );
-        }
-
-        #[test]
-        fn a_connections_first_occurrence_is_first_and_the_rest_repeat() {
-            use Occurrence::{First, Repeat};
-            type TallyOf = fn(&mut ConnectionState) -> &mut Tally;
-            let tallies: [(&str, TallyOf); 3] = [
-                ("refused application frames", |c| {
-                    &mut c.refused_application_frames
-                }),
-                ("refused snapshot frames", |c| {
-                    &mut c.refused_snapshot_frames
-                }),
-                ("store errors", |c| &mut c.store_errors),
-            ];
-            for (case, tally) in tallies {
-                let mut connection = ConnectionState::new(Instant::now());
-                let seen: Vec<_> = (0..4).map(|_| tally(&mut connection).note()).collect();
-                assert_eq!(seen, [First, Repeat, Repeat, Repeat], "case: {case}");
-                assert_eq!(
-                    tally(&mut connection).0,
-                    4,
-                    "case: {case}: every one is counted"
-                );
-                let mut another = ConnectionState::new(Instant::now());
-                assert_eq!(
-                    tally(&mut another).note(),
-                    First,
-                    "case: {case}: per connection"
-                );
-            }
         }
 
         #[test]
