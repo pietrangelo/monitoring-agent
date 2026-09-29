@@ -29,7 +29,9 @@ use crate::snapshot_intake;
 use crate::state::AppState;
 
 mod application_poll;
+mod capped_body;
 use application_poll::poll_applications;
+use capped_body::{CappedBodyError, read_capped};
 
 // ── Agent response shape (maps the system-agent /api/system JSON) ──
 
@@ -115,15 +117,9 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
         return;
     };
     let now = now_iso();
-    let url = format!("{}/api/system", system.url.trim_end_matches('/'));
-    let answer = match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => resp.json::<AgentResponse>().await,
-        Ok(resp) => return mark_offline(&state, system, &now, &format!("HTTP {}", resp.status())),
-        Err(e) => return mark_offline(&state, system, &now, &e.to_string()),
-    };
-    let agent = match answer {
+    let agent = match fetch_system(&client, system).await {
         Ok(agent) => agent,
-        Err(e) => return mark_offline(&state, system, &now, &format!("JSON parse error: {e}")),
+        Err(failure) => return mark_offline(&state, system, now, failure.last_error()).await,
     };
     if store_answer(&state, system, PolledAnswer::from(agent), now)
         .await
@@ -133,6 +129,55 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
     }
     store_agent_alerts(&state, system, &client).await;
     poll_applications(&state, system, &client).await;
+}
+
+/// The largest `/api/system` answer the hub reads: eight times the push message limit, so
+/// every snapshot a push frame can carry fits, with room for the answer's processes and
+/// networks (RFC 0007 §1).
+const MAX_SYSTEM_BODY: usize = 4 * 1024 * 1024;
+
+/// Why a system poll found its system offline.
+#[derive(Debug)]
+enum PollFailure {
+    Transport(reqwest::Error),
+    Status(reqwest::StatusCode),
+    TooLarge,
+    BadJson(serde_json::Error),
+}
+
+impl PollFailure {
+    /// The system's `last_error` for this failure.
+    fn last_error(&self) -> String {
+        match self {
+            Self::Transport(err) => err.to_string(),
+            Self::Status(status) => format!("HTTP {status}"),
+            Self::TooLarge => "body over 4 MiB".to_string(),
+            Self::BadJson(err) => format!("JSON parse error: {err}"),
+        }
+    }
+}
+
+/// Fetches the system's `/api/system` answer, reading at most `MAX_SYSTEM_BODY`, and parses it.
+async fn fetch_system(
+    client: &reqwest::Client,
+    system: &SystemInfo,
+) -> Result<AgentResponse, PollFailure> {
+    let url = format!("{}/api/system", system.url.trim_end_matches('/'));
+    let mut resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(PollFailure::Transport)?;
+    if !resp.status().is_success() {
+        return Err(PollFailure::Status(resp.status()));
+    }
+    let body = read_capped(&mut resp, MAX_SYSTEM_BODY)
+        .await
+        .map_err(|err| match err {
+            CappedBodyError::TooLarge => PollFailure::TooLarge,
+            CappedBodyError::Transport(err) => PollFailure::Transport(err),
+        })?;
+    serde_json::from_slice(&body).map_err(PollFailure::BadJson)
 }
 
 /// The HTTP client for one system's polls: its token as `X-API-Key`, a 10 s timeout, and no
@@ -162,12 +207,17 @@ fn warn_on_failure(result: Result<(), rusqlite::Error>, what: &str, system: &Sys
     }
 }
 
-fn mark_offline(state: &AppState, system: &SystemInfo, now: &str, error: &str) {
-    let offline =
-        state
-            .db
-            .update_system_status(&system.id, &SystemStatus::Offline, now, Some(error));
-    warn_on_failure(offline, "mark offline", system);
+/// Marks the system offline, `error` as its last error, off the async runtime.
+async fn mark_offline(state: &Arc<AppState>, system: &SystemInfo, now: String, error: String) {
+    let (app, id) = (Arc::clone(state), system.id.clone());
+    let unit = move || {
+        app.db
+            .update_system_status(&id, &SystemStatus::Offline, &now, Some(&error))
+    };
+    match tokio::task::spawn_blocking(unit).await {
+        Ok(offline) => warn_on_failure(offline, "mark offline", system),
+        Err(err) => tracing::error!("Poll of {:?}: the offline marking failed: {err}", system.id),
+    }
 }
 
 /// What a successful poll's answer reports, parsed at the edge (RFC 0007 §1): the snapshot,
@@ -840,6 +890,65 @@ mod tests {
         let updated = state.db.get_system("id-1").unwrap().unwrap();
         assert_eq!(updated.status, SystemStatus::Offline);
         assert!(updated.last_error.unwrap().contains("JSON parse error"));
+    }
+
+    /// A mock agent answering `/api/system` with `body`, as given, and no alerts.
+    async fn agent_with_body(body: axum::body::Body) -> String {
+        let body = Arc::new(std::sync::Mutex::new(Some(body)));
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let body = body.lock().unwrap().take().unwrap_or_default();
+                    async move { body }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(|| async { Json(serde_json::json!({"active": []})) }),
+            );
+        spawn_mock_agent(app).await
+    }
+
+    /// RFC 0007 §1: the poll reads `/api/system` up to 4 MiB, inclusive.
+    #[tokio::test]
+    async fn a_system_body_of_exactly_4_mib_is_read() {
+        let frame = r#"{"cpu":{"usage_percent":12.5},"pad":""}"#;
+        let pad = "x".repeat(4 * 1024 * 1024 - frame.len());
+        let body = frame.replace(r#""pad":"""#, &format!(r#""pad":"{pad}""#));
+        assert_eq!(body.len(), 4 * 1024 * 1024);
+        let (state, _dir) = temp_state();
+        let system = sample_system("id-1", agent_with_body(body.into()).await);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 1, "the answer was read");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Online);
+    }
+
+    /// RFC 0007 §1: a larger answer is refused while it streams, whatever its headers say, and
+    /// the system shows offline, naming the cap.
+    #[tokio::test]
+    async fn a_chunked_system_body_over_4_mib_is_refused_and_marks_the_system_offline() {
+        // No Content-Length: only a cap on the bytes read can refuse it.
+        let pad = "x".repeat(1024);
+        let chunks = std::iter::once(r#"{"cpu":{"usage_percent":12.5},"pad":""#.to_string())
+            .chain(std::iter::repeat_n(pad, 4 * 1024 + 1))
+            .chain(std::iter::once(r#""}"#.to_string()))
+            .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)));
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(chunks));
+        let (state, _dir) = temp_state();
+        let system = sample_system("id-1", agent_with_body(body).await);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 0, "the answer wasn't stored");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        let status = (sys.status, sys.last_error.as_deref());
+        assert_eq!(status, (SystemStatus::Offline, Some("body over 4 MiB")));
     }
 
     #[tokio::test]
