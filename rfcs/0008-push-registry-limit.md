@@ -12,8 +12,10 @@
   new hub starts with an empty store. RFC 0011 keeps every system in memory, so the registry
   must be bounded, and this RFC is what bounds push registration. Polled systems are bounded by
   the operator: registering one needs the admin token (RFC 0012).
-- Related: RFC 0007 (Draft; ingestion cost per frame). Split from an earlier, wider draft of
-  RFC 0006. The owner chose the default limit, 1000.
+- Related: RFC 0007 (Draft; ingestion cost per frame). It ships first, on SQLite, and
+  introduces the `registry unavailable` answer (`Refusal::RegistryUnavailable`), which §4
+  reuses for store errors. Split from an earlier, wider draft of RFC 0006. The owner chose the
+  default limit, 1000.
 
 ## Motivation
 
@@ -24,9 +26,9 @@
 2. **Offline marking isn't tied to the connection that is current.** Since RFC 0006, every
    exit of `handle_push` after registration marks the system offline, whichever connection it
    is. So a stale connection that reaches its 90 s idle deadline marks offline a host that
-   already reconnected, and it stays offline until that host's next frame. And a registration
-   whose blocking task fails ends the connection with no answer at all (`Handshake::Closed`),
-   so the agent reconnects at once instead of taking its 5 s backoff.
+   already reconnected, and it stays offline until that host's next frame. (A registration
+   whose blocking task fails no longer ends the connection unanswered: RFC 0007 answers it
+   `registry unavailable`.)
 3. **The agent's id is recomputed on every reconnect.** `src/push.rs::get_persistent_id` runs
    inside `push_once`, and shells out to `hostname` from async code. Without
    `/etc/machine-id`, `/var/lib/dbus/machine-id` and a `hostname` binary (distroless images),
@@ -121,14 +123,16 @@ The push handshake checks, in order: the shape, the token (constant time), the i
 rule (RFC 0005), the reserved-id rule (RFC 0012), then registration (§3). Nothing else; there
 is no import in progress to refuse (RFC 0013 is Rejected).
 
-`Refusal` (RFC 0006: `Rejected(HandshakeRejection)` and `Timeout`) gains two variants:
+`Refusal` (RFC 0006: `Rejected(HandshakeRejection)` and `Timeout`; RFC 0007:
+`RegistryUnavailable`) gains one variant, `RegistryFull`. Store errors reuse RFC 0007's
+`registry unavailable`:
 
 | Outcome | Answer |
 |---|---|
 | `AlreadyRegistered` | accepted, as today |
 | `Registered` | accepted |
 | `RegistryFull` | `auth_error` / `registry full` (`Refusal::RegistryFull`) |
-| a `StoreError` (`Closed` during shutdown, `Failed`, `Io`) | `auth_error` / `registry unavailable` (`Refusal::RegistryUnavailable`), so the agent takes its 5 s backoff instead of reconnecting at once |
+| a `StoreError` (`Closed` during shutdown, `Failed`, `Io`) | `auth_error` / `registry unavailable` (RFC 0007's `Refusal::RegistryUnavailable`), so the agent takes its 5 s backoff instead of reconnecting at once |
 
 Logging (A09):
 - the first `RegistryFull` after the registry fills is logged at `warn`, then **again every
@@ -221,9 +225,9 @@ which reuses it for every reconnect. The sources, in order:
 
 - **Fleet Registry:** `PushRegistryLimit`, the `meta/hub/push_systems` counter, and
   `register_push_system` inside the registration transaction.
-- **Ingestion:** `Refusal::RegistryFull` and `Refusal::RegistryUnavailable`; the handshake
-  order stated in §4; connection numbers, frames claiming currency, `on_exit` and the `stale`
-  backstop over `LiveStatus`.
+- **Ingestion:** `Refusal::RegistryFull`, and store errors mapped to RFC 0007's
+  `Refusal::RegistryUnavailable`; the handshake order stated in §4; connection numbers,
+  frames claiming currency, `on_exit` and the `stale` backstop over `LiveStatus`.
 - **Telemetry Publishing (agent):** `AgentId`, computed once; `SYSTEM_AGENT_ID_FILE`.
 - **Glossary:**
   - **push system**: a system whose source is `Source::Push`, registered by a push handshake,
@@ -233,8 +237,9 @@ which reuses it for every reconnect. The sources, in order:
     (or, before any frame, was accepted last). A push system's status is set offline only by
     its current connection's end, or by the staleness backstop;
   - **connection number**: the in-memory number that identifies a push connection.
-- **Published contracts:** the push frame is untouched. The handshake gains two `auth_error`
-  messages, `registry full` and `registry unavailable`. Mixed-version fleets:
+- **Published contracts:** the push frame is untouched. The handshake gains one `auth_error`
+  message, `registry full`, and answers store errors with RFC 0007's `registry unavailable`.
+  Mixed-version fleets:
   - *any agent*: every `auth_error` gets the same 5 s backoff;
   - *old agents without a stable id source*: a new UUID per reconnect until upgraded, so churn
     can fill the limit; the hourly `warn` and "delete offline" handle it;
@@ -284,8 +289,8 @@ which reuses it for every reconnect. The sources, in order:
   that change.
 - **API1:** unchanged: push ids stay self-asserted. Frames claiming currency mean two agents
   presenting one id alternate its status, as they already alternate its metrics.
-- **API9:** `HUB_MAX_PUSH_SYSTEMS`, `SYSTEM_AGENT_ID_FILE` and the two `auth_error` messages go
-  into the README.
+- **API9:** `HUB_MAX_PUSH_SYSTEMS`, `SYSTEM_AGENT_ID_FILE` and the `registry full` message go
+  into the README (RFC 0007 adds `registry unavailable`).
 - Everything else is unchanged.
 
 ## Testing plan
@@ -339,9 +344,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     in RFC 0005's stored-id entry; a stale connection marking a live host offline; the agent's
     blocking `hostname` shell-out;
   - added: expiring stale push systems.
-- `README.md`: the `HUB_MAX_PUSH_SYSTEMS` and `SYSTEM_AGENT_ID_FILE` rows; `registry full` and
-  `registry unavailable` in the `auth_error` table; "they appear automatically" (up to the
-  limit).
+- `README.md`: the `HUB_MAX_PUSH_SYSTEMS` and `SYSTEM_AGENT_ID_FILE` rows; `registry full` in
+  the `auth_error` table, beside RFC 0007's `registry unavailable`; "they appear
+  automatically" (up to the limit).
 - `docker-compose.yml`: `HUB_MAX_PUSH_SYSTEMS: ${HUB_MAX_PUSH_SYSTEMS:-}` on the hub; nothing on
   the agent. `.env.example`: a commented line.
 
