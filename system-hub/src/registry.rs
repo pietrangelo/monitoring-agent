@@ -198,8 +198,27 @@ pub fn needs_system_info(system: &SystemInfo) -> bool {
     system.hostname.is_none() || system.os.is_none()
 }
 
-/// The systems the poller polls: the enabled ones, in the registry's order.
-pub fn enabled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
+/// The url push registration writes, which makes a system a push system (RFC 0016 §1).
+pub const PUSH_URL: &str = "push://";
+
+/// Where a system's snapshots come from (RFC 0016 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemSource {
+    /// Registered by a push handshake: never polled.
+    Push,
+    /// Any other url: polled.
+    Poll,
+}
+
+impl SystemSource {
+    /// `Push` for exactly `PUSH_URL`, `Poll` for any other url.
+    pub fn of(_url: &str) -> Self {
+        Self::Poll
+    }
+}
+
+/// The systems the poller polls: the enabled polled systems, in the registry's order.
+pub fn polled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
     systems.iter().filter(|system| system.enabled)
 }
 
@@ -215,10 +234,18 @@ mod tests {
     }
 
     fn system(id: &str, enabled: bool) -> SystemInfo {
+        at(id, "http://example.com", enabled)
+    }
+
+    fn push_system(id: &str, enabled: bool) -> SystemInfo {
+        at(id, PUSH_URL, enabled)
+    }
+
+    fn at(id: &str, url: &str, enabled: bool) -> SystemInfo {
         SystemInfo {
             id: id.to_owned(),
             name: id.to_owned(),
-            url: "http://example.com".to_owned(),
+            url: url.to_owned(),
             token: String::new(),
             status: SystemStatus::Unknown,
             last_seen: String::new(),
@@ -236,8 +263,8 @@ mod tests {
     }
 
     #[test]
-    fn only_enabled_systems_are_polled_in_the_registrys_order() {
-        let cases: [(&str, Vec<SystemInfo>, Vec<&str>); 4] = [
+    fn only_enabled_polled_systems_are_polled_in_the_registrys_order() {
+        let cases: [(&str, Vec<SystemInfo>, Vec<&str>); 7] = [
             ("none", vec![], vec![]),
             (
                 "all enabled",
@@ -259,10 +286,49 @@ mod tests {
                 ],
                 vec!["b", "d"],
             ),
+            // RFC 0016 §3: a push system is never polled, enabled or not.
+            (
+                "push systems",
+                vec![push_system("a", true), push_system("b", false)],
+                vec![],
+            ),
+            (
+                "push and polled",
+                vec![
+                    push_system("a", true),
+                    system("b", true),
+                    push_system("c", true),
+                    system("d", false),
+                    system("e", true),
+                ],
+                vec!["b", "e"],
+            ),
+            (
+                "a url POST stores from push://",
+                vec![at("a", "push:", true)],
+                vec!["a"],
+            ),
         ];
         for (case, systems, expected) in cases {
-            let polled: Vec<&str> = enabled_systems(&systems).map(|s| s.id.as_str()).collect();
+            let polled: Vec<&str> = polled_systems(&systems).map(|s| s.id.as_str()).collect();
             assert_eq!(polled, expected, "case: {case}");
+        }
+    }
+
+    /// RFC 0016 §1: only the exact sentinel push registration writes makes a push system.
+    #[test]
+    fn only_the_push_sentinel_makes_a_push_system() {
+        let cases = [
+            ("the sentinel", "push://", SystemSource::Push),
+            ("what POST stores from it", "push:", SystemSource::Poll),
+            ("upper case", "PUSH://", SystemSource::Poll),
+            ("with a host", "push://x", SystemSource::Poll),
+            ("http", "http://10.0.0.1:9090", SystemSource::Poll),
+            ("https", "https://agent.example", SystemSource::Poll),
+            ("empty", "", SystemSource::Poll),
+        ];
+        for (name, url, expected) in cases {
+            assert_eq!(SystemSource::of(url), expected, "case {name}");
         }
     }
 

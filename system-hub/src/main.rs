@@ -22,6 +22,7 @@ mod db;
 mod hourly_warning;
 mod listen;
 mod models;
+mod presence;
 mod push;
 mod registry;
 mod retention;
