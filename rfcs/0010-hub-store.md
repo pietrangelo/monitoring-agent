@@ -657,15 +657,15 @@ tier names, and is an open read like the rest of the hub API.
       liveness: Liveness,
       last_contact: Option<u64>,       // hub time of the last successful frame or poll
       last_error: Option<String>,      // ≤ 256 bytes
-      connection: Option<u64>,         // RFC 0008's connection number, push systems only
+      connection: Option<u64>,         // RFC 0016's connection number, push systems only
   }
   pub enum Liveness { Online, Offline { since: u64 }, Unknown }
   ```
 
   - `Liveness` is one enum, so "online with an offline time" can't be represented.
   - **Set only by contact and by transitions.** A successful frame or poll sets `Online` and
-    `last_contact`. A failed poll, the end of the current push connection (RFC 0008 §5), and
-    RFC 0008's staleness sweep set `Offline { since: now }` unless already offline. Shutdown
+    `last_contact`. A failed poll, the end of the current push connection (RFC 0016 §2), and
+    RFC 0016's silence sweep set `Offline { since: now }` unless already offline. Shutdown
     touches nothing.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.
     *Behaviour change: today a push system's `last_seen` holds its agent's uptime display, and a
