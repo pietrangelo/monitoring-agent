@@ -665,7 +665,9 @@ tier names, and is an open read like the rest of the hub API.
   - `Liveness` is one enum, so "online with an offline time" can't be represented.
   - **Set only by contact and by transitions.** A successful frame or poll sets `Online` and
     `last_contact`. A failed poll, the end of the current push connection (RFC 0016 §2), and
-    RFC 0016's silence sweep set `Offline { since: now }` unless already offline. Shutdown
+    RFC 0016's disconnection sweep (a push system with no current connection, once the store
+    has been open 120 s) set `Offline { since: now }` unless already offline. `last_contact`
+    is a display value, not a liveness rule: a connection that pushes every 300 s is online. Shutdown
     touches nothing.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.
     *Behaviour change: today a push system's `last_seen` holds its agent's uptime display, and a

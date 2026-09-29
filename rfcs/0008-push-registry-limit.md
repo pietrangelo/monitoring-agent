@@ -141,9 +141,9 @@ Logging (A09):
 
 Moved to RFC 0016, which ships it on SQLite: connection numbers, the current connection (the
 one that last delivered a snapshot, or before any the one accepted last), offline marking by
-the current connection's end only, and the silence sweep. RFC 0010 §10 carries it into
+the current connection's end only, and the disconnection sweep. RFC 0010 §10 carries it into
 `LiveStatus`. This RFC relies on it only in that "delete offline" (RFC 0012) then sees a push
-system as offline when its current connection has ended, or it has gone silent.
+system as offline when its current connection has ended, or it has none.
 
 ### 6. Where the limit holds
 
