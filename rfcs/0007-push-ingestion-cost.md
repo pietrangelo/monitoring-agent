@@ -1158,6 +1158,33 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   `src/application_wire.rs`, listed too), and leaves out `registry.rs`, `clock.rs` and
   `listen.rs`.
 
+## Implementation progress
+
+On branch `feat/push-ingestion-cost`, in the order Rollout sets. Each step went through
+`red-test-adversary` (EVIDENCE) and the hub gate.
+
+| Step | State | Commit |
+|---|---|---|
+| `PUT` poll interval fix (`PollInterval`, 422) | done | `904719e` |
+| §6 split of `push/mod.rs` into `push/ingest.rs` | done | `828c060` |
+| §6 split of `db.rs` into `db/mod.rs` and `db/history.rs` | done | `ebc6a4a` |
+| `hourly_warning` moved into a pure module | done | `9f0ff1d` |
+| §1 the snapshot rule (`snapshot.rs`) | done, not yet wired into the adapters | `0059304` |
+| §2 `store_snapshot`, capped prune, `LastSeen`/`UptimeDisplay`/`StatusUpdate`, `MemoryCapacity` bounds | next | |
+| §1/§2/§4 wiring both adapters: push and poll through the rule and `store_snapshot`, poll on the blocking pool, 4 MiB poll body, no systems cache, `insert_system_if_absent`, `registry unavailable` | to do | |
+| §3 decode budget (`TokenBucket`, `DecodeBudget`) | to do | |
+| §4 `Arc<LiveMetrics>`, `end_connection`, eviction on delete | to do | |
+| §5 SSE publisher (`watch`, `send_replace`) | to do | |
+| README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
+
+Open items to settle on the way:
+- `snapshot.rs` has temporary `#[cfg_attr(not(test), allow(dead_code))]` attributes, to be removed
+  once `store_snapshot` and the adapters use the items.
+- `POST /api/systems` accepts a `poll_interval_secs` above `i64::MAX` and answers 500; it should
+  parse through `PollInterval` too. A `PUT` of 0 is still stored while `POST` clamps to 5 (out
+  of this RFC's scope; an open question).
+- `rosette-auditor` hasn't run on any step yet.
+
 ## Rollout / migration notes
 
 Hub-only. No schema change, and no change to the push frame or the poll response. Rolling back
