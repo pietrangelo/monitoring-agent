@@ -262,19 +262,25 @@ fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
     }
 }
 
-pub(super) fn mark_offline(app: &AppState, system_id: &SystemId) {
-    let _ = app.db.update_system_status(
-        system_id.as_str(),
-        &SystemStatus::Offline,
-        "",
-        Some("push disconnected"),
-    );
+/// Ends a push connection's hold on its system (RFC 0007 §4): marks it offline, then removes
+/// its live metrics. One unit of blocking work, so no wait separates the two.
+pub(super) fn end_connection(app: &AppState, system_id: &SystemId) {
+    let id = system_id.as_str();
+    let offline =
+        app.db
+            .update_system_status(id, &SystemStatus::Offline, "", Some("push disconnected"));
+    if let Err(err) = offline {
+        tracing::warn!("Push from {id:?}: couldn't mark the system offline: {err}");
+    }
+    // The evicted entry is dropped here, after the live lock is released.
+    drop(app.evict_live_metrics(id));
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::application_wire;
+    use crate::snapshot::{LiveMetrics, snapshot_rule};
     use serde::Serialize;
 
     #[derive(Serialize)]
@@ -523,22 +529,76 @@ pub(super) mod tests {
         }
     }
 
+    fn app() -> (std::sync::Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = std::sync::Arc::new(crate::db::Database::new(path.to_str().unwrap()).unwrap());
+        (AppState::new(db), dir)
+    }
+
+    fn id(id: &str) -> SystemId {
+        SystemId::try_from(id.to_string()).unwrap()
+    }
+
     /// RFC 0007 §4: registration keeps `Database`'s one lock convention, and panics on a
     /// poisoned mutex, so the handshake answers the `JoinError` rather than accepting an agent
     /// whose every frame would then panic its store.
     #[test]
     fn registration_panics_on_a_poisoned_database_mutex() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let db = std::sync::Arc::new(crate::db::Database::new(path.to_str().unwrap()).unwrap());
-        let app = AppState::new(db);
-        let id = SystemId::try_from("sys-poisoned".to_string()).unwrap();
+        let (app, _dir) = app();
+        let id = id("sys-poisoned");
         app.db.poison_for_test();
 
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| register_if_new(&app, &id)));
 
         assert!(outcome.is_err(), "registration panicked");
+    }
+
+    fn plant_live_metrics(app: &AppState, system_id: &str) {
+        let (snapshot, left_out) = snapshot_rule(ReportedSnapshot::default());
+        let time = SnapshotTime::try_from(1_700_000_000).unwrap();
+        let (entry, _) = LiveMetrics::following(None, snapshot, time, &left_out, Instant::now());
+        let mut live = app.live_metrics.write().unwrap();
+        live.insert(system_id.to_string(), std::sync::Arc::new(entry));
+    }
+
+    /// RFC 0007 §4: a push connection's end marks its system offline and evicts its live
+    /// metrics, even when its row is already gone, and leaves every other system alone.
+    #[test]
+    fn ending_a_connection_marks_its_system_offline_and_evicts_its_live_metrics() {
+        let cases = [("a registered system", true), ("a deleted system", false)];
+        for (case, registered) in cases {
+            let (app, _dir) = app();
+            for system in ["sys-ended", "sys-other"] {
+                register_if_new(&app, &id(system)).unwrap();
+                plant_live_metrics(&app, system);
+            }
+            if !registered {
+                app.db.delete_system("sys-ended").unwrap();
+            }
+
+            end_connection(&app, &id("sys-ended"));
+
+            let status = |system| {
+                let row = app.db.get_system(system).unwrap();
+                row.map(|sys| (sys.status, sys.last_error))
+            };
+            let offline = (SystemStatus::Offline, Some("push disconnected".to_string()));
+            let expected = registered.then_some(offline);
+            assert_eq!(status("sys-ended"), expected, "case: {case}");
+            assert_eq!(
+                status("sys-other"),
+                Some((SystemStatus::Online, None)),
+                "case: {case}: another system stays online"
+            );
+            let live = app.live_metrics.read().unwrap();
+            assert!(!live.contains_key("sys-ended"), "case: {case}: evicted");
+            assert!(
+                live.contains_key("sys-other"),
+                "case: {case}: another entry stays"
+            );
+        }
     }
 
     #[test]

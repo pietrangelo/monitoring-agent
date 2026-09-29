@@ -40,7 +40,7 @@ mod ingest;
 use crate::state::AppState;
 pub use config::{PushAuth, PushAuthError, PushConfig};
 use connection::{ConnectionState, OutOfBudget, warn_first};
-use ingest::{PushPayload, SnapshotFrame, ingest_frame, mark_offline, register_if_new};
+use ingest::{PushPayload, SnapshotFrame, end_connection, ingest_frame, register_if_new};
 
 /// The push handshake's first message. No `Debug`: `token` holds the presented secret.
 #[derive(Deserialize)]
@@ -205,7 +205,7 @@ async fn handle_push(mut socket: WebSocket, ctx: PushContext) {
         ),
     }
 
-    let _ = on_blocking_pool(&ctx.app, &system_id, mark_offline).await;
+    let _ = on_blocking_pool(&ctx.app, &system_id, end_connection).await;
     tracing::info!("Push client disconnected: {:?}", system_id.as_str());
 }
 
@@ -1587,7 +1587,8 @@ mod tests {
 
     /// Sends one push frame per snapshot, then closes the connection and waits until the
     /// hub has marked the system offline. The offline marking runs after every frame has
-    /// been ingested, so once it lands every frame's effects are visible.
+    /// been ingested, so once it lands every frame's effects are visible. The same unit then
+    /// evicts the system's live metrics (RFC 0007 §4).
     async fn push_frames_then_disconnect(
         state: &AppState,
         mut ws: AgentSocket,
@@ -1615,6 +1616,10 @@ mod tests {
             state.db.get_system(system_id).unwrap().unwrap().status,
             SystemStatus::Offline,
             "no frame ingestion lands after the offline marking"
+        );
+        assert!(
+            !state.live_metrics.read().unwrap().contains_key(system_id),
+            "an ended connection leaves no live metrics"
         );
     }
 
@@ -1841,8 +1846,8 @@ mod tests {
     }
 
     /// RFC 0007 §4: a snapshot for a deleted system ends its push connection, as a round's
-    /// does, and writes no live metrics. The agent's reconnect registers the system again,
-    /// under its default name, with none of its history.
+    /// does, and the connection's end leaves no live metrics. The agent's reconnect registers
+    /// the system again, under its default name, with none of its history.
     #[tokio::test]
     async fn a_frame_for_a_deleted_system_ends_the_connection_and_a_reconnect_registers_it_anew() {
         let (state, _dir) = temp_state();
@@ -1850,7 +1855,6 @@ mod tests {
         let mut ws = connect_authenticated(addr, "sys-deleted").await;
         send_and_sync(&mut ws, frame_bytes("host1")).await;
         state.db.delete_system("sys-deleted").unwrap();
-        state.live_metrics.write().unwrap().remove("sys-deleted");
 
         use futures_util::SinkExt;
         ws.send(WsMessage::Binary(frame_bytes("host1")))
@@ -1865,7 +1869,7 @@ mod tests {
                 .read()
                 .unwrap()
                 .contains_key("sys-deleted"),
-            "no live metrics recreated"
+            "no live metrics once the connection ended"
         );
         let _again = connect_authenticated(addr, "sys-deleted").await;
         let sys = state.db.get_system("sys-deleted").unwrap().unwrap();

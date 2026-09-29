@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
@@ -37,8 +37,9 @@ pub struct SystemApplications {
 
 pub struct AppState {
     pub db: Arc<Database>,
-    /// Per-system live metrics, written with each stored snapshot, keyed by system id. Lock
-    /// order: the database mutex, then this; never take the database mutex while holding it.
+    /// Per-system live metrics, written with each stored snapshot, keyed by system id, and
+    /// evicted when a push connection ends or the system is deleted. Lock order: the database
+    /// mutex, then this; never take the database mutex while holding it.
     pub live_metrics: RwLock<HashMap<String, Arc<LiveMetrics>>>,
     /// Per-system applications, keyed by system id. Lock order: the database mutex, then
     /// this; never take the database mutex while holding it.
@@ -55,5 +56,58 @@ impl AppState {
             live_applications: RwLock::new(HashMap::new()),
             digester: RoundDigester::new(),
         })
+    }
+
+    /// Removes a system's live metrics (RFC 0007 §4) and hands the entry back, so the caller
+    /// drops it after the live lock is released.
+    pub fn evict_live_metrics(&self, system_id: &str) -> Option<Arc<LiveMetrics>> {
+        self.live_metrics
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(system_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{ReportedSnapshot, SnapshotTime, snapshot_rule};
+
+    fn app() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
+        (AppState::new(db), dir)
+    }
+
+    fn plant(app: &AppState, system_id: &str) -> Arc<LiveMetrics> {
+        let (snapshot, left_out) = snapshot_rule(ReportedSnapshot::default());
+        let time = SnapshotTime::try_from(1_700_000_000).unwrap();
+        let (entry, _) = LiveMetrics::following(None, snapshot, time, &left_out, Instant::now());
+        let entry = Arc::new(entry);
+        let mut live = app.live_metrics.write().unwrap();
+        live.insert(system_id.to_string(), Arc::clone(&entry));
+        entry
+    }
+
+    /// RFC 0007 §4: an eviction hands back the system's own entry, for its caller to drop
+    /// outside the live lock, and leaves every other entry in place.
+    #[test]
+    fn evicting_live_metrics_hands_back_only_that_systems_entry() {
+        let (app, _dir) = app();
+        let planted = plant(&app, "sys-1");
+        plant(&app, "sys-2");
+
+        let evicted = app.evict_live_metrics("sys-1");
+        let again = app.evict_live_metrics("sys-1");
+
+        assert!(
+            evicted.is_some_and(|entry| Arc::ptr_eq(&entry, &planted)),
+            "the system's entry comes back"
+        );
+        assert!(again.is_none(), "nothing is left to evict");
+        let live = app.live_metrics.read().unwrap();
+        let kept: Vec<&str> = live.keys().map(String::as_str).collect();
+        assert_eq!(kept, ["sys-2"], "another system's entry stays");
     }
 }
