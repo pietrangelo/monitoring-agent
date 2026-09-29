@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::registry::MemoryCapacity;
+use crate::registry::{MemoryCapacity, PollInterval};
 use rusqlite::Connection;
 use std::sync::Mutex;
 
@@ -289,7 +289,7 @@ impl Database {
         name: Option<&str>,
         url: Option<&str>,
         token: Option<&str>,
-        poll_interval_secs: Option<u64>,
+        poll_interval_secs: Option<PollInterval>,
         enabled: Option<bool>,
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
@@ -310,7 +310,7 @@ impl Database {
         }
         if let Some(v) = poll_interval_secs {
             sets.push("poll_interval_secs = ?");
-            params.push(Box::new(v as i64));
+            params.push(Box::new(v.column_value()));
         }
         if let Some(v) = enabled {
             sets.push("enabled = ?");
@@ -820,7 +820,7 @@ mod tests {
             Some("renamed"),
             Some("http://new.example.com"),
             Some("newtoken"),
-            Some(30),
+            PollInterval::try_from(30).ok(),
             Some(false),
         )
         .unwrap();
