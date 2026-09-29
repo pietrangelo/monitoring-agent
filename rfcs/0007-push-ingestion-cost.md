@@ -1160,8 +1160,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
 
 ## Implementation progress
 
-On branch `feat/push-ingestion-cost`, in the order Rollout sets. Each step went through
-`red-test-adversary` (EVIDENCE) and the hub gate.
+On branch `feat/push-ingestion-cost`, continued on `claude/peaceful-einstein-acohge`, in the
+order Rollout sets. Each step went through `red-test-adversary` (EVIDENCE; for §2 as an
+in-process check at medium effort, with mutation runs) and the hub gate.
 
 | Step | State | Commit |
 |---|---|---|
@@ -1170,16 +1171,28 @@ On branch `feat/push-ingestion-cost`, in the order Rollout sets. Each step went 
 | §6 split of `db.rs` into `db/mod.rs` and `db/history.rs` | done | `ebc6a4a` |
 | `hourly_warning` moved into a pure module | done | `9f0ff1d` |
 | §1 the snapshot rule (`snapshot.rs`) | done, not yet wired into the adapters | `0059304` |
-| §2 `store_snapshot`, capped prune, `LastSeen`/`UptimeDisplay`/`StatusUpdate`, `MemoryCapacity` bounds | next | |
-| §1/§2/§4 wiring both adapters: push and poll through the rule and `store_snapshot`, poll on the blocking pool, 4 MiB poll body, no systems cache, `insert_system_if_absent`, `registry unavailable` | to do | |
+| §2 `store_snapshot`, capped prune, `LastSeen`/`UptimeDisplay`/`StatusUpdate`, `MemoryCapacity` bounds | done, `store_snapshot` not yet wired into the adapters | `3d7d610` |
+| §1/§2/§4 wiring both adapters: push and poll through the rule and `store_snapshot`, poll on the blocking pool, 4 MiB poll body, no systems cache, `insert_system_if_absent`, `registry unavailable` | next | |
 | §3 decode budget (`TokenBucket`, `DecodeBudget`) | to do | |
 | §4 `Arc<LiveMetrics>`, `end_connection`, eviction on delete | to do | |
 | §5 SSE publisher (`watch`, `send_replace`) | to do | |
 | README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
 
 Open items to settle on the way:
-- `snapshot.rs` has temporary `#[cfg_attr(not(test), allow(dead_code))]` attributes, to be removed
-  once `store_snapshot` and the adapters use the items.
+- `snapshot.rs`, `registry.rs` (`LastSeen`, `StatusUpdate`) and `db/history.rs`
+  (`store_snapshot`) have temporary `#[cfg_attr(not(test), allow(dead_code))]` attributes, to
+  be removed once the adapters use the items. `SnapshotTimeOutOfRange` gained one in §2: Rust
+  1.98's dead-code lint flags it until the push edge converts a frame's timestamp.
+- §2 added `SnapshotTime::cutoff` (the retention cutoff, never before 0), a pure rule the RFC's
+  text leaves inside `store_snapshot`; it keeps the arithmetic out of the SQL adapter.
+- Still to test with the wiring (Testing plan, `store_snapshot`): the warning time carrying
+  over through the push path's own `on_stored`, and `on_stored` returning the replaced entry
+  (`Arc::ptr_eq`). Both need §4's `LiveMetrics`.
+- Removing `ORDER BY timestamp` from the capped prune survives the tests: SQLite reads the
+  subquery through `idx_metrics_system_time`, already in timestamp order. The `ORDER BY` stays,
+  so oldest-first is a guarantee rather than a planner choice.
+- In a container without IPv6, `tests/fail_closed.rs`'s `[::]:0` case (RFC 0015) fails to bind;
+  CI's runners have IPv6.
 - `POST /api/systems` accepts a `poll_interval_secs` above `i64::MAX` and answers 500; it should
   parse through `PollInterval` too. A `PUT` of 0 is still stored while `POST` clamps to 5 (out
   of this RFC's scope; an open question).
