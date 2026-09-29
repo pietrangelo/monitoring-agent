@@ -65,19 +65,30 @@ monitoring-agent/system-hub/
 ├── system-hub.db               # SQLite (auto-created)
 └── src/
     ├── main.rs                 # Server entry
+    ├── listen.rs               # HUB_LISTEN parsing
+    ├── clock.rs                # The hub's wall clock
     ├── models.rs               # Data types
-    ├── state.rs                # Shared state + live metrics cache
-    ├── db.rs                   # SQLite: migrations, CRUD, queries
+    ├── registry.rs             # Registry rules: memory capacity, last seen, status, poll interval
+    ├── state.rs                # Shared state: live metrics, applications, the SSE summary
+    ├── db/
+    │   ├── mod.rs              # SQLite: migrations, systems and alerts
+    │   └── history.rs          # SQLite: metric history, snapshot and round stores, pruning
+    ├── snapshot.rs             # The snapshot rule, live metrics (pure)
+    ├── snapshot_intake.rs      # Stores a snapshot from either source
+    ├── token_bucket.rs         # The token bucket both paces share (pure)
+    ├── hourly_warning.rs       # At most one warning an hour (pure)
     ├── collector/
     │   ├── mod.rs              # HTTP poller (agent /api/system and /api/alerts)
+    │   ├── capped_body.rs      # Reads a poll's body up to a cap
     │   └── application_poll.rs # Polls /api/applications
     ├── application_wire.rs     # Scrape rounds as agents send them (frame and poll JSON)
     ├── round_intake.rs         # Admits and stores a round from either source
     ├── applications.rs         # Scrape rounds: admission, freshness, metric points
     ├── retention.rs            # Periodic pruning of app:* points
     ├── push/
-    │   ├── mod.rs              # Push receiver (accepts agent WS connections)
-    │   ├── application_wire.rs # Application frame decoding and conversion
+    │   ├── mod.rs              # Push receiver: handshake, message loop
+    │   ├── ingest.rs           # Snapshot frames: decoding, registration, storing
+    │   ├── connection.rs       # A connection's decode budget, pace and counts
     │   └── config.rs           # Push token, socket limits, deadlines
     └── routes/
         ├── mod.rs
@@ -252,20 +263,22 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | `POST /api/systems` | POST | Register a system `{name, url, token, poll_interval_secs}` |
 | `GET /api/systems/{id}` | GET | System details |
 | `PUT /api/systems/{id}` | PUT | Update config (a `poll_interval_secs` above 2^63-1 is refused with 422 and nothing is stored) |
-| `DELETE /api/systems/{id}` | DELETE | Remove system + all data |
+| `DELETE /api/systems/{id}` | DELETE | Remove system + all data, live metrics included. A push agent that is still connected is disconnected by its next frame, and registers the system again at once, with no history: stop the agent first |
 | `GET /api/summary` | GET | Aggregated stats (online/offline/alerts) |
 | `GET /api/systems/{id}/metrics?metric=cpu&limit=300` | GET | Time-series for a specific metric |
 | `GET /api/systems/{id}/history?limit=300` | GET | Combined CPU + memory history |
 | `GET /api/systems/{id}/applications` | GET | The system's latest Spring Boot scrape round (pushed, or polled from the agent's `/api/applications`), with `received_at`, `age_secs` and `freshness` (`fresh`/`stale`) computed on the hub; all three `null` and `applications: []` when none is held. History: `/metrics?metric=app:<name>:<gauge>` |
 | `GET /api/alerts?acknowledged=false&limit=50` | GET | Alert history |
 | `POST /api/alerts/{id}/acknowledge` | POST | Acknowledge an alert |
-| `GET /api/stream/summary` | **SSE** | Live summary + system list + live metrics every 5s |
+| `GET /api/stream/summary` | **SSE** | Live summary + system list + live metrics: one summary every 5 s, shared by every subscriber; a new subscriber gets the current one at once |
 | `GET /api/push` | **WebSocket** | Agent push endpoint (MessagePack) |
 
 **Polling** (`POST /api/systems` with a URL): every 30 s the hub GETs the agent's
 `/api/system`, `/api/alerts` and `/api/applications` with the system's token in
 `X-API-Key`. It follows **no redirects**: a registered URL that answers with a 3xx shows as
-offline, with the 3xx in `last_error`; register the final URL instead. An agent without
+offline, with the 3xx in `last_error`; register the final URL instead. An `/api/system`
+answer over 4 MiB also marks the system offline. The snapshot it carries goes through the
+same rules as a pushed one (see Data frames below). An agent without
 `/api/applications` (404) or without a round simply has no applications.
 
 ### Push protocol (WebSocket + MessagePack)
@@ -289,6 +302,9 @@ When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` m
 | `invalid token` | `HUB_PUSH_TOKEN` is set and `token` doesn't match it |
 | `invalid system_id` | the token is valid (or not required) but `system_id` is empty, longer than 255 bytes, or `.` / `..` |
 | `handshake timeout` | no first message arrived within 10 s of the upgrade |
+| `registry unavailable` | the hub couldn't check or register the system id (a database error, or a registration that panicked). A known id's row is never replaced |
+
+The agent retries after 5 s, as for any `auth_error`.
 
 **Deadlines and limits:** after `auth_ok`, the client must send some message at least every
 90 s, or the hub closes the connection and marks the system offline. Pings count, and the hub
@@ -330,6 +346,25 @@ MessagePack({
 ```
 
 MessagePack is ~50-70% smaller than equivalent JSON. A typical 2 KB JSON snapshot compresses to ~600-800 bytes.
+
+**What the hub keeps.** Every binary message, whatever its kind, spends one token of the
+connection's decode budget before it is decoded: 3 messages, then one per second. A message
+past the budget is dropped undecoded (the connection stays open), and the count is logged
+when the connection ends. The agent sends at most one snapshot every 2 s (`PUSH_INTERVAL`)
+and one round every 10 s, well inside it. Then, for a snapshot frame:
+
+- a `timestamp` above 2^63 − 1 refuses the whole frame;
+- `cpu_percent`, `memory_percent`, `swap_percent`, `load_one` and `load_five` are stored when
+  finite, each on its own;
+- each disk is stored as `disk:<mount_point>` when its mount point is 1 to 256 bytes with no
+  control character and its usage is finite; the first 1024 such disks are kept, in the
+  order sent. What is left out is logged, at `warn` at most once an hour per system;
+- an `uptime_display` or `memory_total_display` over 64 bytes, or holding a control
+  character, is ignored and the stored value kept, and so is a `memory_total_bytes` above
+  2^63 − 1 (the memory rules apply to polled systems too).
+
+A snapshot's points, the pruning of their series and the system's status are written in one
+transaction.
 
 **Application frames (on each scrape round):**
 
@@ -476,7 +511,8 @@ The hub stores everything in **SQLite** (`system-hub.db`, created automatically)
 | `alerts` | Alert history, one record per alert incident, with acknowledge support |
 | `metric_retention` | Per-system per-metric retention (default 24h) |
 
-Snapshot metrics are pruned after their retention period each time that metric is inserted.
+A snapshot's points are written in one transaction, which also prunes each of their series
+past its retention period, at most 16 rows per point.
 Application metrics (`app:*`) are pruned by a task every 10 minutes, past their retention
 row or 24h. Run `sqlite3 system-hub.db` for direct queries.
 
