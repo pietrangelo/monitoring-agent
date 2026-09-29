@@ -18,9 +18,16 @@
 //! pool. The snapshot DTOs are the anti-corruption layer between the agent's push frame and
 //! the hub's registry and history.
 
+use std::time::Instant;
+
+use crate::db::SnapshotStored;
 use crate::models::{SystemId, SystemInfo, SystemStatus};
-use crate::registry::{MemoryCapacity, memory_capacity_refresh};
-use crate::state::{AppState, LiveMetrics};
+use crate::registry::{LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh};
+use crate::snapshot::{
+    LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime, SnapshotTimeOutOfRange,
+};
+use crate::snapshot_intake;
+use crate::state::AppState;
 use serde::Deserialize;
 
 /// Deserialized from MessagePack binary payloads sent by agents.
@@ -70,6 +77,87 @@ struct ProcessItem {
     memory_percent: f32,
 }
 
+/// Why a decoded snapshot frame is refused whole (RFC 0007 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotRefusal {
+    /// Its timestamp is above `i64::MAX`, which SQLite can't hold.
+    TimestampOutOfRange,
+}
+
+/// A snapshot frame parsed at the edge (RFC 0007 §1): the snapshot it reports, its time, what
+/// the system's last seen becomes, and the system info the registry fill reads.
+#[derive(Debug)]
+pub(super) struct SnapshotFrame {
+    reported: ReportedSnapshot,
+    time: SnapshotTime,
+    last_seen: LastSeen,
+    info: PushedInfo,
+}
+
+/// What a snapshot frame reports of its system, for the registry fill.
+#[derive(Debug)]
+struct PushedInfo {
+    hostname: String,
+    os_name: String,
+    kernel: String,
+    cpu_model: String,
+    cpu_cores: usize,
+    /// `None` when the frame's capacity breaks `MemoryCapacity::reported`'s bounds.
+    memory: Option<MemoryCapacity>,
+}
+
+impl TryFrom<PushPayload> for SnapshotFrame {
+    type Error = SnapshotRefusal;
+
+    /// Every scalar of a push frame is reported; the uptime display becomes the last seen only
+    /// under the display rule, else the stored one is kept.
+    fn try_from(payload: PushPayload) -> Result<Self, Self::Error> {
+        let time = SnapshotTime::try_from(payload.timestamp)
+            .map_err(|SnapshotTimeOutOfRange| SnapshotRefusal::TimestampOutOfRange)?;
+        let last_seen = UptimeDisplay::try_from(payload.uptime_display.clone())
+            .map_or(LastSeen::Unchanged, LastSeen::Uptime);
+        let memory = MemoryCapacity::reported(
+            Some(&payload.memory_total_display),
+            Some(payload.memory_total_bytes),
+        );
+        let reported = reported_snapshot(&payload);
+        let info = PushedInfo {
+            hostname: payload.hostname,
+            os_name: payload.os_name,
+            kernel: payload.kernel,
+            cpu_model: payload.cpu_model,
+            cpu_cores: payload.cpu_cores,
+            memory,
+        };
+        Ok(Self {
+            reported,
+            time,
+            last_seen,
+            info,
+        })
+    }
+}
+
+/// The snapshot a push frame reports, before the snapshot rule.
+fn reported_snapshot(payload: &PushPayload) -> ReportedSnapshot {
+    let disks = payload
+        .disks
+        .iter()
+        .map(|disk| ReportedDisk {
+            mount_point: Some(disk.mount_point.clone()),
+            usage_percent: Some(disk.usage_percent),
+        })
+        .collect();
+    ReportedSnapshot {
+        cpu: Some(payload.cpu_percent),
+        memory: Some(payload.memory_percent),
+        swap: Some(payload.swap_percent),
+        load1: Some(payload.load_one),
+        load5: Some(payload.load_five),
+        disks,
+    }
+}
+
 /// Registers a system the hub hasn't seen before, under its default name. A known id is
 /// never written, and a database that can't check or insert returns its error (RFC 0007 §4).
 pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) -> Result<(), rusqlite::Error> {
@@ -93,61 +181,36 @@ pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) -> Result<()
     })
 }
 
-pub(super) fn ingest_frame(app: &AppState, system_id: &SystemId, payload: &PushPayload) {
-    store_metrics(app, system_id.as_str(), payload);
-    cache_live_metrics(app, system_id.as_str(), payload);
-    update_registry(app, system_id, payload);
-    app.refresh_cache();
-}
-
-fn store_metrics(app: &AppState, system_id: &str, payload: &PushPayload) {
-    for (metric, value) in metric_points(payload) {
-        let _ = app
-            .db
-            .insert_metric(system_id, &metric, value, payload.timestamp);
+/// Stores one snapshot frame, then fills the registry from it: one unit of blocking work.
+pub(super) fn ingest_frame(
+    app: &AppState,
+    system_id: &SystemId,
+    frame: SnapshotFrame,
+) -> Result<SnapshotStored<LeftOutLog>, rusqlite::Error> {
+    let SnapshotFrame {
+        reported,
+        time,
+        last_seen,
+        info,
+    } = frame;
+    if last_seen == LastSeen::Unchanged {
+        tracing::debug!(
+            "Push from {:?}: an uptime display the display rule refuses; last seen kept",
+            system_id.as_str()
+        );
     }
+    let now = Instant::now();
+    let stored = snapshot_intake::store_snapshot(app, system_id, reported, time, last_seen, now)?;
+    if let SnapshotStored::Stored(_) = stored {
+        update_registry(app, system_id, &info);
+        app.refresh_cache();
+    }
+    Ok(stored)
 }
 
-/// The metric points one snapshot adds to the system's history, keyed by metric name.
-fn metric_points(payload: &PushPayload) -> impl Iterator<Item = (String, f32)> + '_ {
-    let scalars = [
-        ("cpu", payload.cpu_percent),
-        ("memory", payload.memory_percent),
-        ("swap", payload.swap_percent),
-        ("load1", payload.load_one as f32),
-        ("load5", payload.load_five as f32),
-    ];
-    let disks = payload
-        .disks
-        .iter()
-        .map(|disk| (format!("disk:{}", disk.mount_point), disk.usage_percent));
-    scalars
-        .into_iter()
-        .map(|(metric, value)| (metric.to_string(), value))
-        .chain(disks)
-}
-
-fn cache_live_metrics(app: &AppState, system_id: &str, payload: &PushPayload) {
-    let live = LiveMetrics {
-        cpu_percent: payload.cpu_percent,
-        memory_percent: payload.memory_percent,
-        load_one: payload.load_one,
-        disks: payload
-            .disks
-            .iter()
-            .map(|disk| (disk.mount_point.clone(), disk.usage_percent))
-            .collect(),
-        updated_at: payload.timestamp,
-    };
-    app.live_metrics
-        .write()
-        .unwrap()
-        .insert(system_id.to_string(), live);
-}
-
-/// Fills in system info while its hostname or OS is missing, marks the system online, and
-/// replaces a default name with the snapshot's hostname.
-fn update_registry(app: &AppState, system_id: &SystemId, payload: &PushPayload) {
+/// Fills in system info while its hostname or OS is missing, refreshes its memory capacity,
+/// and replaces a default name with the frame's hostname. The status went into the store.
+fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
     let id = system_id.as_str();
     let Some(sys) = app.db.get_system(id).ok().flatten() else {
         return;
@@ -155,31 +218,25 @@ fn update_registry(app: &AppState, system_id: &SystemId, payload: &PushPayload) 
     if (sys.hostname.is_none() || sys.os.is_none())
         && let Err(err) = app.db.update_system_info(
             id,
-            Some(&payload.os_name),
-            Some(&payload.hostname),
-            Some(&payload.kernel),
-            Some(&payload.cpu_model),
-            Some(payload.cpu_cores),
+            Some(&info.os_name),
+            Some(&info.hostname),
+            Some(&info.kernel),
+            Some(&info.cpu_model),
+            Some(info.cpu_cores),
         )
     {
         tracing::warn!("Push from {id:?}: couldn't record the system info: {err}");
     }
-    let reported = MemoryCapacity::reported(
-        Some(&payload.memory_total_display),
-        Some(payload.memory_total_bytes),
-    );
-    if let Some(capacity) = memory_capacity_refresh(MemoryCapacity::stored(&sys).as_ref(), reported)
+    if let Some(capacity) =
+        memory_capacity_refresh(MemoryCapacity::stored(&sys).as_ref(), info.memory.clone())
         && let Err(err) = app.db.update_memory_capacity(id, &capacity)
     {
         tracing::warn!("Push from {id:?}: couldn't refresh the memory capacity: {err}");
     }
-    let _ = app
-        .db
-        .update_system_status(id, &SystemStatus::Online, &payload.uptime_display, None);
     if system_id.is_default_name(&sys.name) {
         let _ = app
             .db
-            .update_system_config(id, Some(&payload.hostname), None, None, None, None);
+            .update_system_config(id, Some(&info.hostname), None, None, None, None);
     }
 }
 
@@ -365,6 +422,84 @@ pub(super) mod tests {
             rmp_serde::from_slice::<PushPayload>(&snapshot).is_ok(),
             "the snapshot itself decodes"
         );
+    }
+
+    /// Decodes a mirrored frame into the hub's `PushPayload`, as the receiver does.
+    fn payload(frame: &MirroredPushPayload) -> PushPayload {
+        rmp_serde::from_slice(&rmp_serde::to_vec(frame).unwrap()).unwrap()
+    }
+
+    /// RFC 0007 §1: a frame's timestamp becomes its snapshot time, at most `i64::MAX`.
+    #[test]
+    fn a_frame_is_refused_whole_only_for_a_timestamp_past_i64_max() {
+        let cases = [
+            ("zero", 0, Ok(0)),
+            ("i64::MAX", i64::MAX as u64, Ok(i64::MAX)),
+            (
+                "i64::MAX + 1",
+                i64::MAX as u64 + 1,
+                Err(SnapshotRefusal::TimestampOutOfRange),
+            ),
+            (
+                "u64::MAX",
+                u64::MAX,
+                Err(SnapshotRefusal::TimestampOutOfRange),
+            ),
+        ];
+        for (case, timestamp, expected) in cases {
+            let mut frame = sample_frame("host");
+            frame.timestamp = timestamp;
+            let parsed = SnapshotFrame::try_from(payload(&frame));
+            let time = parsed.map(|frame| frame.time.seconds());
+            assert_eq!(time, expected, "case: {case}");
+        }
+    }
+
+    /// RFC 0007 §1, §2: every scalar of a push frame is reported, and the uptime display is the
+    /// last seen only under the display rule.
+    #[test]
+    fn a_frame_reports_every_scalar_and_its_uptime_under_the_display_rule() {
+        let cases = [
+            ("an agent's display", "3d 4h 5m".to_string(), true),
+            ("64 bytes", "u".repeat(64), true),
+            (
+                "65 bytes, a 2-byte character across the bound",
+                format!("{}é", "u".repeat(63)),
+                false,
+            ),
+            ("empty", String::new(), false),
+            ("a newline", "3d\n4h".to_string(), false),
+            ("NEL", "3d\u{85}4h".to_string(), false),
+        ];
+        for (case, display, kept) in cases {
+            let mut frame = sample_frame("host");
+            frame.uptime_display = display.clone();
+            let parsed = SnapshotFrame::try_from(payload(&frame)).unwrap();
+            let expected = match kept {
+                true => LastSeen::Uptime(UptimeDisplay::try_from(display).unwrap()),
+                false => LastSeen::Unchanged,
+            };
+            assert_eq!(parsed.last_seen, expected, "case: {case}");
+            let reported = &parsed.reported;
+            let scalars = (
+                reported.cpu,
+                reported.memory,
+                reported.swap,
+                reported.load1,
+                reported.load5,
+            );
+            assert_eq!(
+                scalars,
+                (Some(11.0), Some(22.0), Some(33.0), Some(0.1), Some(0.2)),
+                "case: {case}"
+            );
+            let mounts: Vec<Option<&str>> = reported
+                .disks
+                .iter()
+                .map(|d| d.mount_point.as_deref())
+                .collect();
+            assert_eq!(mounts, [Some("/"), Some("/home")], "case: {case}");
+        }
     }
 
     /// RFC 0007 §4: registration keeps `Database`'s one lock convention, and panics on a

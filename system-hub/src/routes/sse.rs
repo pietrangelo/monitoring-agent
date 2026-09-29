@@ -24,7 +24,31 @@ use tokio::time::interval;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 
-use crate::state::AppState;
+use crate::snapshot::Scalar;
+use crate::state::{AppState, LiveMetrics};
+
+/// A system's live metrics as the summary event shows them: a value the snapshot rule left out
+/// is `null`, as a non-finite one always serialised.
+#[derive(Debug, serde::Serialize)]
+struct LiveMetricsDto<'a> {
+    cpu_percent: Option<f32>,
+    memory_percent: Option<f32>,
+    load_one: Option<f32>,
+    disks: Vec<(&'a str, f32)>,
+    updated_at: i64,
+}
+
+impl<'a> From<&'a LiveMetrics> for LiveMetricsDto<'a> {
+    fn from(live: &'a LiveMetrics) -> Self {
+        Self {
+            cpu_percent: live.snapshot.scalar(Scalar::Cpu),
+            memory_percent: live.snapshot.scalar(Scalar::Memory),
+            load_one: live.snapshot.scalar(Scalar::Load1),
+            disks: live.snapshot.disks().collect(),
+            updated_at: live.time.seconds(),
+        }
+    }
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -48,8 +72,12 @@ async fn summary_stream(
             .count();
         let active_alerts = s.db.count_active_alerts().unwrap_or(0);
 
-        // Include live metrics
+        // A copy of the entries' pointers, converted once the read lock is released.
         let live = s.live_metrics.read().unwrap().clone();
+        let live: std::collections::HashMap<&str, LiveMetricsDto> = live
+            .iter()
+            .map(|(id, metrics)| (id.as_str(), LiveMetricsDto::from(&**metrics)))
+            .collect();
 
         let payload = serde_json::json!({
             "type": "summary",
@@ -76,6 +104,7 @@ async fn summary_stream(
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::snapshot::{ReportedDisk, ReportedSnapshot, SnapshotTime, snapshot_rule};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -180,15 +209,57 @@ mod tests {
 
     /// The live metrics `the_summary_event_for_a_fixed_state_keeps_its_bytes` shows.
     fn plant_live_metrics(state: &AppState) {
-        state.live_metrics.write().unwrap().insert(
-            "sys-1".into(),
-            crate::state::LiveMetrics {
-                cpu_percent: 11.5,
-                memory_percent: 22.0,
-                load_one: 0.5,
-                disks: vec![("/".into(), 50.25), ("/home".into(), 70.0)],
-                updated_at: 1_700_000_000,
-            },
+        plant(state, reported(Some(11.5)));
+    }
+
+    fn reported(cpu: Option<f32>) -> ReportedSnapshot {
+        let disk = |mount: &str, usage| ReportedDisk {
+            mount_point: Some(mount.to_string()),
+            usage_percent: Some(usage),
+        };
+        ReportedSnapshot {
+            cpu,
+            memory: Some(22.0),
+            swap: Some(33.0),
+            load1: Some(0.5),
+            load5: Some(0.25),
+            disks: vec![disk("/", 50.25), disk("/home", 70.0)],
+        }
+    }
+
+    fn plant(state: &AppState, reported: ReportedSnapshot) {
+        let live = LiveMetrics {
+            snapshot: snapshot_rule(reported).0,
+            time: SnapshotTime::try_from(1_700_000_000).unwrap(),
+            left_out_warned_at: None,
+        };
+        let mut entries = state.live_metrics.write().unwrap();
+        entries.insert("sys-1".into(), Arc::new(live));
+    }
+
+    /// RFC 0007 §4: the dashboard's live values are the snapshot's kept values, and one left
+    /// out is `null` on the wire.
+    #[tokio::test]
+    async fn a_live_value_the_snapshot_rule_left_out_is_null_in_the_summary() {
+        let (state, _dir) = temp_state();
+        plant(&state, reported(None));
+
+        let event = first_event(state).await;
+
+        let json = event
+            .strip_prefix("data: ")
+            .and_then(|rest| rest.strip_suffix("\nevent: summary\n\n"))
+            .unwrap();
+        let summary: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            summary["live_metrics"]["sys-1"],
+            serde_json::json!({
+                "cpu_percent": null,
+                "memory_percent": 22.0,
+                "load_one": 0.5,
+                "disks": [["/", 50.25], ["/home", 70.0]],
+                "updated_at": 1_700_000_000,
+            })
         );
     }
 

@@ -21,28 +21,16 @@ use std::time::Instant;
 use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
 use crate::db::Database;
 use crate::models::SystemInfo;
-use serde::Serialize;
+use crate::snapshot::{Snapshot, SnapshotTime};
 
-/// Latest snapshot per system_id, kept in memory for the dashboard.
-#[derive(Debug, Clone, Serialize)]
+/// A system's latest snapshot, as the snapshot rule kept it, held for the dashboard (RFC 0007
+/// §4). Shared as an `Arc`, so a reader copies a pointer, never a disk.
+#[derive(Debug)]
 pub struct LiveMetrics {
-    pub cpu_percent: f32,
-    pub memory_percent: f32,
-    pub load_one: f64,
-    pub disks: Vec<(String, f32)>,
-    pub updated_at: u64,
-}
-
-impl Default for LiveMetrics {
-    fn default() -> Self {
-        Self {
-            cpu_percent: 0.0,
-            memory_percent: 0.0,
-            load_one: 0.0,
-            disks: Vec::new(),
-            updated_at: 0,
-        }
-    }
+    pub snapshot: Snapshot,
+    pub time: SnapshotTime,
+    /// When this system's left-out values were last logged at `warn` (RFC 0007 §1).
+    pub left_out_warned_at: Option<Instant>,
 }
 
 /// What the hub holds in memory of one system's applications (RFC 0009 §8).
@@ -61,8 +49,9 @@ pub struct SystemApplications {
 pub struct AppState {
     pub db: Arc<Database>,
     pub systems_cache: RwLock<Vec<SystemInfo>>,
-    /// Per-system latest live metrics (updated by push or poll).
-    pub live_metrics: RwLock<HashMap<String, LiveMetrics>>,
+    /// Per-system live metrics, written with each stored snapshot, keyed by system id. Lock
+    /// order: the database mutex, then this; never take the database mutex while holding it.
+    pub live_metrics: RwLock<HashMap<String, Arc<LiveMetrics>>>,
     /// Per-system applications, keyed by system id. Lock order: the database mutex, then
     /// this; never take the database mutex while holding it.
     pub live_applications: RwLock<HashMap<String, SystemApplications>>,
@@ -130,16 +119,6 @@ mod tests {
             poll_interval_secs: 10,
             enabled,
         }
-    }
-
-    #[test]
-    fn live_metrics_default_is_zeroed() {
-        let live = LiveMetrics::default();
-        assert_eq!(live.cpu_percent, 0.0);
-        assert_eq!(live.memory_percent, 0.0);
-        assert_eq!(live.load_one, 0.0);
-        assert!(live.disks.is_empty());
-        assert_eq!(live.updated_at, 0);
     }
 
     #[test]

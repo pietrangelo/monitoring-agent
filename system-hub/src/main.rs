@@ -28,6 +28,7 @@ mod retention;
 mod round_intake;
 mod routes;
 mod snapshot;
+mod snapshot_intake;
 mod state;
 
 use axum::Router;

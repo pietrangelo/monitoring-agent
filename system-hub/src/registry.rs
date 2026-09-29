@@ -54,8 +54,6 @@ impl UptimeDisplay {
 }
 
 /// What a system's `last_seen` column shows. Two meanings today, until RFC 0010's contact time.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot's callers).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LastSeen {
     /// Push: the frame's `uptime_display`, when it follows the display rule.
@@ -74,8 +72,6 @@ pub struct StatusUpdate {
     error: Option<String>,
 }
 
-// Wired into the adapters by RFC 0007 §2 (store_snapshot's callers).
-#[cfg_attr(not(test), allow(dead_code))]
 impl StatusUpdate {
     /// A stored snapshot: online, seen as given, no error.
     pub fn after_snapshot(last_seen: LastSeen) -> Self {

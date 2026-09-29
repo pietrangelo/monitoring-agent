@@ -7,8 +7,6 @@ use std::time::Instant;
 use crate::hourly_warning::{HourlyWarning, hourly_warning};
 
 /// A snapshot as an adapter read it, before the snapshot rule. `None`: not reported.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReportedSnapshot {
     pub cpu: Option<f32>,
@@ -21,8 +19,6 @@ pub struct ReportedSnapshot {
 }
 
 /// One disk as an adapter read it, before the snapshot rule.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReportedDisk {
     pub mount_point: Option<String>,
@@ -82,29 +78,21 @@ impl TryFrom<String> for MountPoint {
 }
 
 /// When a snapshot was taken, in Unix seconds: at most `i64::MAX` (SQLite's integer).
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotTime(i64);
 
 /// A snapshot time above `i64::MAX`.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot's callers).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotTimeOutOfRange;
 
 impl SnapshotTime {
     /// The time in Unix seconds.
-    // Wired into the adapters by RFC 0007 §2 (store_snapshot).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn seconds(self) -> i64 {
         self.0
     }
 
     /// The time `retention_secs` before this one, never before 0: a series' points older
     /// than it are past their retention.
-    // Wired into the adapters by RFC 0007 §2 (store_snapshot).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cutoff(self, retention_secs: u64) -> Self {
         Self(self.0.saturating_sub_unsigned(retention_secs).max(0))
     }
@@ -160,8 +148,6 @@ pub const MAX_MOUNT_POINT_BYTES: usize = 256;
 
 /// The snapshot rule: keeps every reported, finite value, and the first `MAX_DISKS` disks
 /// that pass, and counts the rest by reason.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn snapshot_rule(reported: ReportedSnapshot) -> (Snapshot, LeftOut) {
     let mut left_out = LeftOut::default();
     let scalars = keep_scalars(&reported, &mut left_out);
@@ -220,8 +206,6 @@ fn finite(value: Option<f32>) -> Result<f32, Refusal> {
     }
 }
 
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 impl Snapshot {
     /// The snapshot's metric points: cpu, memory, swap, load1, load5, then disk:<mount point>.
     pub fn metric_points(&self) -> impl Iterator<Item = (String, f32)> + '_ {
@@ -235,6 +219,21 @@ impl Snapshot {
             .map(|(MountPoint(mount), value)| (format!("disk:{mount}"), *value));
         scalars.chain(disks)
     }
+
+    /// The kept value of `scalar`; `None` when the rule left it out.
+    pub fn scalar(&self, scalar: Scalar) -> Option<f32> {
+        self.scalars
+            .iter()
+            .find(|(kept, _)| *kept == scalar)
+            .map(|(_, value)| *value)
+    }
+
+    /// The kept disks, as mount point and usage, in reported order.
+    pub fn disks(&self) -> impl Iterator<Item = (&str, f32)> + '_ {
+        self.disks
+            .iter()
+            .map(|(MountPoint(mount), usage)| (mount.as_str(), *usage))
+    }
 }
 
 /// How one snapshot's left-out values are logged.
@@ -247,8 +246,6 @@ pub enum LeftOutLog {
 
 /// Decides from when this system last warned, and returns the warning time the system's
 /// next live metrics keep: `previous` unchanged, or `now` after a `Warn`.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn left_out_log(
     previous: Option<Instant>,
     left_out: &LeftOut,
@@ -268,8 +265,6 @@ const DEFAULT_RETENTION_SECS: u64 = 86_400;
 
 /// A metric's retention in seconds, from its stored `metric_retention` value: no row or a
 /// negative value is a day, otherwise the stored value.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn snapshot_retention(stored: Option<i64>) -> u64 {
     stored
         .and_then(|secs| u64::try_from(secs).ok())
@@ -753,6 +748,30 @@ mod tests {
         .map(|(name, value)| (name.to_string(), value));
         let points: Vec<_> = snapshot.metric_points().collect();
         assert_eq!(points, expected.to_vec(), "case: every scalar and 3 disks");
+    }
+
+    #[test]
+    fn a_snapshot_reads_back_each_kept_scalar_and_none_for_one_left_out() {
+        let snapshot = kept(
+            &[(Scalar::Memory, 20.0), (Scalar::Load5, 2.5)],
+            &[("/", 50.0), ("/home", 70.0)],
+        );
+        let cases = [
+            ("cpu, left out", Scalar::Cpu, None),
+            ("memory, kept", Scalar::Memory, Some(20.0)),
+            ("swap, left out", Scalar::Swap, None),
+            ("load1, left out", Scalar::Load1, None),
+            ("load5, kept", Scalar::Load5, Some(2.5)),
+        ];
+        for (case, scalar, expected) in cases {
+            assert_eq!(snapshot.scalar(scalar), expected, "case: {case}");
+        }
+        let disks: Vec<(&str, f32)> = snapshot.disks().collect();
+        assert_eq!(
+            disks,
+            [("/", 50.0), ("/home", 70.0)],
+            "disks in reported order"
+        );
     }
 
     #[test]

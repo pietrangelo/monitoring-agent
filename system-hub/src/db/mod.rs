@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use crate::models::*;
 
 mod history;
-pub use history::RoundStored;
+pub use history::{RoundStored, SnapshotStored};
 
 /// Whether the system's row exists, on a connection the caller already holds.
 fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::Error> {
@@ -687,7 +687,7 @@ mod tests {
     fn delete_system_cascades_metrics_alerts_and_system_row() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 50.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 50.0, 100).unwrap();
         db.insert_alert(&AlertRecord {
             id: "alert-1".to_string(),
             system_id: "id-1".to_string(),

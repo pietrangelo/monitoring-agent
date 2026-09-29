@@ -148,46 +148,6 @@ pub struct UpdateSystemPayload {
     pub enabled: Option<bool>,
 }
 
-// ── Metric snapshot (received from agent) ──────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricSnapshot {
-    pub system_id: String,
-    pub timestamp: u64,
-    pub cpu_percent: f32,
-    pub memory_percent: f32,
-    pub swap_percent: f32,
-    pub load_one: f64,
-    pub load_five: f64,
-    pub load_fifteen: f64,
-    pub uptime_seconds: u64,
-    pub uptime_display: String,
-    pub memory_used_display: String,
-    pub memory_total_display: String,
-    pub memory_used_bytes: u64,
-    pub memory_total_bytes: u64,
-    pub cpu_logical_cores: usize,
-    pub disks: Vec<DiskSnapshot>,
-    pub top_processes: Vec<ProcessSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskSnapshot {
-    pub mount_point: String,
-    pub usage_percent: f32,
-    pub total_display: String,
-    pub used_display: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessSnapshot {
-    pub pid: u32,
-    pub name: String,
-    pub cpu_usage: f32,
-    pub memory_usage_display: String,
-    pub memory_percent: f32,
-}
-
 // ── Alert ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

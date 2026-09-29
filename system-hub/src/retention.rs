@@ -103,7 +103,7 @@ mod tests {
             let mut sys = system(id);
             sys.enabled = id != "disabled";
             db.insert_system(&sys).unwrap();
-            db.insert_metric(id, "cpu", 1.0, now).unwrap();
+            db.plant_point(id, "cpu", 1.0, now).unwrap();
         }
         let app = AppState::new(db);
         for id in ["a", "b", "disabled"] {

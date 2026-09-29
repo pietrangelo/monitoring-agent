@@ -867,7 +867,7 @@ mod tests {
                 enabled: true,
             })
             .unwrap();
-        state.db.insert_metric("id-1", "cpu", 42.0, 100).unwrap();
+        state.db.plant_point("id-1", "cpu", 42.0, 100).unwrap();
 
         let res = router(state)
             .oneshot(
@@ -922,8 +922,8 @@ mod tests {
                 enabled: true,
             })
             .unwrap();
-        state.db.insert_metric("id-1", "cpu", 10.0, 1).unwrap();
-        state.db.insert_metric("id-1", "memory", 20.0, 1).unwrap();
+        state.db.plant_point("id-1", "cpu", 10.0, 1).unwrap();
+        state.db.plant_point("id-1", "memory", 20.0, 1).unwrap();
 
         let res = router(state)
             .oneshot(

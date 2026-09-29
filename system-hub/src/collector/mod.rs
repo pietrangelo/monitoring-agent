@@ -14,15 +14,18 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::registry::{MemoryCapacity, memory_capacity_refresh};
+use crate::registry::{LastSeen, MemoryCapacity, memory_capacity_refresh};
 use serde::Deserialize;
+use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, interval};
 
-use crate::models::{
-    AlertRecord, DiskSnapshot, MetricSnapshot, ProcessSnapshot, SystemInfo, SystemStatus,
-};
+use crate::clock::unix_now;
+use crate::db::SnapshotStored;
+use crate::models::{AlertRecord, SystemId, SystemInfo, SystemStatus};
+use crate::snapshot::{LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime};
+use crate::snapshot_intake;
 use crate::state::AppState;
 
 mod application_poll;
@@ -39,10 +42,7 @@ struct AgentResponse {
     memory: Option<AgentMemory>,
     swap: Option<AgentSwap>,
     load_average: Option<AgentLoad>,
-    uptime_seconds: Option<u64>,
-    uptime_display: Option<String>,
     disks: Option<Vec<AgentDisk>>,
-    top_processes: Option<Vec<AgentProcess>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,8 +62,6 @@ struct AgentCpu {
 struct AgentMemory {
     total_bytes: Option<u64>,
     total_display: Option<String>,
-    used_display: Option<String>,
-    used_bytes: Option<u64>,
     usage_percent: Option<f32>,
 }
 
@@ -76,24 +74,12 @@ struct AgentSwap {
 struct AgentLoad {
     one: Option<f64>,
     five: Option<f64>,
-    fifteen: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AgentDisk {
     mount_point: Option<String>,
     usage_percent: Option<f32>,
-    total_display: Option<String>,
-    used_display: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentProcess {
-    pid: Option<u32>,
-    name: Option<String>,
-    cpu_usage: Option<f32>,
-    memory_usage_display: Option<String>,
-    memory_percent: Option<f32>,
 }
 
 // ── Collector ──────────────────────────────────────────
@@ -139,20 +125,12 @@ async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
         Ok(agent) => agent,
         Err(e) => return mark_offline(&state, system, &now, &format!("JSON parse error: {e}")),
     };
-
-    let online = state
-        .db
-        .update_system_status(&system.id, &SystemStatus::Online, &now, None);
-    warn_on_failure(online, "mark online", system);
-    if system.hostname.is_none() || system.os.is_none() {
-        record_system_info(&state, system, &agent);
+    if store_answer(&state, system, PolledAnswer::from(agent), now)
+        .await
+        .is_break()
+    {
+        return;
     }
-    refresh_memory_capacity(&state, system, &agent).await;
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    store_metrics(&state, &metric_snapshot(&system.id, agent, now_secs));
     store_agent_alerts(&state, system, &client).await;
     poll_applications(&state, system, &client).await;
 }
@@ -192,106 +170,151 @@ fn mark_offline(state: &AppState, system: &SystemInfo, now: &str, error: &str) {
     warn_on_failure(offline, "mark offline", system);
 }
 
+/// What a successful poll's answer reports, parsed at the edge (RFC 0007 §1): the snapshot,
+/// the system info, and the memory capacity. A value the agent didn't report stays `None`.
+struct PolledAnswer {
+    reported: ReportedSnapshot,
+    info: PolledInfo,
+    /// `None` unless the answer reports both halves within `MemoryCapacity::reported`'s bounds.
+    memory: Option<MemoryCapacity>,
+}
+
+/// The system info a poll's answer reports.
+struct PolledInfo {
+    os_name: Option<String>,
+    hostname: Option<String>,
+    kernel: Option<String>,
+    cpu_model: Option<String>,
+    cpu_cores: Option<usize>,
+}
+
+impl From<AgentResponse> for PolledAnswer {
+    fn from(agent: AgentResponse) -> Self {
+        let memory = agent.memory.as_ref();
+        let memory = MemoryCapacity::reported(
+            memory.and_then(|m| m.total_display.as_deref()),
+            memory.and_then(|m| m.total_bytes),
+        );
+        let cpu = agent.cpu.as_ref();
+        let info = PolledInfo {
+            os_name: agent
+                .os
+                .as_ref()
+                .and_then(|o| o.pretty_name.clone().or(o.name.clone())),
+            hostname: agent.hostname.clone(),
+            kernel: agent.kernel.clone(),
+            cpu_model: cpu.and_then(|c| c.model.clone()),
+            cpu_cores: cpu.and_then(|c| c.logical_cores),
+        };
+        Self {
+            reported: reported_snapshot(agent),
+            info,
+            memory,
+        }
+    }
+}
+
+/// The snapshot an agent's `/api/system` answer reports, before the snapshot rule.
+fn reported_snapshot(agent: AgentResponse) -> ReportedSnapshot {
+    let load = agent.load_average.as_ref();
+    let disks = agent.disks.unwrap_or_default().into_iter();
+    ReportedSnapshot {
+        cpu: agent.cpu.as_ref().and_then(|c| c.usage_percent),
+        memory: agent.memory.as_ref().and_then(|m| m.usage_percent),
+        swap: agent.swap.as_ref().and_then(|s| s.usage_percent),
+        load1: load.and_then(|l| l.one),
+        load5: load.and_then(|l| l.five),
+        disks: disks
+            .map(|d| ReportedDisk {
+                mount_point: d.mount_point,
+                usage_percent: d.usage_percent,
+            })
+            .collect(),
+    }
+}
+
+/// Stores a successful poll's answer off the async runtime, stamped with the hub's clock.
+/// The poll ends when the system is gone; a store that fails is logged, and the poll goes on.
+async fn store_answer(
+    state: &Arc<AppState>,
+    system: &SystemInfo,
+    answer: PolledAnswer,
+    polled_at: String,
+) -> ControlFlow<()> {
+    // Parsed once, as the applications poll does; only a push row stored before RFC 0005 can
+    // fail, and its `push://` poll fails before it gets here.
+    let Ok(id) = SystemId::try_from(system.id.clone()) else {
+        tracing::debug!("Not storing a poll of an invalid system id");
+        return ControlFlow::Break(());
+    };
+    let Ok(time) = SnapshotTime::try_from(unix_now()) else {
+        tracing::warn!("Poll of {:?}: the hub's clock is past i64::MAX", system.id);
+        return ControlFlow::Break(());
+    };
+    let (app, sys) = (Arc::clone(state), system.clone());
+    let unit = move || store_polled(&app, &sys, &id, answer, time, polled_at);
+    match tokio::task::spawn_blocking(unit).await {
+        Ok(Ok(SnapshotStored::Stored(_))) => ControlFlow::Continue(()),
+        Ok(Ok(SnapshotStored::SystemGone)) => {
+            tracing::debug!("Poll of {:?}: the system is gone", system.id);
+            ControlFlow::Break(())
+        }
+        Ok(Err(err)) => {
+            warn_on_failure(Err(err), "store the snapshot", system);
+            ControlFlow::Continue(())
+        }
+        Err(err) => {
+            tracing::error!(
+                "Poll of {:?}: the snapshot's store failed: {err}",
+                system.id
+            );
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+/// The poll's one unit of blocking work: the snapshot's store, which marks the system online,
+/// then, only once it is stored, the registry fill.
+fn store_polled(
+    app: &AppState,
+    system: &SystemInfo,
+    id: &SystemId,
+    answer: PolledAnswer,
+    time: SnapshotTime,
+    polled_at: String,
+) -> Result<SnapshotStored<LeftOutLog>, rusqlite::Error> {
+    let last_seen = LastSeen::PolledAt(polled_at);
+    let now = Instant::now();
+    let stored = snapshot_intake::store_snapshot(app, id, answer.reported, time, last_seen, now)?;
+    if let SnapshotStored::Stored(_) = stored {
+        if system.hostname.is_none() || system.os.is_none() {
+            record_system_info(app, system, &answer.info);
+        }
+        refresh_memory_capacity(app, system, answer.memory);
+    }
+    Ok(stored)
+}
+
 /// Fills in a system's static info from its first successful poll.
-fn record_system_info(state: &AppState, system: &SystemInfo, agent: &AgentResponse) {
-    let os_name = agent
-        .os
-        .as_ref()
-        .and_then(|o| o.pretty_name.as_deref().or(o.name.as_deref()));
-    let cpu_model = agent.cpu.as_ref().and_then(|c| c.model.as_deref());
-    let cpu_cores = agent.cpu.as_ref().and_then(|c| c.logical_cores);
-    let recorded = state.db.update_system_info(
+fn record_system_info(app: &AppState, system: &SystemInfo, info: &PolledInfo) {
+    let recorded = app.db.update_system_info(
         &system.id,
-        os_name,
-        agent.hostname.as_deref(),
-        agent.kernel.as_deref(),
-        cpu_model,
-        cpu_cores,
+        info.os_name.as_deref(),
+        info.hostname.as_deref(),
+        info.kernel.as_deref(),
+        info.cpu_model.as_deref(),
+        info.cpu_cores,
     );
     warn_on_failure(recorded, "record system info", system);
 }
 
 /// Stores the memory capacity the answer reports when it differs from the stored one
-/// (RFC 0014 §8): unlike the rest of the system's info, it follows every poll. The write runs
-/// on the blocking pool, awaited, so SQLite never holds a runtime thread.
-async fn refresh_memory_capacity(
-    state: &Arc<AppState>,
-    system: &SystemInfo,
-    agent: &AgentResponse,
-) {
-    let memory = agent.memory.as_ref();
-    let reported = MemoryCapacity::reported(
-        memory.and_then(|m| m.total_display.as_deref()),
-        memory.and_then(|m| m.total_bytes),
-    );
-    let Some(capacity) = memory_capacity_refresh(MemoryCapacity::stored(system).as_ref(), reported)
-    else {
-        return;
-    };
-    let (state, id) = (Arc::clone(state), system.id.clone());
-    let refreshed =
-        tokio::task::spawn_blocking(move || state.db.update_memory_capacity(&id, &capacity)).await;
-    match refreshed {
-        Ok(result) => warn_on_failure(result, "refresh the memory capacity", system),
-        Err(err) => tracing::warn!(
-            "Poll of {:?}: the memory capacity write failed: {err}",
-            system.id
-        ),
-    }
-}
-
-/// The snapshot an agent's `/api/system` answer describes, stamped with the hub's clock.
-fn metric_snapshot(system_id: &str, agent: AgentResponse, now_secs: u64) -> MetricSnapshot {
-    let cpu = agent.cpu.as_ref();
-    let memory = agent.memory.as_ref();
-    let load = agent.load_average.as_ref();
-    MetricSnapshot {
-        system_id: system_id.to_string(),
-        timestamp: now_secs,
-        cpu_percent: cpu.and_then(|c| c.usage_percent).unwrap_or(0.0),
-        memory_percent: memory.and_then(|m| m.usage_percent).unwrap_or(0.0),
-        swap_percent: agent
-            .swap
-            .as_ref()
-            .and_then(|s| s.usage_percent)
-            .unwrap_or(0.0),
-        load_one: load.and_then(|l| l.one).unwrap_or(0.0),
-        load_five: load.and_then(|l| l.five).unwrap_or(0.0),
-        load_fifteen: load.and_then(|l| l.fifteen).unwrap_or(0.0),
-        uptime_seconds: agent.uptime_seconds.unwrap_or(0),
-        uptime_display: agent.uptime_display.clone().unwrap_or_default(),
-        memory_used_display: memory
-            .and_then(|m| m.used_display.clone())
-            .unwrap_or_default(),
-        memory_total_display: memory
-            .and_then(|m| m.total_display.clone())
-            .unwrap_or_default(),
-        memory_used_bytes: memory.and_then(|m| m.used_bytes).unwrap_or(0),
-        memory_total_bytes: memory.and_then(|m| m.total_bytes).unwrap_or(0),
-        cpu_logical_cores: cpu.and_then(|c| c.logical_cores).unwrap_or(0),
-        disks: agent
-            .disks
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| DiskSnapshot {
-                mount_point: d.mount_point.unwrap_or_default(),
-                usage_percent: d.usage_percent.unwrap_or(0.0),
-                total_display: d.total_display.unwrap_or_default(),
-                used_display: d.used_display.unwrap_or_default(),
-            })
-            .collect(),
-        top_processes: agent
-            .top_processes
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| ProcessSnapshot {
-                pid: p.pid.unwrap_or(0),
-                name: p.name.unwrap_or_default(),
-                cpu_usage: p.cpu_usage.unwrap_or(0.0),
-                memory_usage_display: p.memory_usage_display.unwrap_or_default(),
-                memory_percent: p.memory_percent.unwrap_or(0.0),
-            })
-            .collect(),
+/// (RFC 0014 §8): unlike the rest of the system's info, it follows every poll.
+fn refresh_memory_capacity(app: &AppState, system: &SystemInfo, reported: Option<MemoryCapacity>) {
+    let stored = MemoryCapacity::stored(system);
+    if let Some(capacity) = memory_capacity_refresh(stored.as_ref(), reported) {
+        let refreshed = app.db.update_memory_capacity(&system.id, &capacity);
+        warn_on_failure(refreshed, "refresh the memory capacity", system);
     }
 }
 
@@ -348,45 +371,6 @@ fn alert_record(
     }
 }
 
-fn store_metrics(state: &AppState, snap: &MetricSnapshot) {
-    let ts = snap.timestamp;
-    let sid = &snap.system_id;
-
-    let _ = state.db.insert_metric(sid, "cpu", snap.cpu_percent, ts);
-    let _ = state
-        .db
-        .insert_metric(sid, "memory", snap.memory_percent, ts);
-    let _ = state.db.insert_metric(sid, "swap", snap.swap_percent, ts);
-    let _ = state
-        .db
-        .insert_metric(sid, "load1", snap.load_one as f32, ts);
-    let _ = state
-        .db
-        .insert_metric(sid, "load5", snap.load_five as f32, ts);
-
-    for disk in &snap.disks {
-        let metric = format!("disk:{}", disk.mount_point);
-        let _ = state.db.insert_metric(sid, &metric, disk.usage_percent, ts);
-    }
-
-    // Update live metrics cache
-    let mut live = state.live_metrics.write().unwrap();
-    live.insert(
-        sid.clone(),
-        crate::state::LiveMetrics {
-            cpu_percent: snap.cpu_percent,
-            memory_percent: snap.memory_percent,
-            load_one: snap.load_one,
-            disks: snap
-                .disks
-                .iter()
-                .map(|d| (d.mount_point.clone(), d.usage_percent))
-                .collect(),
-            updated_at: ts,
-        },
-    );
-}
-
 fn unix_to_iso8601(secs: u64) -> String {
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
@@ -429,6 +413,7 @@ fn is_leap(y: i64) -> bool {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::snapshot::Scalar;
     use axum::{Json, Router, routing::get};
 
     fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
@@ -521,7 +506,99 @@ mod tests {
         assert_eq!(disk_points.len(), 1);
 
         let live = state.live_metrics.read().unwrap();
-        assert_eq!(live.get("id-1").unwrap().cpu_percent, 12.5);
+        let cpu = live.get("id-1").unwrap().snapshot.scalar(Scalar::Cpu);
+        assert_eq!(cpu, Some(12.5));
+    }
+
+    /// A mock agent answering `/api/system` with `system_json` and reporting no alerts.
+    async fn agent_answering(system_json: serde_json::Value) -> String {
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let v = system_json.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(|| async { Json(serde_json::json!({"active": []})) }),
+            );
+        spawn_mock_agent(app).await
+    }
+
+    fn point_count(state: &AppState, metric: &str) -> usize {
+        state
+            .db
+            .get_metrics("id-1", metric, 2_000, None)
+            .unwrap()
+            .len()
+    }
+
+    /// RFC 0007 §1: a poll keeps what the snapshot rule keeps. A value the agent didn't report
+    /// is no point (not `0.0`), a disk without a mount point is no `disk:` point, and only the
+    /// first 1024 valid disks are kept.
+    #[tokio::test]
+    async fn a_poll_stores_what_the_snapshot_rule_keeps() {
+        let (state, _dir) = temp_state();
+        let mut disks: Vec<_> = (0..1025)
+            .map(|i| serde_json::json!({"mount_point": format!("/d{i}"), "usage_percent": 1.0}))
+            .collect();
+        disks.insert(1, serde_json::json!({"usage_percent": 99.0}));
+        let url = agent_answering(serde_json::json!({
+            "cpu": {"logical_cores": 4},
+            "memory": {"usage_percent": 50.0},
+            "swap": {"usage_percent": 5.0},
+            "load_average": {"one": 0.5, "five": 0.25},
+            "disks": disks,
+        }))
+        .await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let cases = [
+            ("cpu", 0),
+            ("memory", 1),
+            ("swap", 1),
+            ("load1", 1),
+            ("load5", 1),
+            ("disk:", 0),
+            ("disk:/d0", 1),
+            ("disk:/d1023", 1),
+            ("disk:/d1024", 0),
+        ];
+        for (metric, expected) in cases {
+            assert_eq!(point_count(&state, metric), expected, "metric: {metric}");
+        }
+        let live = state
+            .live_metrics
+            .read()
+            .unwrap()
+            .get("id-1")
+            .cloned()
+            .unwrap();
+        assert_eq!(live.snapshot.scalar(Scalar::Cpu), None, "live cpu left out");
+        assert_eq!(live.snapshot.disks().count(), 1024, "live disks");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Online);
+    }
+
+    /// RFC 0007 §4: a poll racing a delete writes nothing, not even live metrics.
+    #[tokio::test]
+    async fn a_system_deleted_before_its_poll_gets_no_points_and_no_live_metrics() {
+        let (state, _dir) = temp_state();
+        let url = agent_answering(serde_json::json!({"cpu": {"usage_percent": 12.5}})).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+        state.db.delete_system("id-1").unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 0);
+        assert!(!state.live_metrics.read().unwrap().contains_key("id-1"));
+        assert!(state.db.get_system("id-1").unwrap().is_none());
     }
 
     /// RFC 0014 §8: a poll refreshes the memory capacity when its answer has both halves, and
@@ -797,66 +874,50 @@ mod tests {
         assert!(updated.last_error.is_some());
     }
 
+    /// RFC 0007 §1: the poll's edge maps what the agent reported, and nothing it didn't:
+    /// a value missing from the answer stays `None`, never `0.0`, and so does a mount point.
     #[test]
-    fn store_metrics_writes_all_metrics_and_updates_live_cache() {
-        let (state, _dir) = {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("test.db");
-            let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-            db.insert_system(&sample_system("id-1", "http://x".to_string()))
-                .unwrap();
-            (AppState::new(db), dir)
-        };
-
-        let snap = MetricSnapshot {
-            system_id: "id-1".to_string(),
-            timestamp: 100,
-            cpu_percent: 10.0,
-            memory_percent: 20.0,
-            swap_percent: 5.0,
-            load_one: 0.1,
-            load_five: 0.2,
-            load_fifteen: 0.3,
-            uptime_seconds: 60,
-            uptime_display: "1m".to_string(),
-            memory_used_display: "1 GB".to_string(),
-            memory_total_display: "4 GB".to_string(),
-            memory_used_bytes: 1_000_000,
-            memory_total_bytes: 4_000_000,
-            cpu_logical_cores: 4,
-            disks: vec![DiskSnapshot {
-                mount_point: "/".to_string(),
-                usage_percent: 33.0,
-                total_display: "10G".to_string(),
-                used_display: "3G".to_string(),
-            }],
-            top_processes: vec![],
-        };
-
-        store_metrics(&state, &snap);
-
-        assert_eq!(
-            state.db.get_metrics("id-1", "cpu", 10, None).unwrap()[0].value,
-            10.0
-        );
-        assert_eq!(
-            state.db.get_metrics("id-1", "memory", 10, None).unwrap()[0].value,
-            20.0
-        );
-        assert_eq!(
-            state.db.get_metrics("id-1", "swap", 10, None).unwrap()[0].value,
-            5.0
-        );
-        assert_eq!(
-            state.db.get_metrics("id-1", "disk:/", 10, None).unwrap()[0].value,
-            33.0
-        );
-
-        let live = state.live_metrics.read().unwrap();
-        let m = live.get("id-1").unwrap();
-        assert_eq!(m.cpu_percent, 10.0);
-        assert_eq!(m.disks, vec![("/".to_string(), 33.0)]);
-        assert_eq!(m.updated_at, 100);
+    fn a_poll_answer_parses_into_what_the_agent_reported_and_nothing_more() {
+        let full = r#"{"cpu":{"usage_percent":12.5},"memory":{"usage_percent":50.0},
+            "swap":{"usage_percent":5.0},"load_average":{"one":0.5,"five":0.25},
+            "disks":[{"mount_point":"/","usage_percent":40.0},{"usage_percent":60.0}]}"#;
+        let cases = [
+            (
+                "every value reported",
+                full,
+                ReportedSnapshot {
+                    cpu: Some(12.5),
+                    memory: Some(50.0),
+                    swap: Some(5.0),
+                    load1: Some(0.5),
+                    load5: Some(0.25),
+                    disks: vec![
+                        ReportedDisk {
+                            mount_point: Some("/".into()),
+                            usage_percent: Some(40.0),
+                        },
+                        ReportedDisk {
+                            mount_point: None,
+                            usage_percent: Some(60.0),
+                        },
+                    ],
+                },
+            ),
+            ("nothing reported", "{}", ReportedSnapshot::default()),
+            (
+                "empty sections",
+                r#"{"cpu":{},"memory":{},"swap":{},"load_average":{},"disks":[{}]}"#,
+                ReportedSnapshot {
+                    disks: vec![ReportedDisk::default()],
+                    ..ReportedSnapshot::default()
+                },
+            ),
+        ];
+        for (case, body, expected) in cases {
+            let agent: AgentResponse = serde_json::from_str(body).unwrap();
+            let answer = PolledAnswer::from(agent);
+            assert_eq!(answer.reported, expected, "case: {case}");
+        }
     }
 
     #[test]
@@ -866,7 +927,6 @@ mod tests {
         assert!(resp.os.is_none());
         assert!(resp.cpu.is_none());
         assert!(resp.disks.is_none());
-        assert!(resp.top_processes.is_none());
     }
 
     #[test]

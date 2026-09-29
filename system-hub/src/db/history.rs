@@ -90,8 +90,6 @@ impl Database {
     /// `time`, each followed by a capped prune of its series; then `status`; then the commit,
     /// and `on_stored` with the snapshot, still under the mutex. `on_stored` must not call back
     /// into `Database` (the mutex isn't reentrant) and must not panic.
-    // Wired into the adapters by RFC 0007 §2 (store_snapshot's callers).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn store_snapshot<R>(
         &self,
         system_id: &SystemId,
@@ -109,35 +107,6 @@ impl Database {
         write_status(&tx, system_id, &status)?;
         tx.commit()?;
         Ok(SnapshotStored::Stored(on_stored(snapshot)))
-    }
-
-    pub fn insert_metric(
-        &self,
-        system_id: &str,
-        metric: &str,
-        value: f32,
-        timestamp: u64,
-    ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO metrics (system_id, metric, value, timestamp) VALUES (?1,?2,?3,?4)",
-            rusqlite::params![system_id, metric, value, timestamp],
-        )?;
-
-        let retention: u64 = conn
-            .query_row(
-                "SELECT retention_secs FROM metric_retention WHERE system_id=?1 AND metric=?2",
-                rusqlite::params![system_id, metric],
-                |row| row.get(0),
-            )
-            .unwrap_or(86400);
-
-        let cutoff = timestamp.saturating_sub(retention);
-        conn.execute(
-            "DELETE FROM metrics WHERE system_id=?1 AND metric=?2 AND timestamp < ?3",
-            rusqlite::params![system_id, metric, cutoff],
-        )?;
-        Ok(())
     }
 
     /// Stores one scrape round's points, if `decide` admits it, holding the connection mutex
@@ -282,6 +251,25 @@ impl Database {
     }
 }
 
+#[cfg(test)]
+impl Database {
+    /// Inserts one metric point as given, with no prune, for tests that need history in place.
+    pub fn plant_point(
+        &self,
+        system_id: &str,
+        metric: &str,
+        value: f32,
+        timestamp: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            INSERT_POINT,
+            rusqlite::params![system_id, metric, value, timestamp],
+        )?;
+        Ok(())
+    }
+}
+
 /// Inserts each of the snapshot's metric points at `time`, each followed by the capped prune
 /// of its series past the series' retention.
 fn store_points(
@@ -348,12 +336,12 @@ mod tests {
     use crate::db::tests::{sample_system, temp_db};
 
     #[test]
-    fn insert_metric_and_get_metrics_round_trip() {
+    fn get_metrics_returns_planted_points_oldest_first() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 10.0, 100).unwrap();
-        db.insert_metric("id-1", "cpu", 20.0, 200).unwrap();
-        db.insert_metric("id-1", "cpu", 30.0, 300).unwrap();
+        db.plant_point("id-1", "cpu", 10.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 20.0, 200).unwrap();
+        db.plant_point("id-1", "cpu", 30.0, 300).unwrap();
 
         let points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
         assert_eq!(points.len(), 3);
@@ -367,7 +355,7 @@ mod tests {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
         for i in 0..10 {
-            db.insert_metric("id-1", "cpu", i as f32, 100 + i).unwrap();
+            db.plant_point("id-1", "cpu", i as f32, 100 + i).unwrap();
         }
         let points = db.get_metrics("id-1", "cpu", 3, None).unwrap();
         assert_eq!(points.len(), 3);
@@ -377,9 +365,9 @@ mod tests {
     fn get_metrics_with_since_filters_and_stays_ascending() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 1.0, 100).unwrap();
-        db.insert_metric("id-1", "cpu", 2.0, 200).unwrap();
-        db.insert_metric("id-1", "cpu", 3.0, 300).unwrap();
+        db.plant_point("id-1", "cpu", 1.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 2.0, 200).unwrap();
+        db.plant_point("id-1", "cpu", 3.0, 300).unwrap();
 
         let points = db.get_metrics("id-1", "cpu", 100, Some(150)).unwrap();
         assert_eq!(points.len(), 2);
@@ -391,26 +379,12 @@ mod tests {
     fn get_metrics_different_metric_names_are_isolated() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 1.0, 100).unwrap();
-        db.insert_metric("id-1", "memory", 2.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 1.0, 100).unwrap();
+        db.plant_point("id-1", "memory", 2.0, 100).unwrap();
 
         let cpu_points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
         assert_eq!(cpu_points.len(), 1);
         assert_eq!(cpu_points[0].value, 1.0);
-    }
-
-    #[test]
-    fn insert_metric_applies_default_retention_cutoff() {
-        let (db, _dir) = temp_db();
-        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        // Default retention is 86400s. First point at ts=0.
-        db.insert_metric("id-1", "cpu", 1.0, 0).unwrap();
-        // Second point far enough ahead that the cutoff (ts - 86400) prunes the first.
-        db.insert_metric("id-1", "cpu", 2.0, 100_000).unwrap();
-
-        let points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
-        assert_eq!(points.len(), 1);
-        assert_eq!(points[0].timestamp, 100_000);
     }
 
     mod rounds {

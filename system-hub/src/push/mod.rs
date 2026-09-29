@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use crate::application_wire;
 use crate::applications::{ScrapeRound, SourcePace};
 use crate::clock::unix_now;
-use crate::db::RoundStored;
+use crate::db::{RoundStored, SnapshotStored};
 use crate::models::{SystemId, SystemIdError};
 use crate::round_intake::{self, Arrival};
 
@@ -38,7 +38,7 @@ mod config;
 mod ingest;
 use crate::state::AppState;
 pub use config::{PushAuth, PushAuthError, PushConfig};
-use ingest::{PushPayload, ingest_frame, mark_offline, register_if_new};
+use ingest::{PushPayload, SnapshotFrame, ingest_frame, mark_offline, register_if_new};
 
 /// The push handshake's first message. No `Debug`: `token` holds the presented secret.
 #[derive(Deserialize)]
@@ -287,27 +287,21 @@ async fn send_answer(socket: &mut WebSocket, answer: String) -> Answer {
 /// deadline, sends an oversize message, or ingestion fails. tungstenite answers pings on its
 /// own, so the hub never awaits a send here.
 async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &SystemId) {
-    let mut rounds = ConnectionRounds::new(Instant::now());
-    receive_until_end(socket, ctx, system_id, &mut rounds).await;
-    if rounds.refusals > 0 {
-        tracing::info!(
-            "Push connection of {:?} refused {} application frame(s)",
-            system_id.as_str(),
-            rounds.refusals
-        );
-    }
+    let mut connection = ConnectionState::new(Instant::now());
+    receive_until_end(socket, ctx, system_id, &mut connection).await;
+    connection.log_counts(system_id);
 }
 
 async fn receive_until_end(
     socket: &mut WebSocket,
     ctx: &PushContext,
     system_id: &SystemId,
-    rounds: &mut ConnectionRounds,
+    connection: &mut ConnectionState,
 ) {
     loop {
         match recv_within(socket, ctx.config.idle_timeout).await {
             Received::Message(Message::Binary(data)) => {
-                if let Err(stop) = ingest(ctx, system_id, &data, rounds).await {
+                if let Err(stop) = ingest(ctx, system_id, &data, connection).await {
                     tracing::info!(
                         "Ending the push connection of {:?}: {stop:?}",
                         system_id.as_str()
@@ -340,38 +334,73 @@ async fn receive_until_end(
     }
 }
 
-/// What one push connection keeps of the rounds it sends: its own pace, and how many of its
-/// application frames were refused.
-struct ConnectionRounds {
+/// What one push connection keeps between messages: its rounds' pace, and how many of its
+/// frames it refused or failed to store.
+struct ConnectionState {
     pace: SourcePace,
-    refusals: u64,
+    refused_application_frames: Tally,
+    refused_snapshot_frames: Tally,
+    store_errors: Tally,
 }
 
-impl ConnectionRounds {
+impl ConnectionState {
     fn new(now: Instant) -> Self {
         Self {
             pace: SourcePace::new(now),
-            refusals: 0,
+            refused_application_frames: Tally::default(),
+            refused_snapshot_frames: Tally::default(),
+            store_errors: Tally::default(),
         }
     }
 
-    /// Counts a refused application frame, and says whether it is the connection's first:
-    /// logged at `warn`, the rest at `debug`, so a sender can't flood the log.
-    fn note_refusal(&mut self) -> RefusedFrame {
-        self.refusals += 1;
-        if self.refusals == 1 {
-            RefusedFrame::First
-        } else {
-            RefusedFrame::Repeat
+    /// Logs each count the connection ended with at `info`, beside the per-frame lines.
+    fn log_counts(&self, system_id: &SystemId) {
+        let counts = [
+            (
+                self.refused_application_frames,
+                "application frame(s) refused",
+            ),
+            (self.refused_snapshot_frames, "snapshot frame(s) refused"),
+            (self.store_errors, "snapshot(s) that failed to store"),
+        ];
+        for (Tally(count), what) in counts.into_iter().filter(|(tally, _)| tally.0 > 0) {
+            tracing::info!(
+                "Push connection of {:?}: {count} {what}",
+                system_id.as_str()
+            );
         }
     }
 }
 
-/// Which of a connection's refused application frames this is.
+/// How often one thing happened on a connection.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally(u64);
+
+impl Tally {
+    /// Counts one more, and says whether it is the connection's first.
+    fn note(&mut self) -> Occurrence {
+        self.0 += 1;
+        match self.0 {
+            1 => Occurrence::First,
+            _ => Occurrence::Repeat,
+        }
+    }
+}
+
+/// Whether something happened on a connection for the first time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefusedFrame {
+enum Occurrence {
     First,
     Repeat,
+}
+
+/// Logs a connection's first occurrence of something at `warn`, and the rest at `debug`, so a
+/// sender can't flood the log.
+fn warn_first(occurrence: Occurrence, message: &str) {
+    match occurrence {
+        Occurrence::First => tracing::warn!("{message}"),
+        Occurrence::Repeat => tracing::debug!("{message}"),
+    }
 }
 
 /// Why a push connection stops ingesting.
@@ -389,29 +418,54 @@ async fn ingest(
     ctx: &PushContext,
     system_id: &SystemId,
     data: &[u8],
-    rounds: &mut ConnectionRounds,
+    connection: &mut ConnectionState,
 ) -> Result<(), IngestStop> {
     if let Ok(payload) = rmp_serde::from_slice::<PushPayload>(data) {
-        let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, &payload);
-        return on_blocking_pool(&ctx.app, system_id, work)
-            .await
-            .map_err(|_| IngestStop::WorkFailed);
+        return ingest_snapshot(ctx, system_id, payload, connection).await;
     }
     let Some(frame) = application_wire::decode(data) else {
         return Ok(());
     };
     match ScrapeRound::try_from(frame) {
-        Ok(round) => ingest_round(ctx, system_id, round, rounds).await,
+        Ok(round) => ingest_round(ctx, system_id, round, connection).await,
         Err(refusal) => {
-            let id = system_id.as_str();
-            match rounds.note_refusal() {
-                RefusedFrame::First => {
-                    tracing::warn!("Refused an application frame from {id:?}: {refusal:?}")
-                }
-                RefusedFrame::Repeat => {
-                    tracing::debug!("Refused an application frame from {id:?}: {refusal:?}")
-                }
-            }
+            let message = format!(
+                "Refused an application frame from {:?}: {refusal:?}",
+                system_id.as_str()
+            );
+            warn_first(connection.refused_application_frames.note(), &message);
+            Ok(())
+        }
+    }
+}
+
+/// Parses a decoded snapshot frame at the edge and stores it off the async runtime. A refused
+/// frame, or one that fails to store, leaves the connection open; a gone system ends it.
+async fn ingest_snapshot(
+    ctx: &PushContext,
+    system_id: &SystemId,
+    payload: PushPayload,
+    connection: &mut ConnectionState,
+) -> Result<(), IngestStop> {
+    let id = system_id.as_str();
+    let frame = match SnapshotFrame::try_from(payload) {
+        Ok(frame) => frame,
+        Err(refusal) => {
+            let message = format!("Refused a snapshot frame from {id:?}: {refusal:?}");
+            warn_first(connection.refused_snapshot_frames.note(), &message);
+            return Ok(());
+        }
+    };
+    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, frame);
+    let stored = on_blocking_pool(&ctx.app, system_id, work)
+        .await
+        .map_err(|_| IngestStop::WorkFailed)?;
+    match stored {
+        Ok(SnapshotStored::Stored(_)) => Ok(()),
+        Ok(SnapshotStored::SystemGone) => Err(IngestStop::SystemGone),
+        Err(err) => {
+            let message = format!("Storing a snapshot from {id:?} failed: {err}");
+            warn_first(connection.store_errors.note(), &message);
             Ok(())
         }
     }
@@ -422,9 +476,9 @@ async fn ingest_round(
     ctx: &PushContext,
     system_id: &SystemId,
     round: ScrapeRound,
-    rounds: &mut ConnectionRounds,
+    connection: &mut ConnectionState,
 ) -> Result<(), IngestStop> {
-    let pace = rounds.pace;
+    let pace = connection.pace;
     let work = move |app: &AppState, id: &SystemId| {
         let arrival = Arrival {
             now: Instant::now(),
@@ -435,7 +489,7 @@ async fn ingest_round(
     let (stored, pace) = on_blocking_pool(&ctx.app, system_id, work)
         .await
         .map_err(|_| IngestStop::WorkFailed)?;
-    rounds.pace = pace;
+    connection.pace = pace;
     match stored {
         Ok(RoundStored::SystemGone) => Err(IngestStop::SystemGone),
         Ok(RoundStored::Stored | RoundStored::Duplicate | RoundStored::TooSoon) => Ok(()),
@@ -475,11 +529,12 @@ async fn on_blocking_pool<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::ingest::tests::{MirroredProcess, MirroredPushPayload, sample_frame};
+    use super::ingest::tests::{MirroredDisk, MirroredProcess, MirroredPushPayload, sample_frame};
     use super::*;
     use crate::db::Database;
     use crate::models::SystemStatus;
     use crate::registry::MemoryCapacity;
+    use crate::snapshot::Scalar;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -1685,14 +1740,21 @@ mod tests {
             .get(system_id)
             .cloned()
             .unwrap();
-        assert_eq!(live.cpu_percent, 11.0);
-        assert_eq!(live.memory_percent, 22.0);
-        assert_eq!(live.load_one, 0.1);
+        let scalars = [
+            Scalar::Cpu,
+            Scalar::Memory,
+            Scalar::Swap,
+            Scalar::Load1,
+            Scalar::Load5,
+        ]
+        .map(|scalar| live.snapshot.scalar(scalar));
         assert_eq!(
-            live.disks,
-            vec![("/".to_string(), 50.0), ("/home".to_string(), 70.0)]
+            scalars,
+            [Some(11.0), Some(22.0), Some(33.0), Some(0.1), Some(0.2)]
         );
-        assert_eq!(live.updated_at, 1_700_000_000);
+        let disks: Vec<(&str, f32)> = live.snapshot.disks().collect();
+        assert_eq!(disks, [("/", 50.0), ("/home", 70.0)]);
+        assert_eq!(live.time.seconds(), 1_700_000_000);
         let cached_name = |state: &AppState| {
             let cache = state.systems_cache.read().unwrap();
             let cached = cache.iter().find(|s| s.id == system_id).cloned().unwrap();
@@ -1713,6 +1775,180 @@ mod tests {
             cached_name(&state),
             ("host1".to_string(), SystemStatus::Offline),
             "systems cache is refreshed after the offline marking"
+        );
+    }
+
+    /// Sends one binary message and waits until the hub has handled it.
+    async fn send_and_sync(ws: &mut AgentSocket, bytes: Vec<u8>) {
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Binary(bytes)).await.unwrap();
+        wait_until_hub_caught_up(ws).await;
+    }
+
+    fn points(state: &AppState, system_id: &str, metric: &str) -> usize {
+        state
+            .db
+            .get_metrics(system_id, metric, 2_000, None)
+            .unwrap()
+            .len()
+    }
+
+    /// RFC 0007 §1: a push frame keeps what the snapshot rule keeps, in history and in live
+    /// metrics: no NaN, no mount point past 256 bytes, and the first 1024 valid disks.
+    #[tokio::test]
+    async fn a_push_frame_stores_what_the_snapshot_rule_keeps() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-rule").await;
+        let mut frame = sample_frame("host1");
+        frame.cpu_percent = f32::NAN;
+        let disk = |mount_point: String| MirroredDisk {
+            mount_point,
+            usage_percent: 1.0,
+            total_display: String::new(),
+            used_display: String::new(),
+        };
+        frame.disks = (0..1025).map(|i| disk(format!("/d{i}"))).collect();
+        frame.disks.insert(1, disk(format!("/{}", "x".repeat(256))));
+
+        send_and_sync(&mut ws, rmp_serde::to_vec(&frame).unwrap()).await;
+
+        let long = format!("disk:/{}", "x".repeat(256));
+        let cases = [
+            ("cpu", 0),
+            ("memory", 1),
+            ("swap", 1),
+            ("load1", 1),
+            ("load5", 1),
+            ("disk:/d0", 1),
+            ("disk:/d1023", 1),
+            ("disk:/d1024", 0),
+            (long.as_str(), 0),
+        ];
+        for (metric, expected) in cases {
+            assert_eq!(points(&state, "sys-rule", metric), expected, "{metric}");
+        }
+        let live = state.live_metrics.read().unwrap().get("sys-rule").cloned();
+        let live = live.expect("live metrics written");
+        assert_eq!(live.snapshot.scalar(Scalar::Cpu), None, "live cpu left out");
+        assert_eq!(live.snapshot.disks().count(), 1024, "live disks");
+    }
+
+    /// RFC 0007 §1: a timestamp SQLite can't hold refuses the frame whole; the connection
+    /// stays open.
+    #[tokio::test]
+    async fn a_frame_timestamped_past_i64_max_is_refused_and_the_next_one_stored() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-time").await;
+        let mut refused = sample_frame("host1");
+        refused.timestamp = i64::MAX as u64 + 1;
+
+        send_and_sync(&mut ws, rmp_serde::to_vec(&refused).unwrap()).await;
+        let after_refused = points(&state, "sys-time", "cpu");
+        let live_after_refused = state.live_metrics.read().unwrap().contains_key("sys-time");
+        send_and_sync(&mut ws, frame_bytes("host1")).await;
+
+        assert_eq!(after_refused, 0, "nothing stored");
+        assert!(!live_after_refused, "no live metrics");
+        assert_eq!(
+            points(&state, "sys-time", "cpu"),
+            1,
+            "the next frame is stored"
+        );
+    }
+
+    /// RFC 0007 §2: an uptime display or a memory capacity display past the display rule is no
+    /// report: the frame's points are stored, and the stored values kept.
+    #[tokio::test]
+    async fn displays_past_64_bytes_keep_the_stored_last_seen_and_memory_capacity() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-display").await;
+        send_and_sync(&mut ws, frame_bytes("host1")).await;
+        let mut long = sample_frame("host1");
+        long.uptime_display = "u".repeat(65);
+        long.memory_total_display = "m".repeat(65);
+        long.memory_total_bytes = 8_000;
+        long.timestamp += 2;
+
+        send_and_sync(&mut ws, rmp_serde::to_vec(&long).unwrap()).await;
+
+        assert_eq!(
+            points(&state, "sys-display", "cpu"),
+            2,
+            "both frames stored"
+        );
+        let sys = state.db.get_system("sys-display").unwrap().unwrap();
+        assert_eq!(sys.last_seen, "1m", "the first frame's uptime kept");
+        let capacity = (sys.total_memory_display.as_deref(), sys.total_memory_bytes);
+        assert_eq!(capacity, (Some("4 GB"), Some(4_000)), "the capacity kept");
+    }
+
+    /// RFC 0007 §4: a store error leaves the connection open, so the next frame stores once
+    /// the database recovers.
+    #[tokio::test]
+    async fn a_failed_store_keeps_the_connection_open() {
+        let (state, dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-failing").await;
+        let raw = raw_connection(&dir);
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON metrics
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+
+        send_and_sync(&mut ws, frame_bytes("host1")).await;
+        let while_failing = points(&state, "sys-failing", "cpu");
+        raw.execute_batch("DROP TRIGGER boom").unwrap();
+        send_and_sync(&mut ws, frame_bytes("host1")).await;
+
+        assert_eq!(while_failing, 0, "nothing stored while the store fails");
+        assert_eq!(
+            points(&state, "sys-failing", "cpu"),
+            1,
+            "the next frame stores"
+        );
+    }
+
+    /// RFC 0007 §4: a snapshot for a deleted system ends its push connection, as a round's
+    /// does, and writes no live metrics. The agent's reconnect registers the system again,
+    /// under its default name, with none of its history.
+    #[tokio::test]
+    async fn a_frame_for_a_deleted_system_ends_the_connection_and_a_reconnect_registers_it_anew() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-deleted").await;
+        send_and_sync(&mut ws, frame_bytes("host1")).await;
+        state.db.delete_system("sys-deleted").unwrap();
+        state.live_metrics.write().unwrap().remove("sys-deleted");
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Binary(frame_bytes("host1")))
+            .await
+            .unwrap();
+        let closed = messages_until_closed(&mut ws, Duration::from_secs(5)).await;
+
+        assert!(closed.is_some(), "the hub ended the connection");
+        assert!(
+            !state
+                .live_metrics
+                .read()
+                .unwrap()
+                .contains_key("sys-deleted"),
+            "no live metrics recreated"
+        );
+        let _again = connect_authenticated(addr, "sys-deleted").await;
+        let sys = state.db.get_system("sys-deleted").unwrap().unwrap();
+        let default_name = SystemId::try_from("sys-deleted".to_string())
+            .unwrap()
+            .default_name();
+        assert_eq!(sys.name, default_name, "registered anew");
+        assert_eq!(
+            points(&state, "sys-deleted", "cpu"),
+            0,
+            "none of its history"
         );
     }
 
@@ -2183,14 +2419,34 @@ mod tests {
         }
 
         #[test]
-        fn a_connections_first_refused_frame_is_first_and_the_rest_repeat() {
-            use RefusedFrame::{First, Repeat};
-            let mut rounds = ConnectionRounds::new(Instant::now());
-            let refused: Vec<_> = (0..4).map(|_| rounds.note_refusal()).collect();
-            assert_eq!(refused, [First, Repeat, Repeat, Repeat]);
-            assert_eq!(rounds.refusals, 4, "every refusal is counted");
-            let mut another = ConnectionRounds::new(Instant::now());
-            assert_eq!(another.note_refusal(), First, "per connection");
+        fn a_connections_first_occurrence_is_first_and_the_rest_repeat() {
+            use Occurrence::{First, Repeat};
+            type TallyOf = fn(&mut ConnectionState) -> &mut Tally;
+            let tallies: [(&str, TallyOf); 3] = [
+                ("refused application frames", |c| {
+                    &mut c.refused_application_frames
+                }),
+                ("refused snapshot frames", |c| {
+                    &mut c.refused_snapshot_frames
+                }),
+                ("store errors", |c| &mut c.store_errors),
+            ];
+            for (case, tally) in tallies {
+                let mut connection = ConnectionState::new(Instant::now());
+                let seen: Vec<_> = (0..4).map(|_| tally(&mut connection).note()).collect();
+                assert_eq!(seen, [First, Repeat, Repeat, Repeat], "case: {case}");
+                assert_eq!(
+                    tally(&mut connection).0,
+                    4,
+                    "case: {case}: every one is counted"
+                );
+                let mut another = ConnectionState::new(Instant::now());
+                assert_eq!(
+                    tally(&mut another).note(),
+                    First,
+                    "case: {case}: per connection"
+                );
+            }
         }
 
         #[test]
