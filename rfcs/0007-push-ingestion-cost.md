@@ -1182,8 +1182,8 @@ hub gate.
 | §3 `TokenBucket` under `SourcePace`'s tests; the connection's state split into `push/connection.rs` | done | `7a96072`, `f77ac56` |
 | §3 decode budget (`DecodeBudget`, `PushConfig::decode_refill`), spent before either decode | done | `c9c3c51` |
 | §4 `end_connection`, eviction on delete (`AppState::evict_live_metrics`) | done | `69d23f2` |
-| §5 SSE publisher (`watch`, `send_replace`) | next | |
-| README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
+| §5 SSE publisher (`watch`, `send_replace`) | done | `160862a` |
+| README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | next | |
 
 Open items to settle on the way:
 - §2 added `SnapshotTime::cutoff` (the retention cutoff, never before 0), a pure rule the RFC's
@@ -1271,6 +1271,41 @@ Open items to settle on the way:
   the `&str` key and the `""` `last_seen`, both as above. The delete handler still calls
   SQLite on the runtime, as every REST handler does; moving it alone would widen this RFC, and
   RFC 0010 replaces that store.
+- §5 added names the design doesn't have:
+  - `Summary`, the serialised summary: a newtype over `Arc<str>` whose field is private, so no
+    empty or placeholder summary can be built outside `routes/sse.rs`. `state.rs` imports it
+    from there;
+  - `SummaryFailure` (the serialisation, or the blocking task), which both the publisher and
+    `main` report. `AppState::new` returns `serde_json::Error`, since the first summary
+    serialises; `main` refuses to start with `StartupError::FirstSummary` when it fails or
+    panics;
+  - `SummaryDto` beside `LiveMetricsDto`, still serialised through a `Value`, so the keys stay
+    sorted and the percentages keep their widened bytes (as above); `summaries`, the watch
+    stream, and `summary_event`.
+- The publisher's first tick comes one period after it starts (`interval_at`), since
+  `AppState::new` built the first summary.
+- The serialisation counter became a shared-allocation check, with no test-only field: every
+  subscriber's summary of a tick is the same `Arc<str>`, so three subscribers over two ticks
+  hold two allocations. A serialisation or a copy per subscriber holds six.
+- One test the plan doesn't list: the running binary (`tests/fail_closed.rs`) lists a system
+  registered after startup within one tick. No unit test sees `main` start the publisher.
+- The summary's read fallbacks stay as they were: a `list_systems` that fails shows no systems
+  (the open question the docs row adds), and a `count_active_alerts` that fails shows no
+  active alerts. The poller warns when the registry can't be read.
+- `red-test-adversary` on §5, as an in-process check with mutation runs in a sandbox:
+  EVIDENCE. The published-not-fresh and shared-serialisation tests were red on assertions
+  against the stubs. These cheats were all killed: `send` for `send_replace`,
+  `WatchStream::from_changes`, a copy per subscriber, `main` not starting the publisher, a
+  publisher every 60 s, a startup summary from another database, and a publish that keeps
+  serving the startup summary. Three things stay unpinned, since no test can see them: the
+  build on the blocking pool rather than the runtime, keeping the previous summary when a
+  build fails (no failure can be injected), and the missed-tick policy.
+- `rosette-auditor` on §5, as an in-process check: no VIOLATED. Three AT-RISK, each decided:
+  the read fallbacks' empty list and zero (kept, as above: changing them is a behaviour
+  change §5 doesn't make); `state.rs` depending on `routes/sse.rs` for `Summary` (`AppState`
+  is the adapters' shared state, and the summary is the SSE adapter's wire value); "summary"
+  has no glossary entry (it is a wire document, which `ARCHITECTURE.md` already calls the SSE
+  summary; the docs row decides).
 - Removing `ORDER BY timestamp` from the capped prune survives the tests: SQLite reads the
   subquery through `idx_metrics_system_time`, already in timestamp order. The `ORDER BY` stays,
   so oldest-first is a guarantee rather than a planner choice.
