@@ -34,6 +34,10 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// before it is dropped. Shipped agents reconnect with no backoff after a drop, so this
 /// spaces their reconnects.
 pub const OVERSIZE_LINGER: Duration = Duration::from_secs(30);
+/// How often a push connection's decode budget gains a token (RFC 0007 §3). An honest agent
+/// sends at most 0.6 messages a second: a snapshot per 2 s tick, and a round per scrape
+/// interval of at least 10 s.
+pub const DECODE_REFILL: Duration = Duration::from_secs(1);
 
 /// The configured `HUB_PUSH_TOKEN`. Never empty. No `Debug`, so the secret can't reach a log
 /// line.
@@ -168,6 +172,8 @@ pub struct PushConfig {
     pub handshake_timeout: Duration,
     pub idle_timeout: Duration,
     pub oversize_linger: Duration,
+    /// Zero refills the decode budget at every message, so it never drops one.
+    pub decode_refill: Duration,
 }
 
 impl PushConfig {
@@ -178,6 +184,7 @@ impl PushConfig {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
             oversize_linger: OVERSIZE_LINGER,
+            decode_refill: DECODE_REFILL,
         }
     }
 }

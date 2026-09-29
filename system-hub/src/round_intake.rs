@@ -183,7 +183,7 @@ mod tests {
             enabled: true,
         })
         .unwrap();
-        (AppState::new(db), dir)
+        (AppState::new(db).unwrap(), dir)
     }
 
     #[test]

@@ -32,7 +32,7 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0004](0004-alert-incident-identity.md) | Alert Incident Identity | Implemented |
 | [0005](0005-system-id-dot-segments.md) | System Ids That Are Always One Path Segment | Implemented |
 | [0006](0006-push-connection-limits.md) | Push Connection Limits and Fail-Closed Token | Implemented |
-| [0007](0007-push-ingestion-cost.md) | One Snapshot Rule, One Transaction, One Serialisation | Accepted |
+| [0007](0007-push-ingestion-cost.md) | One Snapshot Rule, One Transaction, One Serialisation | Implemented |
 | [0008](0008-push-registry-limit.md) | Push Registry Limit and Push System Lifecycle | Draft |
 | [0009](0009-spring-boot-application-telemetry.md) | Spring Boot Application Telemetry | Implemented |
 | [0010](0010-hub-store.md) | Hub Store on redb: Tiered Time Series and the Hub's Catalog in One Embedded Database | Draft |

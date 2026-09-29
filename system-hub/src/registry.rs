@@ -14,9 +14,87 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Fleet Registry rules the ingestion adapters apply to what an agent reports (RFC 0014 §8).
+//! Fleet Registry rules the ingestion adapters apply to what an agent reports (RFC 0014 §8,
+//! RFC 0007 §2).
 
-use crate::models::SystemInfo;
+use crate::models::{SystemInfo, SystemStatus};
+
+/// The display rule's longest text, in bytes.
+pub const MAX_DISPLAY_BYTES: usize = 64;
+
+/// The display rule, for text an agent may send anew in every snapshot: 1..=`MAX_DISPLAY_BYTES`
+/// bytes, no control character.
+fn follows_display_rule(text: &str) -> bool {
+    (1..=MAX_DISPLAY_BYTES).contains(&text.len()) && !text.chars().any(char::is_control)
+}
+
+/// A display the display rule refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDisplay;
+
+/// An agent's uptime as it displays it ("3d 4h 5m"), under the display rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UptimeDisplay(String);
+
+impl TryFrom<String> for UptimeDisplay {
+    type Error = InvalidDisplay;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match follows_display_rule(&value) {
+            true => Ok(Self(value)),
+            false => Err(InvalidDisplay),
+        }
+    }
+}
+
+impl UptimeDisplay {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What a stored snapshot writes as a system's last seen. The offline markings write the
+/// column too (a failed poll its time, a push disconnect a blank), until RFC 0010's contact time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LastSeen {
+    /// Push: the frame's `uptime_display`, when it follows the display rule.
+    Uptime(UptimeDisplay),
+    /// Poll: the poll's ISO time, built by the hub.
+    PolledAt(String),
+    /// Push, with a display the rule refuses: the column keeps its value.
+    Unchanged,
+}
+
+/// One write of a system's status: the status, when it was last seen, and its error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusUpdate {
+    status: SystemStatus,
+    last_seen: LastSeen,
+    error: Option<String>,
+}
+
+impl StatusUpdate {
+    /// A stored snapshot: online, seen as given, no error.
+    pub fn after_snapshot(last_seen: LastSeen) -> Self {
+        Self {
+            status: SystemStatus::Online,
+            last_seen,
+            error: None,
+        }
+    }
+
+    pub fn status(&self) -> &SystemStatus {
+        &self.status
+    }
+
+    pub fn last_seen(&self) -> &LastSeen {
+        &self.last_seen
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
 
 /// How much memory a system's monitored environment may use, as its agent last reported it:
 /// the bytes and their display string, always together, so the two never disagree.
@@ -27,18 +105,21 @@ pub struct MemoryCapacity {
 }
 
 impl MemoryCapacity {
-    /// The capacity an agent reported, when it reported both halves. An empty display isn't
-    /// one: it would show as a blank.
+    /// The capacity an agent reported, when it reported both halves within bounds: a display
+    /// under the display rule (an empty one would show as a blank), and bytes the `systems`
+    /// row can hold (at most `i64::MAX`).
     pub fn reported(display: Option<&str>, bytes: Option<u64>) -> Option<Self> {
-        let display = display.filter(|d| !d.is_empty())?;
+        let display = display.filter(|d| follows_display_rule(d))?;
+        let bytes = bytes.filter(|b| i64::try_from(*b).is_ok())?;
         Some(Self {
             display: display.to_owned(),
-            bytes: bytes?,
+            bytes,
         })
     }
 
-    /// The capacity `system`'s row holds, when it holds both halves: a half-stored pair (left
-    /// by a hub before RFC 0014) counts as nothing stored.
+    /// The capacity `system`'s row holds, when it holds both halves within `reported`'s bounds:
+    /// a half-stored pair (left by a hub before RFC 0014), or a display an older hub stored
+    /// past the display rule, counts as nothing stored.
     pub fn stored(system: &SystemInfo) -> Option<Self> {
         Self::reported(
             system.total_memory_display.as_deref(),
@@ -110,15 +191,175 @@ impl PollInterval {
     }
 }
 
+/// Whether a system's info is still to be filled from what its agent reports: while its
+/// hostname or its OS is missing. Filled once, unlike the memory capacity, which follows the
+/// agent.
+pub fn needs_system_info(system: &SystemInfo) -> bool {
+    system.hostname.is_none() || system.os.is_none()
+}
+
+/// The systems the poller polls: the enabled ones, in the registry's order.
+pub fn enabled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
+    systems.iter().filter(|system| system.enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::SystemStatus;
 
     fn capacity(display: &str, bytes: u64) -> MemoryCapacity {
         MemoryCapacity {
             display: display.to_owned(),
             bytes,
+        }
+    }
+
+    fn system(id: &str, enabled: bool) -> SystemInfo {
+        SystemInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            url: "http://example.com".to_owned(),
+            token: String::new(),
+            status: SystemStatus::Unknown,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn only_enabled_systems_are_polled_in_the_registrys_order() {
+        let cases: [(&str, Vec<SystemInfo>, Vec<&str>); 4] = [
+            ("none", vec![], vec![]),
+            (
+                "all enabled",
+                vec![system("a", true), system("b", true)],
+                vec!["a", "b"],
+            ),
+            (
+                "all disabled",
+                vec![system("a", false), system("b", false)],
+                vec![],
+            ),
+            (
+                "mixed",
+                vec![
+                    system("a", false),
+                    system("b", true),
+                    system("c", false),
+                    system("d", true),
+                ],
+                vec!["b", "d"],
+            ),
+        ];
+        for (case, systems, expected) in cases {
+            let polled: Vec<&str> = enabled_systems(&systems).map(|s| s.id.as_str()).collect();
+            assert_eq!(polled, expected, "case: {case}");
+        }
+    }
+
+    #[test]
+    fn system_info_is_filled_while_the_hostname_or_the_os_is_missing() {
+        let cases = [
+            ("neither", None, None, true),
+            ("no os", Some("web-01"), None, true),
+            ("no hostname", None, Some("Ubuntu"), true),
+            ("both", Some("web-01"), Some("Ubuntu"), false),
+        ];
+        for (case, hostname, os, expected) in cases {
+            let mut known = system("a", true);
+            known.hostname = hostname.map(str::to_owned);
+            known.os = os.map(str::to_owned);
+            assert_eq!(needs_system_info(&known), expected, "case: {case}");
+        }
+    }
+
+    fn uptime_accepted(display: &str) -> bool {
+        UptimeDisplay::try_from(display.to_owned()).is_ok()
+    }
+
+    #[test]
+    fn an_uptime_display_follows_the_display_rule() {
+        let at_bound_with_a_wide_char = format!("{}é", "a".repeat(62));
+        let across_the_bound = format!("{}é", "a".repeat(63)); // 64 chars, 65 bytes
+        let cases: [(&str, String, bool); 10] = [
+            ("the agent's own format", "3d 4h 5m".into(), true),
+            ("64 bytes", "a".repeat(64), true),
+            (
+                "64 bytes ending in a 2-byte char",
+                at_bound_with_a_wide_char,
+                true,
+            ),
+            ("65 bytes", "a".repeat(65), false),
+            (
+                "65 bytes, a 2-byte char across the bound",
+                across_the_bound,
+                false,
+            ),
+            ("empty", String::new(), false),
+            ("a newline", "3d\n4h".into(), false),
+            ("a tab", "3d\t4h".into(), false),
+            ("DEL", "3d\u{7f}4h".into(), false),
+            ("NEL, a C1 control", "3d\u{85}4h".into(), false),
+        ];
+        for (name, display, expected) in cases {
+            let parsed = UptimeDisplay::try_from(display.clone());
+            assert_eq!(parsed.is_ok(), expected, "{name}");
+            if let Ok(uptime) = parsed {
+                assert_eq!(uptime.as_str(), display, "{name}: kept verbatim");
+            }
+        }
+    }
+
+    #[test]
+    fn the_display_rule_sweeps_lengths_and_control_characters() {
+        // Every length from 1 to 64 bytes is accepted and every one from 65 to 128 refused, so
+        // no bound but 64 bytes passes.
+        for len in 1..=128 {
+            assert_eq!(uptime_accepted(&"a".repeat(len)), len <= 64, "{len} bytes");
+        }
+        // Every C0 control, DEL and every C1 control is refused, in any position; the
+        // printable characters around them are accepted.
+        let controls = (0u32..0x20).chain(0x7f..=0x9f).filter_map(char::from_u32);
+        for control in controls {
+            for display in [format!("{control}3d"), format!("3d{control}4h")] {
+                assert!(!uptime_accepted(&display), "U+{:04X}", control as u32);
+            }
+        }
+        for printable in [' ', '~', '\u{a0}', 'é', '日'] {
+            assert!(
+                uptime_accepted(&format!("3d{printable}4h")),
+                "{printable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_snapshot_marks_the_system_online_as_seen_with_no_error() {
+        let cases = [
+            (
+                "an uptime",
+                LastSeen::Uptime(UptimeDisplay("3d 4h 5m".into())),
+            ),
+            (
+                "a poll time",
+                LastSeen::PolledAt("2026-09-29T10:00:00Z".into()),
+            ),
+            ("unchanged", LastSeen::Unchanged),
+        ];
+        for (name, last_seen) in cases {
+            let update = StatusUpdate::after_snapshot(last_seen.clone());
+            assert_eq!(update.status(), &SystemStatus::Online, "{name}");
+            assert_eq!(update.last_seen(), &last_seen, "{name}");
+            assert_eq!(update.error(), None, "{name}");
         }
     }
 
@@ -184,6 +425,71 @@ mod tests {
         for (name, display, bytes, expected) in cases {
             assert_eq!(MemoryCapacity::reported(display, bytes), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_capacity_report_follows_the_display_rule_and_the_rows_range() {
+        let max = i64::MAX as u64;
+        let gb = 33_285_996_544;
+        let across_the_bound = format!("{}é", "a".repeat(63)); // 64 chars, 65 bytes
+        // (name, display, bytes, reported)
+        let cases: [(&str, String, u64, bool); 11] = [
+            ("the agent's largest display", "16384.0 PB".into(), gb, true),
+            ("a 64-byte display", "a".repeat(64), gb, true),
+            ("a 65-byte display", "a".repeat(65), gb, false),
+            (
+                "65 bytes, a 2-byte char across the bound",
+                across_the_bound,
+                gb,
+                false,
+            ),
+            ("a newline", "31.0\nGB".into(), gb, false),
+            ("NEL, a C1 control", "31.0\u{85}GB".into(), gb, false),
+            ("DEL", "31.0\u{7f}GB".into(), gb, false),
+            ("bytes of i64::MAX", "8.0 EB".into(), max, true),
+            ("bytes of i64::MAX + 1", "8.0 EB".into(), max + 1, false),
+            (
+                "the top bit plus change",
+                "8.0 EB".into(),
+                (1 << 63) | 0x1234,
+                false,
+            ),
+            ("bytes of u64::MAX", "16384.0 PB".into(), u64::MAX, false),
+        ];
+        for (name, display, bytes, expected) in cases {
+            let reported = MemoryCapacity::reported(Some(&display), Some(bytes));
+            let expected = expected.then(|| capacity(&display, bytes));
+            assert_eq!(reported, expected, "{name}");
+        }
+        // Every value max + 2^k lies above the row's range, and every 2^k within it.
+        for k in 0..63 {
+            let over = MemoryCapacity::reported(Some("x"), Some(max + (1 << k)));
+            assert_eq!(over, None, "max + 2^{k}");
+            let within = MemoryCapacity::reported(Some("x"), Some(1 << k));
+            assert_eq!(within, Some(capacity("x", 1 << k)), "2^{k}");
+        }
+    }
+
+    #[test]
+    fn the_refresh_replaces_a_stored_capacity_the_rule_refuses_and_ignores_out_of_range_bytes() {
+        let valid = || Some(capacity("31.0 GB", 33_285_996_544));
+        let long_display = "a".repeat(65);
+        let stored_long = MemoryCapacity::stored(&row(Some(&long_display), Some(33_285_996_544)));
+        assert_eq!(
+            stored_long, None,
+            "a stored 65-byte display counts as nothing stored"
+        );
+        assert_eq!(
+            memory_capacity_refresh(stored_long.as_ref(), valid()),
+            valid(),
+            "a valid report replaces it"
+        );
+        let out_of_range = MemoryCapacity::reported(Some("8.0 EB"), Some(i64::MAX as u64 + 1));
+        assert_eq!(
+            memory_capacity_refresh(valid().as_ref(), out_of_range),
+            None,
+            "bytes above i64::MAX write nothing over a stored capacity"
+        );
     }
 
     fn row(display: Option<&str>, bytes: Option<u64>) -> SystemInfo {

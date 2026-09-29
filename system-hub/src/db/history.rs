@@ -19,7 +19,11 @@
 
 use super::{Database, system_exists};
 use crate::applications::{Admission, SourcePace};
-use crate::models::MetricPoint;
+use crate::models::{MetricPoint, SystemId};
+use crate::registry::{LastSeen, StatusUpdate};
+use crate::snapshot::{Snapshot, SnapshotTime, snapshot_retention};
+use rusqlite::types::ValueRef;
+use rusqlite::{OptionalExtension, Transaction};
 
 /// The most `app:*` points one prune batch deletes, so no batch holds the mutex for long.
 /// (`DELETE … LIMIT` needs a compile option the bundled SQLite lacks, hence `rowid IN`.)
@@ -40,6 +44,27 @@ const PRUNE_ONE_METRIC: &str = "DELETE FROM metrics WHERE rowid IN (
     WHERE system_id = ?1 AND metric = ?4 AND timestamp < ?2
     LIMIT ?3)";
 
+/// The most expired points of its series one snapshot point prunes, oldest first, so a
+/// backlog (after a gap, or a far-future timestamp) drains over several snapshots instead of
+/// holding the mutex for one (RFC 0007 §2).
+const PRUNE_PER_POINT: usize = 16;
+
+const INSERT_POINT: &str =
+    "INSERT INTO metrics (system_id, metric, value, timestamp) VALUES (?1,?2,?3,?4)";
+
+const SELECT_RETENTION: &str =
+    "SELECT retention_secs FROM metric_retention WHERE system_id = ?1 AND metric = ?2";
+
+/// Deletes up to ?4 of system ?1's oldest points of metric ?2 older than ?3.
+const PRUNE_OLDEST: &str = "DELETE FROM metrics WHERE rowid IN (
+    SELECT rowid FROM metrics
+    WHERE system_id = ?1 AND metric = ?2 AND timestamp < ?3
+    ORDER BY timestamp LIMIT ?4)";
+
+/// Writes system ?4's status; a NULL ?2 keeps its `last_seen`.
+const WRITE_STATUS: &str = "UPDATE systems
+    SET status = ?1, last_seen = COALESCE(?2, last_seen), last_error = ?3 WHERE id = ?4";
+
 /// What `Database::store_round` did with a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundStored {
@@ -50,34 +75,38 @@ pub enum RoundStored {
     SystemGone,
 }
 
+/// What `Database::store_snapshot` did with a snapshot: `R` is what `on_stored` returned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotStored<R> {
+    Stored(R),
+    /// The system's row is gone: nothing was written.
+    SystemGone,
+}
+
 impl Database {
-    pub fn insert_metric(
+    /// Stores a snapshot and writes the system's status in one transaction, holding the
+    /// connection mutex throughout (RFC 0007 §2). In order: the system's row must exist, else
+    /// `SystemGone` with nothing written and `on_stored` not called; then each metric point at
+    /// `time`, each followed by a capped prune of its series; then `status`; then the commit,
+    /// and `on_stored` with the snapshot, still under the mutex. `on_stored` must not call back
+    /// into `Database` (the mutex isn't reentrant) and must not panic.
+    pub fn store_snapshot<R>(
         &self,
-        system_id: &str,
-        metric: &str,
-        value: f32,
-        timestamp: u64,
-    ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO metrics (system_id, metric, value, timestamp) VALUES (?1,?2,?3,?4)",
-            rusqlite::params![system_id, metric, value, timestamp],
-        )?;
-
-        let retention: u64 = conn
-            .query_row(
-                "SELECT retention_secs FROM metric_retention WHERE system_id=?1 AND metric=?2",
-                rusqlite::params![system_id, metric],
-                |row| row.get(0),
-            )
-            .unwrap_or(86400);
-
-        let cutoff = timestamp.saturating_sub(retention);
-        conn.execute(
-            "DELETE FROM metrics WHERE system_id=?1 AND metric=?2 AND timestamp < ?3",
-            rusqlite::params![system_id, metric, cutoff],
-        )?;
-        Ok(())
+        system_id: &SystemId,
+        snapshot: Snapshot,
+        time: SnapshotTime,
+        status: StatusUpdate,
+        on_stored: impl FnOnce(Snapshot) -> R,
+    ) -> Result<SnapshotStored<R>, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        if !system_exists(&conn, system_id.as_str())? {
+            return Ok(SnapshotStored::SystemGone);
+        }
+        let tx = conn.transaction()?;
+        store_points(&tx, system_id, &snapshot, time)?;
+        write_status(&tx, system_id, &status)?;
+        tx.commit()?;
+        Ok(SnapshotStored::Stored(on_stored(snapshot)))
     }
 
     /// Stores one scrape round's points, if `decide` admits it, holding the connection mutex
@@ -105,9 +134,7 @@ impl Database {
         };
         let tx = conn.transaction()?;
         {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO metrics (system_id, metric, value, timestamp) VALUES (?1,?2,?3,?4)",
-            )?;
+            let mut insert = tx.prepare_cached(INSERT_POINT)?;
             for (metric, value) in points {
                 insert.execute(rusqlite::params![system_id, metric, value, received_at])?;
             }
@@ -225,17 +252,96 @@ impl Database {
 }
 
 #[cfg(test)]
+impl Database {
+    /// Inserts one metric point as given, with no prune, for tests that need history in place.
+    pub fn plant_point(
+        &self,
+        system_id: &str,
+        metric: &str,
+        value: f32,
+        timestamp: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            INSERT_POINT,
+            rusqlite::params![system_id, metric, value, timestamp],
+        )?;
+        Ok(())
+    }
+}
+
+/// Inserts each of the snapshot's metric points at `time`, each followed by the capped prune
+/// of its series past the series' retention.
+fn store_points(
+    tx: &Transaction,
+    system_id: &SystemId,
+    snapshot: &Snapshot,
+    time: SnapshotTime,
+) -> Result<(), rusqlite::Error> {
+    let id = system_id.as_str();
+    let mut insert = tx.prepare_cached(INSERT_POINT)?;
+    let mut retention = tx.prepare_cached(SELECT_RETENTION)?;
+    let mut prune = tx.prepare_cached(PRUNE_OLDEST)?;
+    for (metric, value) in snapshot.metric_points() {
+        insert.execute(rusqlite::params![id, metric, value, time.seconds()])?;
+        let stored = retention
+            .query_row(rusqlite::params![id, metric], |row| {
+                Ok(integer(row.get_ref(0)?))
+            })
+            .optional()?
+            .flatten();
+        let cutoff = time.cutoff(snapshot_retention(stored));
+        prune.execute(rusqlite::params![
+            id,
+            metric,
+            cutoff.seconds(),
+            PRUNE_PER_POINT
+        ])?;
+    }
+    Ok(())
+}
+
+/// A column's value when it holds an integer; any other type is none, so no stored value can
+/// fail the read.
+fn integer(value: ValueRef) -> Option<i64> {
+    match value {
+        ValueRef::Integer(integer) => Some(integer),
+        ValueRef::Null | ValueRef::Real(_) | ValueRef::Text(_) | ValueRef::Blob(_) => None,
+    }
+}
+
+/// Writes the status the registry decided, as it was decided.
+fn write_status(
+    tx: &Transaction,
+    system_id: &SystemId,
+    status: &StatusUpdate,
+) -> Result<(), rusqlite::Error> {
+    let last_seen = match status.last_seen() {
+        LastSeen::Uptime(uptime) => Some(uptime.as_str()),
+        LastSeen::PolledAt(polled_at) => Some(polled_at.as_str()),
+        LastSeen::Unchanged => None,
+    };
+    tx.prepare_cached(WRITE_STATUS)?.execute(rusqlite::params![
+        status.status().to_string(),
+        last_seen,
+        status.error(),
+        system_id.as_str()
+    ])?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::tests::{sample_system, temp_db};
 
     #[test]
-    fn insert_metric_and_get_metrics_round_trip() {
+    fn get_metrics_returns_planted_points_oldest_first() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 10.0, 100).unwrap();
-        db.insert_metric("id-1", "cpu", 20.0, 200).unwrap();
-        db.insert_metric("id-1", "cpu", 30.0, 300).unwrap();
+        db.plant_point("id-1", "cpu", 10.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 20.0, 200).unwrap();
+        db.plant_point("id-1", "cpu", 30.0, 300).unwrap();
 
         let points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
         assert_eq!(points.len(), 3);
@@ -249,7 +355,7 @@ mod tests {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
         for i in 0..10 {
-            db.insert_metric("id-1", "cpu", i as f32, 100 + i).unwrap();
+            db.plant_point("id-1", "cpu", i as f32, 100 + i).unwrap();
         }
         let points = db.get_metrics("id-1", "cpu", 3, None).unwrap();
         assert_eq!(points.len(), 3);
@@ -259,9 +365,9 @@ mod tests {
     fn get_metrics_with_since_filters_and_stays_ascending() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 1.0, 100).unwrap();
-        db.insert_metric("id-1", "cpu", 2.0, 200).unwrap();
-        db.insert_metric("id-1", "cpu", 3.0, 300).unwrap();
+        db.plant_point("id-1", "cpu", 1.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 2.0, 200).unwrap();
+        db.plant_point("id-1", "cpu", 3.0, 300).unwrap();
 
         let points = db.get_metrics("id-1", "cpu", 100, Some(150)).unwrap();
         assert_eq!(points.len(), 2);
@@ -273,26 +379,12 @@ mod tests {
     fn get_metrics_different_metric_names_are_isolated() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 1.0, 100).unwrap();
-        db.insert_metric("id-1", "memory", 2.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 1.0, 100).unwrap();
+        db.plant_point("id-1", "memory", 2.0, 100).unwrap();
 
         let cpu_points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
         assert_eq!(cpu_points.len(), 1);
         assert_eq!(cpu_points[0].value, 1.0);
-    }
-
-    #[test]
-    fn insert_metric_applies_default_retention_cutoff() {
-        let (db, _dir) = temp_db();
-        db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        // Default retention is 86400s. First point at ts=0.
-        db.insert_metric("id-1", "cpu", 1.0, 0).unwrap();
-        // Second point far enough ahead that the cutoff (ts - 86400) prunes the first.
-        db.insert_metric("id-1", "cpu", 2.0, 100_000).unwrap();
-
-        let points = db.get_metrics("id-1", "cpu", 100, None).unwrap();
-        assert_eq!(points.len(), 1);
-        assert_eq!(points[0].timestamp, 100_000);
     }
 
     mod rounds {
@@ -608,6 +700,310 @@ mod tests {
                 Ok(12_000)
             );
             assert_eq!(metric_count(&db, "id-1", "app:orders:up"), 0);
+        }
+    }
+
+    mod snapshots {
+        use super::*;
+        use crate::models::{SystemInfo, SystemStatus};
+        use crate::registry::{LastSeen, UptimeDisplay};
+        use crate::snapshot::{ReportedDisk, ReportedSnapshot, snapshot_rule};
+        use std::cell::Cell;
+
+        const TIME: u64 = 1_790_000_000;
+        const DAY: u64 = 86_400;
+
+        fn id() -> SystemId {
+            SystemId::try_from("id-1".to_string()).unwrap()
+        }
+
+        fn at(secs: u64) -> SnapshotTime {
+            SnapshotTime::try_from(secs).unwrap()
+        }
+
+        /// A system last marked offline by a failed poll, so a stored snapshot visibly
+        /// changes every status column.
+        fn db_with_offline_system() -> (Database, tempfile::TempDir) {
+            let (db, dir) = temp_db();
+            db.insert_system(&SystemInfo {
+                status: SystemStatus::Offline,
+                last_seen: "before".into(),
+                last_error: Some("timeout".into()),
+                ..sample_system("id-1", "web-01")
+            })
+            .unwrap();
+            (db, dir)
+        }
+
+        /// Every scalar, and one disk per mount point given.
+        fn snapshot(mounts: &[&str]) -> Snapshot {
+            let disks = mounts.iter().enumerate().map(|(i, mount)| ReportedDisk {
+                mount_point: Some(mount.to_string()),
+                usage_percent: Some(40.0 + i as f32),
+            });
+            let reported = ReportedSnapshot {
+                cpu: Some(10.0),
+                memory: Some(20.0),
+                swap: Some(30.0),
+                load1: Some(1.5),
+                load5: Some(2.5),
+                disks: disks.collect(),
+            };
+            snapshot_rule(reported).0
+        }
+
+        fn online(uptime: &str) -> StatusUpdate {
+            let uptime = UptimeDisplay::try_from(uptime.to_string()).unwrap();
+            StatusUpdate::after_snapshot(LastSeen::Uptime(uptime))
+        }
+
+        fn stored(db: &Database, metric: &str) -> Vec<(u64, f32)> {
+            db.get_metrics("id-1", metric, 100_000, None)
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.timestamp, p.value))
+                .collect()
+        }
+
+        fn timestamps(db: &Database, metric: &str) -> Vec<u64> {
+            stored(db, metric).into_iter().map(|(ts, _)| ts).collect()
+        }
+
+        fn plant(db: &Database, metric: &str, timestamps: impl IntoIterator<Item = u64>) {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            for ts in timestamps {
+                tx.execute(
+                    "INSERT INTO metrics (system_id, metric, value, timestamp) VALUES ('id-1',?1,0.0,?2)",
+                    rusqlite::params![metric, ts],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        /// (status, last_seen, last_error) as the row holds them.
+        fn status_columns(db: &Database) -> (SystemStatus, String, Option<String>) {
+            let row = db.get_system("id-1").unwrap().unwrap();
+            (row.status, row.last_seen, row.last_error)
+        }
+
+        #[test]
+        fn a_snapshot_is_stored_at_its_time_with_the_status_given() {
+            let uptime = LastSeen::Uptime(UptimeDisplay::try_from("3d 4h 5m".to_string()).unwrap());
+            let polled = LastSeen::PolledAt("2026-09-29T10:00:00Z".into());
+            // (name, last_seen given, the row's last_seen afterwards)
+            let cases = [
+                ("push, an uptime", uptime, "3d 4h 5m"),
+                ("poll, a poll time", polled, "2026-09-29T10:00:00Z"),
+                (
+                    "push, a display the rule refused",
+                    LastSeen::Unchanged,
+                    "before",
+                ),
+            ];
+            for (case, last_seen, shown) in cases {
+                let (db, _dir) = db_with_offline_system();
+                let kept = snapshot(&["/", "/home"]);
+                let status = StatusUpdate::after_snapshot(last_seen);
+                let outcome = db.store_snapshot(&id(), kept.clone(), at(TIME), status, |s| s);
+                assert_eq!(outcome, Ok(SnapshotStored::Stored(kept)), "case: {case}");
+                let expected = [
+                    ("cpu", 10.0),
+                    ("memory", 20.0),
+                    ("swap", 30.0),
+                    ("load1", 1.5),
+                    ("load5", 2.5),
+                    ("disk:/", 40.0),
+                    ("disk:/home", 41.0),
+                ];
+                for (metric, value) in expected {
+                    assert_eq!(
+                        stored(&db, metric),
+                        [(TIME, value)],
+                        "case: {case}: {metric}"
+                    );
+                }
+                assert_eq!(
+                    status_columns(&db),
+                    (SystemStatus::Online, shown.to_string(), None),
+                    "case: {case}"
+                );
+            }
+        }
+
+        #[test]
+        fn retention_rows_never_fail_a_store_and_fall_back_to_a_day() {
+            // (name, the row's retention_secs as SQL, None for no row, the retention it means)
+            let cases = [
+                ("an hour", Some("3600"), 3_600),
+                ("none: everything older than the snapshot", Some("0"), 0),
+                ("no row", None, DAY),
+                ("a negative row", Some("-1"), DAY),
+                ("the most negative row", Some("-9223372036854775808"), DAY),
+                ("a row holding text", Some("'abc'"), DAY),
+                ("a row holding a real", Some("3600.5"), DAY),
+            ];
+            for (case, row, retention) in cases {
+                let (db, _dir) = db_with_offline_system();
+                if let Some(sql) = row {
+                    db.conn
+                        .lock()
+                        .unwrap()
+                        .execute_batch(&format!(
+                            "INSERT INTO metric_retention (system_id, metric, retention_secs)
+                             VALUES ('id-1', 'cpu', {sql})"
+                        ))
+                        .unwrap();
+                }
+                let (past, within) = (TIME - retention - 1, TIME - retention);
+                plant(&db, "cpu", [past, within]);
+                let outcome =
+                    db.store_snapshot(&id(), snapshot(&[]), at(TIME), online("1m"), |_| ());
+                assert_eq!(outcome, Ok(SnapshotStored::Stored(())), "case: {case}");
+                assert_eq!(timestamps(&db, "cpu"), [within, TIME], "case: {case}");
+                assert_eq!(
+                    timestamps(&db, "memory"),
+                    [TIME],
+                    "case: {case}: others unpruned"
+                );
+            }
+        }
+
+        #[test]
+        fn a_gone_system_gets_nothing_written_and_on_stored_isnt_called() {
+            let (db, _dir) = temp_db();
+            let called = Cell::new(false);
+            let outcome =
+                db.store_snapshot(&id(), snapshot(&["/"]), at(TIME), online("1m"), |_| {
+                    called.set(true)
+                });
+            assert_eq!(outcome, Ok(SnapshotStored::SystemGone));
+            assert!(!called.get(), "on_stored isn't called");
+            assert!(stored(&db, "cpu").is_empty());
+            assert!(stored(&db, "disk:/").is_empty());
+        }
+
+        #[test]
+        fn on_stored_runs_after_the_commit_and_under_the_mutex() {
+            let (db, dir) = db_with_offline_system();
+            let path = dir.path().join("test.db");
+            let seen = Cell::new(None);
+            let outcome =
+                db.store_snapshot(&id(), snapshot(&["/"]), at(TIME), online("1m"), |_| {
+                    let held = db.conn.try_lock().is_err();
+                    let other = rusqlite::Connection::open(&path).unwrap();
+                    let committed: i64 = other
+                        .query_row(
+                            "SELECT COUNT(*) FROM metrics WHERE system_id = 'id-1'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let status: String = other
+                        .query_row("SELECT status FROM systems WHERE id = 'id-1'", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    seen.set(Some((held, committed, status)));
+                });
+            assert_eq!(outcome, Ok(SnapshotStored::Stored(())));
+            let (held, committed, status) = seen.take().expect("on_stored is called");
+            assert!(held, "on_stored runs under the mutex");
+            assert_eq!(committed, 6, "another connection already sees every point");
+            assert_eq!(status, "online", "and the status");
+        }
+
+        #[test]
+        fn each_point_prunes_at_most_16_of_its_series_oldest_expired_points() {
+            let recent = TIME - 10;
+            // (name, expired points planted, expired left after one snapshot, then after two)
+            let cases: [(&str, u64, std::ops::Range<u64>, std::ops::Range<u64>); 4] = [
+                ("a backlog of 100", 100, 16..100, 32..100),
+                ("a backlog of 17", 17, 16..17, 17..17),
+                ("exactly 16", 16, 16..16, 16..16),
+                ("fewer than the cap", 10, 10..10, 10..10),
+            ];
+            for (case, planted, after_one, after_two) in cases {
+                let (db, _dir) = db_with_offline_system();
+                // Two series with the same backlog, so the cap is per point, not per snapshot;
+                // planted newest first, so rowid order isn't the oldest-first order.
+                for metric in ["cpu", "memory"] {
+                    plant(&db, metric, [recent].into_iter().chain((0..planted).rev()));
+                }
+                db.store_snapshot(&id(), snapshot(&[]), at(TIME), online("1m"), |_| ())
+                    .unwrap();
+                let expected: Vec<u64> = after_one.clone().chain([recent, TIME]).collect();
+                for metric in ["cpu", "memory"] {
+                    let left = timestamps(&db, metric);
+                    assert_eq!(left, expected, "case: {case}: {metric}: one snapshot");
+                }
+                db.store_snapshot(&id(), snapshot(&[]), at(TIME + 2), online("1m"), |_| ())
+                    .unwrap();
+                let expected: Vec<u64> = after_two.chain([recent, TIME, TIME + 2]).collect();
+                for metric in ["cpu", "memory"] {
+                    let left = timestamps(&db, metric);
+                    assert_eq!(left, expected, "case: {case}: {metric}: two snapshots");
+                }
+            }
+        }
+
+        #[test]
+        fn a_failure_part_way_leaves_nothing_behind() {
+            // The failing metric sits between points inserted before it and after it, and an
+            // expired point the earlier `cpu` prune deletes must come back too.
+            let cases = ["memory", "load5", "disk:/home"];
+            for failing in cases {
+                let (db, _dir) = db_with_offline_system();
+                plant(&db, "cpu", [0]);
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch(&format!(
+                        "CREATE TRIGGER boom BEFORE INSERT ON metrics
+                         WHEN NEW.metric = '{failing}' AND NEW.timestamp = {TIME}
+                         BEGIN SELECT RAISE(ABORT, 'boom'); END;"
+                    ))
+                    .unwrap();
+                let called = Cell::new(false);
+                let outcome = db.store_snapshot(
+                    &id(),
+                    snapshot(&["/", "/home", "/var"]),
+                    at(TIME),
+                    online("1m"),
+                    |_| called.set(true),
+                );
+                assert!(
+                    outcome.is_err(),
+                    "case: {failing}: the insert fails: {outcome:?}"
+                );
+                assert!(!called.get(), "case: {failing}: on_stored isn't called");
+                assert_eq!(
+                    timestamps(&db, "cpu"),
+                    [0],
+                    "case: {failing}: cpu rolled back"
+                );
+                for metric in [
+                    "memory",
+                    "swap",
+                    "load1",
+                    "load5",
+                    "disk:/",
+                    "disk:/home",
+                    "disk:/var",
+                ] {
+                    assert!(stored(&db, metric).is_empty(), "case: {failing}: {metric}");
+                }
+                assert_eq!(
+                    status_columns(&db),
+                    (
+                        SystemStatus::Offline,
+                        "before".to_string(),
+                        Some("timeout".to_string())
+                    ),
+                    "case: {failing}: the status is unchanged"
+                );
+            }
         }
     }
 }

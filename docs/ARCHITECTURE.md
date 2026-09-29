@@ -126,37 +126,58 @@ Runs on every monitored Linux host. Responsibilities:
 
 Aggregates data from many `system-agent` instances. Responsibilities:
 
-- Maintains a registry of known systems (`db.rs`, SQLite table `systems`) — name, URL, token,
-  poll interval, last-known status/OS info. A system's info (hostname, OS, kernel, CPU model
-  and cores) is filled once, while its hostname or OS is missing (`db.rs::update_system_info`,
-  which never writes the memory columns). Its **memory
+- Maintains a registry of known systems (`db/mod.rs`, SQLite table `systems`) — name, URL,
+  token, poll interval, last-known status/OS info. A system's info (hostname, OS, kernel, CPU
+  model and cores) is filled once, while its hostname or OS is missing
+  (`registry.rs::needs_system_info`, the rule both ingestion modes apply;
+  `db/mod.rs::update_system_info`, which never writes the memory columns). Its **memory
   capacity** follows the agent (RFC 0014 §8): every push frame and every poll that reports
-  both its bytes and a non-empty display refreshes the stored pair when it differs
-  (`registry.rs::memory_capacity_refresh`, over `MemoryCapacity::stored` and `::reported`),
-  written by `db.rs::update_memory_capacity`, two fixed columns in one statement and the
-  columns' only writer; the poll path runs it on the blocking pool. A report without the whole pair never clears it. So a
-  containerised agent's system shows the container's limit, and a VM's memory hotplug shows
-  too. The dashboard labels the figure "Memory", true on every environment.
+  both its bytes (at most 2^63 − 1) and a display (1 to 64 bytes, with no control character)
+  refreshes the stored pair when it differs (`registry.rs::memory_capacity_refresh`, over
+  `MemoryCapacity::stored` and `::reported`), written by `db/mod.rs::update_memory_capacity`,
+  two fixed columns in one statement and the columns' only writer. Both modes run it on the
+  blocking pool. A report without the whole pair, or that breaks either bound, never clears
+  it. So a containerised agent's system shows the container's limit, and a VM's memory
+  hotplug shows too. The dashboard labels the figure "Memory", true on every environment.
+- Push registration never replaces a row (RFC 0007 §4): `db/mod.rs::insert_system_if_absent`
+  checks the id with a query that reads no column, and inserts with `ON CONFLICT(id) DO
+  NOTHING`, so for a known id nothing but the check runs. When the check or the insert fails,
+  or the registration panics, the handshake answers `registry unavailable`.
 - Two ingestion modes, both able to run simultaneously per fleet:
-  - **HTTP poll** (`collector/`): every 30 s the hub calls each enabled agent's
-    `/api/system`, then `/api/alerts` and `/api/applications` (it ignores
-    `poll_interval_secs`). No poll follows a redirect, so the per-system token never leaves
-    the registered host; a URL that redirects shows as offline, naming the 3xx. Used when the
-    hub can reach the agent (agent behind NAT/firewall from the hub's perspective is *not*
-    this mode). A polled scrape round is admitted and stored like a pushed one, under a pace
-    kept per system; a 404 (an older agent) or a `null` round forgets the shown round but keeps
-    the recent rounds; any other failure (another status, a body over 256 KiB, bad JSON, a
-    refused round) is logged and changes neither the shown round nor the system's status.
+  - **HTTP poll** (`collector/`): every 30 s the hub reads the registry (on the blocking
+    pool; there is no systems cache, and a tick whose read fails polls the systems of the last
+    read that succeeded) and calls each enabled agent's `/api/system`, then `/api/alerts` and
+    `/api/applications` (it ignores `poll_interval_secs`). No poll follows a redirect, so the
+    per-system token never leaves the registered host; a URL that redirects shows as offline,
+    naming the 3xx. The `/api/system` answer is read up to 4 MiB
+    (`collector/capped_body.rs::read_capped`, shared with the applications poll): a larger one,
+    a transport error, another status or a body that isn't the answer's JSON marks the system
+    offline (`PollFailure`). Its snapshot store, registry fill and offline marking run on the
+    blocking pool. Used when the hub can reach the agent (agent behind NAT/firewall from the
+    hub's perspective is *not* this mode). A polled scrape round is admitted and stored like
+    a pushed one, under a pace kept per system; a 404 (an older agent) or a `null` round
+    forgets the shown round but keeps the recent rounds; any other failure (another status, a
+    body over 256 KiB, bad JSON, a refused round) is logged and changes neither the shown
+    round nor the system's status.
   - **WebSocket push** (`push/`): agents connect out to the hub's `/api/push` endpoint,
     authenticate with a shared token (`HUB_PUSH_TOKEN`), then stream MessagePack-encoded
     snapshots every `PUSH_INTERVAL` seconds, and application frames when the agent watches
     Spring Boot applications. Agents auto-register on first successful push
-    handshake — no prior entry in `systems` is required.
+    handshake — no prior entry in `systems` is required. Every binary message spends the
+    connection's decode budget before it is decoded (RFC 0007 §3).
+- Stores every snapshot, pushed or polled, through one **snapshot rule** (`snapshot.rs`,
+  RFC 0007 §1): at most 1024 disks, valid mount points, finite values; what it leaves out is
+  counted and logged, at `warn` at most hourly per system (`left_out_log`). `snapshot_intake.rs`
+  is the one step both modes share: the rule, then `Database::store_snapshot`, then the
+  system's live metrics.
 - Persists time-series metrics (`metrics` table) and alert history, one record per alert
-  incident (`alerts` table) to SQLite. Snapshot metrics are pruned on insert, per system and
-  metric (`metric_retention` table, default 24h). Application metrics (`app:*`) are stored at
-  hub time and pruned by a task every 10 minutes (`retention.rs`), past their
-  `metric_retention` row or 24h.
+  incident (`alerts` table) to SQLite. A snapshot's points, the prune of each of their series,
+  and the system's status and last seen are written in one transaction, with cached
+  statements, under the database mutex (`db/history.rs::store_snapshot`, RFC 0007 §2). The
+  prune deletes at most 16 of a series' rows past its retention per stored point
+  (`metric_retention` table, default 24h), so a backlog drains over several snapshots.
+  Application metrics (`app:*`) are stored at hub time and pruned by a task every 10 minutes
+  (`retention.rs`), past their `metric_retention` row or 24h.
 - Admits application rounds (`applications.rs`, RFC 0009 §8): an exact re-send of one of a
   system's last 8 accepted rounds (same round id and same content digest) is a duplicate, and
   each source (one push connection, or the poller for one system) is paced by its own token bucket (2 rounds, then one per
@@ -169,10 +190,22 @@ Aggregates data from many `system-agent` instances. Responsibilities:
   Applications section, re-read on each SSE summary and dimmed when stale, and draws an
   application's heap and request-rate history from its `app:*` series when its row is
   opened.
-- Maintains an in-memory live-metrics cache (`state.rs`) for low-latency dashboard updates
-  between DB writes.
+- Holds each system's **live metrics** in memory (`state.rs::live_metrics`, one
+  `Arc<LiveMetrics>` per system): the latest snapshot as the rule kept it, moved in by the
+  transaction that stored it, and shared rather than copied by every reader. An entry is
+  evicted when the system's push connection ends (`push/ingest.rs::end_connection`) and when
+  the system is deleted (`AppState::evict_live_metrics`), so live state never outgrows the
+  registry. Deleting a connected push system also ends its connection: its next frame finds
+  no row (`SnapshotStored::SystemGone`), and the agent reconnects and registers the id again,
+  with no history.
 - Exposes a REST API and an SSE summary stream (`routes/`), and serves a static fleet
-  dashboard (`static/index.html`) that updates every 5s via SSE. The dashboard is served from
+  dashboard (`static/index.html`) that updates every 5s via SSE. One publisher
+  (`routes/sse.rs::start_publisher`) builds the summary every 5 s on the blocking pool,
+  serialises it once, and replaces it in a `watch` channel (`AppState::summary`) that every
+  subscriber reads, so a tick costs one serialisation whatever the number of subscribers. A
+  new subscriber gets the current summary at once. The hub refuses to start when the first
+  summary can't be built (`StartupError::FirstSummary`); a later tick that fails keeps
+  serving the previous one. The dashboard is served from
   `HUB_STATIC_DIR` when it is set (it must then be a directory the hub can search, or the
   hub refuses to start), and from `static` under the working directory otherwise. The container image sets it to
   `/usr/share/system-hub/static`, outside the `/app` data volume, because a named volume is
@@ -189,8 +222,10 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 | Push | Agent → Hub | WebSocket + MessagePack | Agent behind NAT/firewall from hub's side; lower latency, smaller payload (~50-70% smaller than equivalent JSON) |
 
 A push connection carries two kinds of binary frame: snapshot frames, and application frames
-(one scrape round each). The hub tries a snapshot first, then an application frame, and drops
-whatever decodes as neither. An old hub drops application frames the same way.
+(one scrape round each). Every binary message first spends a token of the connection's decode
+budget; a message past the budget is dropped undecoded and counted. The hub then tries a
+snapshot, then an application frame, and drops whatever decodes as neither. An old hub drops
+application frames the same way.
 
 ## Domain model
 
@@ -207,23 +242,35 @@ match those rules (listed under Open architectural questions below).
 | **Agent Access** | agent | — | `auth.rs`, `routes/*` | who may read the agent's API |
 | **Telemetry Publishing** | agent | — | `push/` (WS client, agent-side `PushPayload`; `PushFeed` and `SnapshotCursor`, which sends each published snapshot once, by seq; `current_round` / `next_round` / `give_up_rounds` for the round channel); `push/application_frame.rs` (the application frame); `applications/wire.rs` (`ApplicationReportDto`, one report's wire shape, shared with the applications poll response) | sending snapshots and scrape rounds to a hub |
 | **Application Telemetry** | agent | `applications/config.rs` (`ApplicationsConfig::parse` over a lookup function, `ApplicationName`, `ActuatorBaseUrl`, `ActuatorCredentials` / `BasicCredentials`, `ScrapeInterval`, `ApplicationsConfigError`); `applications/report.rs` (`ApplicationGauge`, `MeterValue`, `Meters`, `RawScrape`, `ApplicationReport`, `ApplicationHealth`, `ScrapeFailure`, `ApplicationVersion`, `rate_per_second`, `ScrapeHistory::advance`); `applications/round.rs` (`RoundId`, `RoundSequence`, `ScrapeRound`, `NamedReport`, `health_change`) | `main.rs::start` (passes `std::env::var`, logs and exits on a refusal); `applications/actuator.rs` (Actuator answers → meter values, health, version); `applications/scraper.rs` (the HTTP client: `Scraper`, `Timeouts`, the body cap); `applications/scrape_loop.rs` (`scrape_loop`, the round `watch` channel); `routes/applications.rs` (`GET /api/applications` and its JSON) | which Spring Boot applications the operator asked the agent to watch (RFC 0009) |
-| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`) | `db.rs` `systems` table, `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
-| **Ingestion** | hub | — | `collector/` (HTTP poll), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` / `Answer`, the handshake and idle deadlines, the oversize linger, hub-side `PushPayload`, `ConnectionRounds` (a connection's pace and refusal count), `RefusedFrame`; `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `refused_poll`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits` and `PushConfig`) | turning agent output into hub metrics, alerts and status |
-| **Fleet History** | hub | `models.rs` (`MetricSnapshot`, `AlertRecord`, `HubSummary`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db.rs` `metrics` / `alerts` / `metric_retention` tables and `store_round`, `state.rs` live cache and `live_applications`, `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`) | stored time series, alert history, retention, and each system's shown scrape round |
+| **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`, `MAX_DISPLAY_BYTES`, `UptimeDisplay`, `LastSeen`, `StatusUpdate` / `after_snapshot`, `PollInterval`, `needs_system_info`, `enabled_systems`) | `db/mod.rs` `systems` table (`insert_system_if_absent`, `update_system_status` for the offline markings), `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
+| **Ingestion** | hub | — | `collector/` (HTTP poll: `PolledAnswer` / `PolledInfo`, the parsed answer and the system info the registry fill reads; `PollFailure`; `MAX_SYSTEM_BODY`; `collector/capped_body.rs`: `read_capped`, `CappedBodyError`), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` (with `RegistryUnavailable` / `RegistryFailure`) / `Answer`, the handshake and idle deadlines, the oversize linger; `push/ingest.rs`: hub-side `PushPayload`, `SnapshotFrame` / `PushedInfo`, `SnapshotRefusal`, `register_if_new`, `ingest_frame`, `update_registry`, `end_connection`; `push/connection.rs`: `ConnectionState` (a connection's decode budget, pace and counts), `Tally`, `Occurrence`, `warn_first`, `DecodeBudget`, `DECODE_BURST`); `snapshot_intake.rs` stores one snapshot for either mode (`store_snapshot`: the rule, the store, the live metrics entry); `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `log_refused_round`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits`, `PushConfig` (with `decode_refill`) and the production timings, `DECODE_REFILL` among them) | turning agent output into hub metrics, alerts and status |
+| **Fleet History** | hub | `models.rs` (`AlertRecord`, `HubSummary`); `snapshot.rs` (`ReportedSnapshot`, `ReportedDisk`, `Snapshot`, `Scalar`, `MountPoint`, `SnapshotTime`, `LeftOut`, `snapshot_rule`, `MAX_DISKS`, `MAX_MOUNT_POINT_BYTES`, `LeftOutLog`, `left_out_log`, `snapshot_retention`, `LiveMetrics`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db/history.rs` `metrics` / `metric_retention` tables (`store_snapshot` / `SnapshotStored`, `store_round`, the pruning), `db/mod.rs` `alerts` table, `state.rs` (`live_metrics`, `evict_live_metrics`, `live_applications`, `summary`), `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`; `routes/sse.rs`: the publisher, `Summary`, `SummaryFailure`, and the wire DTOs `SummaryDto` / `LiveMetricsDto`) | stored time series, alert history, retention, each system's live metrics, and each system's shown scrape round |
+
+Two pure modules belong to no context and have no domain term of their own:
+`token_bucket.rs` (`TokenBucket`, `Refill`, `Empty`), the bucket arithmetic both `SourcePace`
+and `DecodeBudget` wrap, and `hourly_warning.rs` (`HourlyWarning`, `hourly_warning`), the
+at-most-hourly `warn` that `left_out_log` and the applications poll's `log_refused_round` share.
 
 **Published contracts between contexts** (both sides must change together, and a
 mixed-version fleet must keep working):
 
 - *Push handshake*: Telemetry Publishing → Ingestion. JSON text messages: the agent sends
   `{"type":"auth",…}` (hub-side `AuthMessage`), and the hub answers `auth_ok`/`auth_error`
-  (agent-side `HubMessage`). The connection carries two deadlines: the auth message within
-  10 s of the upgrade, and after that some message at least every 90 s. Pings count, and the
-  hub answers them itself; every shipped agent pings every 30 s.
+  (agent-side `HubMessage`). The hub answers `registry unavailable` when it can't check or
+  register the id (a database error, or a registration that panicked); every shipped agent
+  retries any `auth_error` after 5 s. The connection carries two deadlines: the auth message
+  within 10 s of the upgrade, and after that some message at least every 90 s. Pings count,
+  and the hub answers them itself; every shipped agent pings every 30 s.
 - *Push frame*: Telemetry Publishing → Ingestion. A binary MessagePack `PushPayload`,
-  declared independently in `src/push/mod.rs` and `system-hub/src/push/mod.rs`. The agent encodes
-  it with `rmp_serde::to_vec`, which is positional: structs become arrays with no field
-  names, so field *order* is the contract. The hub silently drops frames that fail to
-  decode. A frame, like any push message, is at most 512 KiB.
+  declared independently in `src/push/mod.rs` and `system-hub/src/push/ingest.rs`. The agent
+  encodes it with `rmp_serde::to_vec`, which is positional: structs become arrays with no
+  field names, so field *order* is the contract. The hub silently drops frames that fail to
+  decode. A frame, like any push message, is at most 512 KiB, and spends the connection's
+  decode budget before it is decoded: 3 messages, then one per second, which no shipped
+  agent exceeds. A decoded snapshot frame whose `timestamp` is above 2^63 − 1 is refused
+  whole; otherwise the snapshot rule decides what is kept. An `uptime_display` or a
+  `memory_total_display` over 64 bytes or holding a control character, and a
+  `memory_total_bytes` above 2^63 − 1, count as not reported, and the stored value is kept.
 - *Application frame*: Telemetry Publishing → Ingestion, on the same connection. A positional
   5-element array `[kind, run, seq, interval_secs, applications]`, each application
   `[name, health, version | nil, {gauge: f64}]`, with `kind` = `"applications.v1"`; an
@@ -233,7 +280,9 @@ mixed-version fleet must keep working):
   `testdata/application-frame-v1.msgpack`, which both crates' tests read. A frame and a
   snapshot never decode as each other (5 elements against 21).
 - *Poll responses*: the agent's `/api/system`, `/api/alerts` and `/api/applications` JSON →
-  Ingestion (`collector/`), none of them through a redirect. `/api/alerts` is read field by
+  Ingestion (`collector/`), none of them through a redirect. `/api/system` is read up to
+  4 MiB, and its snapshot and memory capacity go through the same rules as a push frame's.
+  `/api/alerts` is read field by
   field from untyped `serde_json::Value`. `/api/applications` is `{round: {run, seq} | null,
   interval_secs, scraped_at, applications: [{name, health, version, gauges}]}`; the hub
   ignores `scraped_at`, and the golden body `testdata/applications-v1.json` ties the two
@@ -249,11 +298,12 @@ mixed-version fleet must keep working):
 | **agent** | the `system-agent` process running on one monitored host | `system-agent` crate |
 | **hub** | the `system-hub` process aggregating many agents | `system-hub` crate |
 | **system** | a monitored host *as the hub knows it*: registry entry, config, status | `SystemInfo`, `systems` table |
-| **memory capacity** (hub) | a system's memory total as its agent last reported it, bytes and display always together: the agent's resource capacity for memory, so a container's limit in a container | `MemoryCapacity` |
+| **memory capacity** (hub) | a system's memory total as its agent last reported it, bytes and display always together: the agent's resource capacity for memory, so a container's limit in a container. A display that is empty, over 64 bytes or holding a control character is no report, and neither are bytes above 2^63 − 1, which SQLite can't hold: the stored capacity is then kept | `MemoryCapacity`, `MAX_DISPLAY_BYTES` |
 | **system id** | the identifier an agent presents in the push handshake; the hub uses it as the system's primary key. It is one URL path segment: non-empty, at most 255 bytes, and not `.` or `..`. The hub refuses any other id at the push handshake; rows stored before the rule may still hold one (see Open architectural questions) | `SystemId` (hub) |
 | **default system name** | the name the hub gives a newly pushed system until its first snapshot supplies a hostname: the longest prefix of the system id that is at most 8 bytes and ends on a character boundary | `SystemId::default_name`, `SystemId::is_default_name` |
-| **system status** | the hub's view of whether a system is reachable: online / offline / unknown. A push system is marked offline when its connection ends, and a connection ends at the latest 90 s after its last message, or 30 s after an oversize one | `SystemStatus` |
-| **snapshot** | one point-in-time reading of the agent's execution environment: its CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent), `MetricSnapshot` (hub), `PushPayload` (wire) |
+| **system status** | the hub's view of whether a system is reachable: online / offline / unknown. A push system is marked offline when its connection ends, and a connection ends at the latest 90 s after its last message, or 30 s after an oversize one. A polled system is marked offline by each poll that fails. A system is marked online by each stored snapshot, in the snapshot's transaction, and a new push id is registered online at its handshake | `SystemStatus`, `StatusUpdate` (one write of a system's status, its last seen and its error) |
+| **last seen** | what the hub shows in a system's `last_seen` column, which several writers share until RFC 0010's contact time: the uptime its last stored push frame reported (at most 64 bytes, with no control character, else the previous value is kept), blank once its push connection ends, or the time of its last poll, whether that poll succeeded or marked it offline. So a polled system's last seen moves on while it is down | `LastSeen`, `UptimeDisplay` (a stored snapshot's); `update_system_status` (the offline markings') |
+| **snapshot** | one point-in-time reading of the agent's execution environment: its CPU, memory, swap, disks, network, processes, etc. | `SystemSnapshot` (agent); `ReportedSnapshot` and `Snapshot` (hub, before and after the snapshot rule), `SnapshotTime` (its time: the frame's `timestamp` on push, the hub's clock on poll); `PushPayload` (wire) |
 | **collected snapshot** | a snapshot the sampler read at least 1 s after its priming reading, not yet published, with its `collected_at` (unix seconds on the agent's clock) and `read_at` (the monotonic clock) | `CollectedSnapshot` |
 | **priming reading** | a sampler's first reading, which only gives the next one an interval to measure CPU over. It is never published, since sysinfo's first CPU figure is a since-boot average. A reading becomes a collected snapshot only once priming is done | `Sampler::prime`, `Priming` |
 | **published snapshot** | the latest collected snapshot, published by the background collector with its snapshot seq. It is the only snapshot any route, stream or push frame reads | `PublishedSnapshot`, `SnapshotReceiver` |
@@ -271,13 +321,16 @@ mixed-version fleet must keep working):
 | **steal time** | the share of CPU time the hypervisor withheld from a virtual machine between two readings, from the host kernel's `/proc/stat`: a real 0 on bare metal, unmeasured when the kernel has no steal column | `StealCounters`, `steal_share` |
 | **workload** | the processes inside the container that the agent monitors. When PID 1 of the agent's PID namespace is outside the monitored cgroup, the namespace is shared and the process list isn't only the workload | `ProcessView` |
 | **load scope** | whose load average the kernel reports to the agent: the host's in a container, which shares the host's run queue, else the execution environment's own | `LoadScope` |
-| **metric point** | one timestamped value of one metric | `MetricPoint` (both crates) |
+| **metric point** | one timestamped value of one metric | `MetricPoint` (both crates); a snapshot's are `Snapshot::metric_points` |
+| **snapshot rule** | how the hub turns a snapshot into what it keeps, the same for push and poll: `cpu`, `memory`, `swap`, `load1` and `load5`, and one point per disk. A value that isn't reported or isn't finite, a disk with an invalid mount point, and the disks past the first 1024 valid ones are each left out on their own, and counted. What was left out is logged at `warn` at most once an hour per system | `snapshot_rule`, `Snapshot`, `Scalar`, `LeftOut`, `left_out_log`, `MAX_DISKS` |
+| **mount point** | where a disk is mounted, as the hub keeps it: 1 to 256 bytes, with no control character. A disk's series is `disk:<mount point>` | `MountPoint`, `MAX_MOUNT_POINT_BYTES` |
+| **live metrics** | a system's latest snapshot as the snapshot rule kept it, held in memory for the dashboard. Written with the snapshot's store, and removed when the system is deleted or its push connection ends | `LiveMetrics`, `AppState::live_metrics` |
 | **history** | the agent's in-memory ring buffer of recent metric points (3600 per series) | `MetricsHistory` |
 | **alert rule** | a metric, an operator, a threshold, a duration and a cooldown | `AlertRule` |
 | **agent run** | one lifetime of the agent process, identified by a random UUID minted at startup | `AgentRun` |
 | **tick** | one evaluation of every enabled alert rule against one snapshot, every 2 s | `AlertManager::evaluate` |
 | **metric readings** | the values of one snapshot that alert rules read on a tick (CPU, memory, swap, disks, load, core count). CPU, memory and swap are each a *reading*: *measured* on the tick, *carried* (the tick couldn't measure it and the last measured value stands: the rule skips the tick, keeping its breach and incident, notifying nothing), or *unavailable* (the rule clears, ending its incident or pending breach, and stays idle until a measured tick). A reading follows its group's reading source: a group read on the tick (from the cgroup or the kernel) is measured, a carried group is carried, an unavailable one is unavailable, and a measured percentage that isn't a number is unavailable too. Percentages are over the resource capacity | `Readings`, `Reading`, `ReadingOrigins` |
-| **percent** | a share of a resource, held to 0–100 inclusive. NaN isn't one | `Percent` |
+| **percent** (agent) | a share of a resource, held to 0–100 inclusive. NaN isn't one. The hub keeps a snapshot's percentages as the snapshot rule passes them: any finite value (see Open architectural questions) | `Percent` |
 | **load average** | runnable tasks averaged over 1, 5 or 15 minutes. Not a percent and not bounded above | `environment::usage::LoadAverage` (domain), `models::LoadAverage` (the snapshot's DTO) |
 | **alert incident** | one uninterrupted breach of one alert rule. It becomes active on the first tick the breach has lasted the rule's duration, and ends on the first tick the rule no longer breaches, when the rule set is replaced, or when the agent restarts | `Incident`, held by `Breach::Active` |
 | **incident id** | identifies one alert incident: `<agent run>-<sequence>`, where the sequence counts the run's incidents from 1 and never rewinds. Every active alert of the incident carries it | `IncidentId` |
@@ -285,12 +338,13 @@ mixed-version fleet must keep working):
 | **notification** | an active alert's announcement (the agent's `🚨 ALERT` log line), made when the incident is active and the rule's cooldown since its last notification has elapsed. The cooldown spans incidents | `Report::Notify`, the return value of `evaluate` |
 | **severity** | how serious an alert is (info / warning / critical). The hub stores it as a free `String`, defaulting to `"warning"` | `AlertSeverity` (agent), `AlertRecord.severity` (hub) |
 | **alert record** | the hub's stored copy of one alert incident, keyed by `<system id>_<incident id>` and inserted with `INSERT OR IGNORE`, so it keeps the values first seen | `AlertRecord`, `alerts` table |
-| **retention** | how long the hub keeps metric points per system per metric: a `metric_retention` row, else 24 h. For `app:*` metrics a negative (hand-set) row counts as none | `metric_retention` table, `APPLICATION_RETENTION_SECS` |
+| **retention** | how long the hub keeps metric points per system per metric: a `metric_retention` row, else 24 h. A negative (hand-set) row counts as none, and so does a snapshot metric's row that isn't an integer | `metric_retention` table, `snapshot_retention`, `APPLICATION_RETENTION_SECS` |
 | **poll** | the hub fetching a system's snapshot, alerts and scrape round over HTTP, every 30 s, following no redirect | `collector/` |
 | **push** | an agent streaming snapshots and scrape rounds to the hub over WebSocket + MessagePack | `push/` (both crates) |
 | **push token** | the shared secret (`HUB_PUSH_TOKEN`) an agent must present in the push handshake when one is configured. Unset or empty leaves push open; a value that isn't UTF-8 makes the hub refuse to start | `PushToken`, `PushAuth` (hub) |
-| **push handshake** | the JSON text exchange that authenticates a push connection. A *rejection* is an auth message the hub refuses by its content (shape, token or system id); a *refusal* is any `auth_error` answer: a rejection, or a handshake timeout | `AuthMessage`, `HandshakeRejection`, `Refusal`, `Handshake` (hub), `HubMessage` (agent) |
+| **push handshake** | the JSON text exchange that authenticates a push connection. A *rejection* is an auth message the hub refuses by its content (shape, token or system id); a *refusal* is any `auth_error` answer: a rejection, a handshake timeout, or `registry unavailable` (registering a new push id failed or panicked) | `AuthMessage`, `HandshakeRejection`, `Refusal`, `Handshake` (hub), `HubMessage` (agent) |
 | **push frame** | one binary, positional MessagePack message on the push connection: a snapshot frame or an application frame | `PushPayload` (both crates) |
+| **decode budget** | a token bucket per push connection that every binary message spends before it is decoded, whatever its kind: 3 messages, then one per second, on the monotonic clock. A message past it is dropped undecoded and counted. A round's admission is still its source pace | `DecodeBudget`, `DECODE_BURST`, `DECODE_REFILL` |
 | **application frame** | a push frame carrying one scrape round | `ApplicationFrame` (agent), `ApplicationFrameDto` (hub) |
 | **application** | a Spring Boot service the agent's operator names in `SPRING_BOOT_APPS`, watched through its Actuator. Not a package, unit or container: those are the host inventory. `ApplicationTarget` is an application *as configured* (name, actuator base URL, credentials), as opposed to what a scrape of it reports | `ApplicationTarget` |
 | **application name** | how the operator names an application: 1 to 64 bytes of `[A-Za-z0-9_.-]`, not `.` or `..`. Upper-cased with `-` and `.` as `_`, it is the application's credential key, and two names with the same key can't coexist | `ApplicationName` |
@@ -309,7 +363,7 @@ mixed-version fleet must keep working):
 | **application freshness** | whether a held round is still current: stale once more than two scrape intervals and 30 s have passed since it arrived | `Freshness`, `freshness` |
 | **round digest** | a keyed hash of a scrape round's content as the hub converted it (interval, and each application's name, health, version and gauges). One key per hub process, so no sender can compute one | `RoundDigest`, `RoundDigester` |
 | **recent rounds** | the last 8 (round id, round digest) pairs the hub accepted for a system; a round matching one of them exactly is a duplicate. Kept across disconnects | `RecentRounds` |
-| **source pace** | a token bucket per source of rounds (one push connection, or the poller for one system): 2 rounds, then one per 8 s, on the monotonic clock. The poller's is read and spent inside the admission step, so overlapping polls share it | `SourcePace`, `ConnectionRounds`, `SystemApplications::poll_pace` |
+| **source pace** | a token bucket per source of rounds (one push connection, or the poller for one system): 2 rounds, then one per 8 s, on the monotonic clock. The poller's is read and spent inside the admission step, so overlapping polls share it | `SourcePace` (over `TokenBucket`), `ConnectionState::pace`, `SystemApplications::poll_pace` |
 | **admission** | the hub's decision on a round: accept, duplicate, or too soon | `Admission`, `admit`, `RoundStored` |
 | **round id** | identifies a scrape round: the **agent run** and a sequence counting the run's rounds from 1, never rewinding. The hub parses the run as a UUID and compares ids only for equality | `RoundId` (both crates), `RoundSequence` |
 | **health change** | an application becoming unreachable, or recovering; a change among reported healths (up to down) is not one. The agent logs each: `warn` naming the scrape failure, `info` on recovery | `HealthChange`, `health_change` |
@@ -357,13 +411,28 @@ mixed-version fleet must keep working):
     buffer is capped at 64 KiB (a peer that never reads gets its pongs parked and replaced,
     never an ever-growing buffer), and handshake answers are sent under a 5 s timeout.
   - Every exit after registration, a failed `auth_ok` included, runs the one offline
-    marking. Log lines name a system id in `Debug` form, so a self-asserted id can't forge
-    log lines.
-- **Hub → Agent (poll)**: hub sends the per-system token stored in `db.rs` (as configured via
-  `POST/PUT /api/systems`) as the agent's expected auth token, in `X-API-Key`. No poll
-  follows a redirect: reqwest strips only standard credential headers across hosts, so a
-  followed redirect would carry the token anywhere. The poll client still honours
-  environment proxies.
+    marking, which also evicts the system's live metrics (`end_connection`). Log lines name
+    a system id in `Debug` form, so a self-asserted id can't forge log lines.
+
+  What a connection's messages cost is bounded too (`rfcs/0007-push-ingestion-cost.md`):
+  - Every binary message spends the connection's decode budget before it is decoded: 3
+    messages, then one per second. A message past it is dropped undecoded, counted, and
+    reported in one `info` line when the connection ends; the connection stays open. It is
+    still read off the socket, up to 512 KiB.
+  - A decoded snapshot is bounded by the snapshot rule: at most 1024 disks, each mount point
+    1 to 256 bytes with no control character, and only finite values. The displays the
+    registry keeps (uptime, memory capacity) are at most 64 bytes with no control character.
+    A refused snapshot frame, and one that fails to store, is logged at `warn` the first time
+    on a connection and at `debug` after that, and counted.
+  - A snapshot is stored in one transaction, on the blocking pool. When the system's row is
+    gone, nothing is written and the connection ends.
+- **Hub → Agent (poll)**: hub sends the per-system token stored in `db/mod.rs` (as
+  configured via `POST/PUT /api/systems`) as the agent's expected auth token, in
+  `X-API-Key`. No poll follows a redirect: reqwest strips only standard credential headers
+  across hosts, so a followed redirect would carry the token anywhere. The poll client still
+  honours environment proxies. The `/api/system` answer is read up to 4 MiB, as it arrives,
+  and a larger one marks the system offline; its snapshot goes through the same snapshot
+  rule as a pushed one.
 - **Client → Hub**: no auth on the hub's own REST/SSE API in the current implementation — the
   hub is assumed to sit behind a trusted network boundary or reverse proxy (see "Deployment
   patterns" in `README.md`). Adding hub-side client auth would be an architectural change
@@ -398,17 +467,20 @@ mixed-version fleet must keep working):
 ## Storage
 
 SQLite database `system-hub/system-hub.db`, auto-created on first run, migrations applied at
-startup (`db.rs`).
+startup (`db/mod.rs`; metric history in `db/history.rs`).
 
 | Table | Contents |
 |---|---|
 | `systems` | Registered agents: id, name, URL, token, status, OS info, poll interval |
 | `metrics` | Time-series rows: system_id, metric name (`cpu`, `memory`, `swap`, `load1`, `load5`, `disk:{mount}`, and per application `app:{name}:{gauge}` and `app:{name}:up`), value, timestamp |
 | `alerts` | Alert history, one record per alert incident, with acknowledge support |
-| `metric_retention` | Per-system, per-metric retention window (default 24h). Snapshot metrics are pruned on each insert of that metric; `app:*` metrics by `retention.rs` every 10 minutes, in batches of at most 5,000 rows, each under its own hold of the mutex |
+| `metric_retention` | Per-system, per-metric retention window (default 24h). A snapshot metric is pruned in each transaction that stores a point of it, at most 16 rows per point, oldest first; `app:*` metrics by `retention.rs` every 10 minutes, in batches of at most 5,000 rows, each under its own hold of the mutex |
 
-Snapshot points carry the agent's clock (the frame's `timestamp`); `app:*` points carry the
-hub's clock at arrival. A scrape round's points are inserted in one transaction.
+Snapshot points carry the agent's clock on push (the frame's `timestamp`) and the hub's clock
+on poll; `app:*` points carry the hub's clock at arrival. A snapshot's points, their series'
+prunes and the system's status and last seen are written in one transaction
+(`Database::store_snapshot`), which first checks that the system's row exists and writes
+nothing when it doesn't. A scrape round's points are inserted in one transaction.
 
 The `system-agent` has no persistent storage — its metric history is an in-memory ring buffer
 (`state.rs`, 3600 points) that resets on restart.
@@ -437,11 +509,15 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   `authenticate` function, which a table-driven unit test covers without a server. The
   real-server tests inject a `PushConfig` (token, deadlines, limits, linger) through
   `router_with_config` instead of setting `HUB_PUSH_TOKEN`, so they run in parallel with no
-  `unsafe` env mutation and never wait for a production deadline. After closing the socket
-  they wait for the offline marking, which is ordered after every frame's ingestion. The
+  `unsafe` env mutation and never wait for a production deadline. `PushConfig` also carries
+  the decode budget's refill period, so a test that sends several frames can take a zero
+  refill (a bucket that never runs out), while the budget's own tests send faster than a
+  short refill allows. After closing the socket they wait for the offline marking, which is
+  ordered after every frame's ingestion and before the eviction of the live metrics. The
   deadline and linger tests use rows whose time windows don't overlap, so no fixed duration
   passes them; the pong test shrinks both sockets' kernel buffers so that the write-buffer
-  cap is what the returned pongs show.
+  cap is what the returned pongs show. The snapshot rule, the token bucket and the display
+  rules are pure and tested by tables, without a server.
 - **Contract golden files** (`testdata/` at the repo root): `application-frame-v1.msgpack`,
   written by `generate_application_frame_v1.py`, a MessagePack encoder independent of
   rmp-serde. The agent's test asserts its encoding of a fixed round equals the bytes; the
@@ -463,16 +539,30 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   invalid `HUB_LISTEN` refuses startup before any file is created, an unopenable database is a
   logged exit, not a panic, and `HUB_LISTEN` is bound, logged and suggested as configured.
   Every hub it starts to serve listens on a port the OS chose (`HUB_LISTEN=…:0`, read from the
-  startup line) or a probed free one, so none needs 9091 free.
+  startup line) or a probed free one, so none needs 9091 free. The `[::]:0` case needs IPv6,
+  which CI's runners have. It also checks that the running hub starts its SSE publisher: a
+  system registered after startup reaches a subscriber within one tick.
 - Route tests drive each module's `router`. In the hub, `main.rs::app` assembles the
   production router (the module routers, `ServeDir` and CORS), and its tests check that the
   API, applications, SSE and push routes, CORS and the configured dashboard directory all survive the
   assembly. The agent's `main.rs` still assembles its router without such a test.
-- **`system-hub`'s SQLite layer** (`db.rs`) and its agent-polling logic (`collector/`) are
+- **`system-hub`'s SQLite layer** (`db/`) and its agent-polling logic (`collector/`) are
   tested against real (but temporary) SQLite files via the `tempfile` crate — never against the
-  real `system-hub.db`. `collector/`'s `poll_system` (including the applications poll and the no-redirect rule) is tested against a small mock
+  real `system-hub.db`. `store_snapshot` is tested for its one transaction (a failing
+  statement leaves no point and no status behind), its capped prune and its row check;
+  `insert_system_if_absent` for writing nothing for a known id (a recording `BEFORE INSERT`
+  trigger, and a `query_only` connection); `register_if_new` panics on a poisoned database,
+  so the handshake's `registry unavailable` for a panic has a real-server test. A test that needs
+  history in place plants it with the test-only `Database::plant_point`.
+  `collector/`'s `poll_system` (including the applications poll and the no-redirect rule) is tested against a small mock
   `system-agent`-shaped `axum::serve` instance covering the success, JSON-parse-error,
-  HTTP-error, and connection-refused branches.
+  HTTP-error, connection-refused, over-4-MiB and failed-store branches.
+- **The SSE publisher** (`routes/sse.rs`) is tested on its watch channel: a new subscriber's
+  first summary arrives at once and is the published one, not a fresh build; a summary
+  published with no subscriber is kept; three subscribers over two ticks hold two
+  allocations, so each tick is serialised once and shared. The summary event's bytes for a
+  fixed state are pinned, so the shared serialisation can't change what the dashboard
+  reads.
 - **The hub dashboard** (`static/index.html`) has no JS unit-test harness. Its rendering rule
   is checked by an XSS smoke test, `system-hub/dashboard-tests/xss.mjs`: plain Node with no
   npm dependencies, driving headless Chromium (`CHROME_BIN`, else the first found on `PATH`,
@@ -555,8 +645,21 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - A refused polled round creates a system's `live_applications` entry to remember when it
   last warned; a poll racing `DELETE /api/systems/:id` can leave such an entry, holding only
   that time, for a deleted system.
+- The hub keeps a snapshot's `cpu`, `memory`, `swap` and disk usages as any finite `f32`: the
+  snapshot rule refuses what isn't finite but not what is out of 0–100, so a pushed −5 or
+  1e30 reaches history and the SSE summary. A hub-side percent with an out-of-range reason
+  among the rule's left-out counts would be a behaviour change of its own.
 - A snapshot series that stops receiving points (a disk unmounted, a system gone quiet) is
-  never pruned: snapshot pruning runs only when that metric is inserted.
+  never pruned: snapshot pruning runs only when that metric is inserted. Upgrading to RFC
+  0007 orphans more series: disks past a host's first 1024, the poller's old `disk:` series
+  (a disk without a mount point), and mount points over 256 bytes or holding a control
+  character. No cleanup ships: disks past the first 1024 can't be told apart in SQL from
+  disks that are merely unmounted.
+- The client-chosen push `timestamp` drives pruning: a frame from the far future prunes up to
+  16 of the oldest points of each series it carries, so a sender that keeps sending such
+  frames empties those series' history, and the far-future points it leaves are never
+  pruned by honest frames. Only a push token holder (or anyone, with push open) can send
+  one.
 - Anyone who can push as a system id (the push token, or anyone when it's unset) can push
   scrape rounds as that system, interleaved with the honest ones; the dashboard shows
   whichever arrived last. Admission rules out locking the honest rounds out, not forging.
@@ -610,10 +713,18 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   `414 URI Too Long`.
 - The bundled SQLite enforces foreign keys (`SQLITE_DEFAULT_FOREIGN_KEYS=1` in
   `libsqlite3-sys`), so `Database::insert_system`'s `INSERT OR REPLACE` would cascade-delete a
-  system's metrics, alerts and retention rows if it ever replaced an existing row. Every caller
-  means to insert a new id (`POST` generates a UUID, and `register_if_new` checks first), but
-  that check is best-effort: a failed lookup counts as "not registered", so a row-mapping
-  error on an existing push system would replace it and lose its history.
+  system's metrics, alerts and retention rows if it ever replaced an existing row. Its one
+  caller is `POST /api/systems`, which inserts a new UUID. Push registration doesn't use it:
+  `insert_system_if_absent` checks with `system_exists`, which reads no column, and inserts
+  with `ON CONFLICT(id) DO NOTHING`, so no failed lookup can make it replace a row.
+- A row an older hub stored with a negative `poll_interval_secs` (its `PUT` accepted a value
+  above 2^63 − 1, which `PollInterval` now refuses with 422) maps back through no read.
+  `get_system` then fails for that row, so its `PUT` answers 500 and only `DELETE` removes it,
+  and `list_systems` fails for every row: the REST list and the SSE summary fall back to no
+  systems, and the poller keeps its last good read. Its push agent's snapshots are still
+  stored, and its registry fill is skipped.
+- `POST /api/systems` still takes `poll_interval_secs` without `PollInterval`: a value above
+  2^63 − 1 answers 500, and one below 5 is clamped to 5, while a `PUT` of 0 is stored.
 - The hub's `alerts` table has no retention. With one record per alert incident, a flapping
   rule adds a record for each incident a poll sees.
 - An agent alert without an `id` gets a random id on the hub (`collector/`), so it becomes a
@@ -627,12 +738,15 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
 - Most blocking work is not offloaded. The inventory collectors' `std::process::Command`
   shell-outs (`dpkg-query`, `rpm`, `pacman`, `apk`, `systemctl`, `docker`, `ss`) run on the
   async runtime, per request. The system reading (sysinfo, `/etc/os-release`,
-  `lsb_release`) and the push client's system id (`hostname`) run in `spawn_blocking`. The hub's synchronous
-  `rusqlite` calls hold a `std::sync::Mutex` from async code everywhere except the push
-  receiver, which runs registration, frame ingestion and offline marking in
-  `spawn_blocking`.
-- Retention policy (look up `retention_secs`, fall back to 86400, delete older rows) is
-  decided inside `Database::insert_metric`, in the SQL adapter, rather than in the domain.
+  `lsb_release`) and the push client's system id (`hostname`) run in `spawn_blocking`. The
+  hub's synchronous `rusqlite` calls hold a `std::sync::Mutex`. The push receiver
+  (registration, frame ingestion, offline marking), the poller (its registry read, snapshot
+  store, registry fill, offline marking and applications store) and the SSE publisher run
+  them in `spawn_blocking`; the poller's alert records and every REST handler, `DELETE`
+  included, still run them on the async runtime.
+- Retention's fallback (no row, or a negative or non-integer one, means 24 h) is the pure
+  `snapshot_retention`; the DELETE of older rows stays in SQL, inside `store_snapshot`'s
+  transaction.
 - The push system id is self-asserted (API1). The hub trusts whatever `system_id` the
   handshake presents, and `GET /api/systems` lists every id without auth. So anyone holding
   the single shared push token, or anyone at all when it is unset, can push as any
@@ -640,10 +754,32 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   or force it offline on disconnect. Fixing this needs per-system push credentials.
 - Push auto-registration is unbounded (API4). Every handshake with an unseen system id
   inserts a permanent, enabled `systems` row, and the poller visits every enabled row every
-  30 s (RFC 0008). Messages are capped at 512 KiB, but what one frame costs to ingest is not
-  (RFC 0007).
+  30 s (RFC 0008). What one frame costs to ingest is bounded: at most 512 KiB, one decode per
+  budget token, at most 1029 points in one transaction (RFC 0007).
 - Push-registered systems (`url: "push://"`) are also polled. reqwest rejects the scheme,
   so the poller marks them offline, and they flap between online and offline.
+- Every poll, of any system, builds its own reqwest client on a runtime worker, loading the
+  CA roots each time. With OpenSSL 3.0.13 in a 4-core container that cost about 0.36 s of
+  CPU per poll (RFC 0007's measurement), so such a hub keeps up with about 300 polls per 30 s
+  tick: 1,000 enabled `push://` rows kept every core busy and left the API unanswered. One
+  client per system, and no poll of `push://` rows, would remove it.
+- The system info strings (`hostname`, `os`, `kernel`, `cpu_model`, and the name taken from
+  the hostname) are unbounded, and reach every SSE summary: push writes them once per
+  registration, poll on every poll.
+- The single SQLite mutex bounds a fleet's aggregate load: every snapshot store, round store,
+  REST handler and summary build takes it in turn. RFC 0007's Appendix measured a store's
+  hold at about 2 ms for a 5-disk snapshot and 54 ms for a 1024-disk one, on a disk where a
+  commit costs about 1 ms: by itself the mutex admits about 1,000 such five-disk systems, or
+  37 with 1024 disks, pushing every 2 s.
+- SSE subscribers are unbounded. Each tick is serialised once and shared, but each
+  subscriber's event still copies the summary's bytes.
+- Any connection presenting an id evicts that system's live metrics when it ends, even while
+  another connection for the same id is still pushing, until RFC 0016 ties eviction to the
+  current connection.
+- A deleted push system comes back while its agent runs: nothing binds the id to a
+  credential, so the agent's reconnect registers it again, with no history.
+- A message the decode budget drops is still read off the socket, up to 512 KiB: the budget
+  bounds decoding and storing, not reading.
 - Connections that never finish their HTTP request are unbounded (API4): `axum::serve`
   gives hyper no timer, so hyper's 30 s header-read timeout is off for every route. The fix
   is a hyper-util server with `TokioTimer`, which touches every route.
@@ -651,13 +787,11 @@ Tracked here so they aren't rediscovered from scratch; promote any of these to a
   alive with a ping every 89 s.
 - The agent never reads after the push handshake, so the hub's automatic pongs collect in
   its receive buffer. That's harmless now that the hub's write buffer is capped.
-- The snapshot → metric mapping (metric names `cpu`, `memory`, `swap`, `load1`, `load5`,
-  `disk:<mount>`) is written twice: once in `push::metric_points` over the push DTO, and
-  once in `collector/` over the poll DTO. It belongs in one Fleet History domain function.
-- The Fleet Registry rules applied on each push frame are decided inside the Ingestion
-  adapter (`push::update_registry`). Those rules are: refill system info while its
-  hostname or OS is missing, and mark the system online. The default-name rule and the
-  memory capacity refresh live in the domain.
+- The Fleet Registry fill on each push frame is still written in the Ingestion adapter
+  (`push/ingest.rs::update_registry`): it reads the row, then applies the domain's rules
+  (`needs_system_info`, the default-name rule, the memory capacity refresh) in separate
+  statements, outside the snapshot's transaction. Marking the system online is the pure
+  `StatusUpdate::after_snapshot`, written by `store_snapshot`.
 - Rejected push handshakes are logged without the peer's address. The hub isn't served with
   connect info, and behind a reverse proxy it would need a forwarded-header policy.
 - The agent doesn't treat a missing handshake answer as a failure. Its handshake check has

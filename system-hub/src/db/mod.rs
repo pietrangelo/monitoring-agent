@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use crate::models::*;
 
 mod history;
-pub use history::RoundStored;
+pub use history::{RoundStored, SnapshotStored};
 
 /// Whether the system's row exists, on a connection the caller already holds.
 fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::Error> {
@@ -29,6 +29,28 @@ fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::E
         "SELECT EXISTS(SELECT 1 FROM systems WHERE id = ?1)",
         [system_id],
         |row| row.get(0),
+    )
+}
+
+/// A system's columns, in the order the `systems` INSERTs name them.
+fn system_params(sys: &SystemInfo) -> impl rusqlite::Params + '_ {
+    (
+        &sys.id,
+        &sys.name,
+        &sys.url,
+        &sys.token,
+        sys.status.to_string(),
+        &sys.last_seen,
+        &sys.last_error,
+        &sys.os,
+        &sys.hostname,
+        &sys.kernel,
+        &sys.cpu_model,
+        sys.cpu_cores,
+        &sys.total_memory_display,
+        sys.total_memory_bytes,
+        sys.poll_interval_secs,
+        sys.enabled,
     )
 }
 
@@ -184,26 +206,44 @@ impl Database {
                  total_memory_display, total_memory_bytes,
                  poll_interval_secs, enabled)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-            rusqlite::params![
-                sys.id,
-                sys.name,
-                sys.url,
-                sys.token,
-                sys.status.to_string(),
-                sys.last_seen,
-                sys.last_error,
-                sys.os,
-                sys.hostname,
-                sys.kernel,
-                sys.cpu_model,
-                sys.cpu_cores,
-                sys.total_memory_display,
-                sys.total_memory_bytes,
-                sys.poll_interval_secs,
-                sys.enabled,
-            ],
+            system_params(sys),
         )?;
         Ok(())
+    }
+
+    /// Registers `sys` unless a row with its id exists, under one hold of the mutex (RFC 0007
+    /// §4). A known id runs only the existence check, which reads no column, so neither a row
+    /// that doesn't map nor a database that refuses writes fails it. An absent id is inserted
+    /// with `ON CONFLICT(id) DO NOTHING`, so no registration replaces a row.
+    pub fn insert_system_if_absent(&self, sys: &SystemInfo) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        if system_exists(&conn, &sys.id)? {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO systems
+                (id, name, url, token, status, last_seen, last_error,
+                 os, hostname, kernel, cpu_model, cpu_cores,
+                 total_memory_display, total_memory_bytes,
+                 poll_interval_secs, enabled)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO NOTHING",
+            system_params(sys),
+        )?;
+        Ok(())
+    }
+
+    /// Poisons the connection mutex: a thread panics while holding its guard.
+    #[cfg(test)]
+    pub fn poison_for_test(&self) {
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = self.conn.lock().unwrap();
+                panic!("poisoning the database mutex for a test");
+            });
+            assert!(poisoner.join().is_err(), "the poisoning thread panicked");
+        });
+        assert!(self.conn.is_poisoned());
     }
 
     pub fn update_system_status(
@@ -647,7 +687,7 @@ mod tests {
     fn delete_system_cascades_metrics_alerts_and_system_row() {
         let (db, _dir) = temp_db();
         db.insert_system(&sample_system("id-1", "web-01")).unwrap();
-        db.insert_metric("id-1", "cpu", 50.0, 100).unwrap();
+        db.plant_point("id-1", "cpu", 50.0, 100).unwrap();
         db.insert_alert(&AlertRecord {
             id: "alert-1".to_string(),
             system_id: "id-1".to_string(),
@@ -841,5 +881,119 @@ mod tests {
         .unwrap();
 
         assert_eq!(db.count_active_alerts().unwrap(), 1);
+    }
+
+    /// RFC 0007 §4: push registration checks, then inserts only an absent id.
+    mod insert_system_if_absent {
+        use super::*;
+        use rusqlite::OptionalExtension;
+
+        /// A known system with a name of its own and one metric point, whose row no read can
+        /// map: its `poll_interval_secs` is stored as −1, as an older hub's `PUT` stored
+        /// `u64::MAX`.
+        fn db_with_unmappable_known_system() -> (Database, tempfile::TempDir) {
+            let (db, dir) = temp_db();
+            db.insert_system(&sample_system("known", "web-01")).unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO metrics (system_id, metric, value, timestamp)
+                         VALUES ('known', 'cpu', 1.0, 100);
+                     UPDATE systems SET poll_interval_secs = -1 WHERE id = 'known';",
+                )
+                .unwrap();
+            assert!(db.get_system("known").is_err(), "the known row doesn't map");
+            (db, dir)
+        }
+
+        /// The row as a registration may never change it: its name and its points.
+        fn raw_row(db: &Database, id: &str) -> Option<(String, i64)> {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT name, (SELECT COUNT(*) FROM metrics WHERE system_id = ?1)
+                 FROM systems WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+        }
+
+        const REFUSE_INSERTS: &str = "CREATE TRIGGER refuse BEFORE INSERT ON systems
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;";
+        const REFUSE_WRITES: &str = "PRAGMA query_only = ON;";
+
+        #[test]
+        fn only_an_absent_id_is_inserted_and_a_known_row_is_never_changed() {
+            let known_row = Some(("web-01".to_string(), 1));
+            let cases = [
+                ("a known id", "", "known", true, known_row.clone()),
+                ("a new id", "", "new", true, Some(("new".to_string(), 0))),
+                (
+                    "a known id while inserts fail",
+                    REFUSE_INSERTS,
+                    "known",
+                    true,
+                    known_row.clone(),
+                ),
+                (
+                    "a new id while inserts fail",
+                    REFUSE_INSERTS,
+                    "new",
+                    false,
+                    None,
+                ),
+                (
+                    "a known id while writes are refused",
+                    REFUSE_WRITES,
+                    "known",
+                    true,
+                    known_row.clone(),
+                ),
+                (
+                    "a new id while writes are refused",
+                    REFUSE_WRITES,
+                    "new",
+                    false,
+                    None,
+                ),
+            ];
+            for (case, setup, id, succeeds, expected_row) in cases {
+                let (db, _dir) = db_with_unmappable_known_system();
+                db.conn.lock().unwrap().execute_batch(setup).unwrap();
+
+                let outcome = db.insert_system_if_absent(&sample_system(id, id));
+
+                assert_eq!(outcome.is_ok(), succeeds, "case: {case}: {outcome:?}");
+                assert_eq!(raw_row(&db, id), expected_row, "case: {case}");
+                assert_eq!(raw_row(&db, "known"), known_row, "case: {case}: known row");
+            }
+        }
+
+        #[test]
+        fn a_known_id_runs_no_insert_at_all() {
+            let (db, _dir) = db_with_unmappable_known_system();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE probe (id TEXT);
+                     CREATE TRIGGER record BEFORE INSERT ON systems
+                     BEGIN INSERT INTO probe VALUES (NEW.id); END;",
+                )
+                .unwrap();
+
+            db.insert_system_if_absent(&sample_system("known", "known"))
+                .unwrap();
+
+            let attempts: i64 = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(attempts, 0, "no INSERT was tried for a known id");
+        }
     }
 }

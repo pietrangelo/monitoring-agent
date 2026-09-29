@@ -100,7 +100,6 @@ async fn register_system(
 
     s.db.insert_system(&sys)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    s.refresh_cache();
     Ok(Json(sys))
 }
 
@@ -135,8 +134,6 @@ async fn update_system(
     )
     .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    s.refresh_cache();
-
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -149,12 +146,12 @@ async fn delete_system(
     s.db.delete_system(&id)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     // After the row: a store racing this delete then finds the system gone instead of
-    // recreating an entry nothing would evict.
+    // recreating an entry nothing would evict (RFC 0007 §4).
+    drop(s.evict_live_metrics(&id));
     s.live_applications
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&id);
-    s.refresh_cache();
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
 
@@ -301,7 +298,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-        (AppState::new(db), dir)
+        (AppState::new(db).unwrap(), dir)
     }
 
     async fn body_json(res: axum::response::Response) -> serde_json::Value {
@@ -651,47 +648,82 @@ mod tests {
         assert_ne!(token_after.as_deref(), Some("a-replacement-token"));
     }
 
-    #[tokio::test]
-    async fn deleting_a_system_forgets_its_applications() {
-        let (state, _dir) = temp_state();
-        let app = router(state.clone());
-        let created = body_json(
-            app.clone()
-                .oneshot(json_request(
-                    "POST",
-                    "/api/systems",
-                    serde_json::json!({"name": "w", "url": "http://x"}),
-                ))
-                .await
-                .unwrap(),
-        )
-        .await;
-        let id = created["id"].as_str().unwrap().to_string();
-        for system in [id.as_str(), "other"] {
-            state.live_applications.write().unwrap().insert(
-                system.to_string(),
-                crate::state::SystemApplications::default(),
-            );
-        }
-
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/systems/{id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(res.status(), StatusCode::OK);
-        let live = state.live_applications.read().unwrap();
-        assert!(
-            !live.contains_key(&id),
-            "the deleted system's entry is gone"
+    /// Plants a live metrics entry and an applications entry for `system`.
+    fn plant_live_state(state: &AppState, system: &str) {
+        use crate::snapshot::{LiveMetrics, ReportedSnapshot, SnapshotTime, snapshot_rule};
+        let (snapshot, left_out) = snapshot_rule(ReportedSnapshot::default());
+        let time = SnapshotTime::try_from(1_700_000_000).unwrap();
+        let now = std::time::Instant::now();
+        let (entry, _) = LiveMetrics::following(None, snapshot, time, &left_out, now);
+        let mut live = state.live_metrics.write().unwrap();
+        live.insert(system.to_string(), Arc::new(entry));
+        let mut applications = state.live_applications.write().unwrap();
+        applications.insert(
+            system.to_string(),
+            crate::state::SystemApplications::default(),
         );
-        assert!(live.contains_key("other"), "another system's entry stays");
+    }
+
+    /// How a system reaches the hub.
+    #[derive(Debug, Clone, Copy)]
+    enum Source {
+        Poll,
+        Push,
+    }
+
+    /// Registers a polled system through the API, or a push system as its handshake does.
+    async fn registered(state: &Arc<AppState>, source: Source) -> String {
+        match source {
+            Source::Poll => {
+                let body = serde_json::json!({"name": "w", "url": "http://x"});
+                let request = json_request("POST", "/api/systems", body);
+                let res = router(state.clone()).oneshot(request).await.unwrap();
+                body_json(res).await["id"].as_str().unwrap().to_string()
+            }
+            Source::Push => {
+                state
+                    .db
+                    .insert_system(&legacy_push_system("sys-push"))
+                    .unwrap();
+                "sys-push".to_string()
+            }
+        }
+    }
+
+    /// RFC 0007 §4: a delete evicts the system's live metrics and applications, whichever
+    /// path it reports through, and no other system's.
+    #[tokio::test]
+    async fn deleting_a_system_forgets_its_live_metrics_and_applications() {
+        for source in [Source::Poll, Source::Push] {
+            let (state, _dir) = temp_state();
+            let id = registered(&state, source).await;
+            for system in [id.as_str(), "other"] {
+                plant_live_state(&state, system);
+            }
+
+            let res = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/systems/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), StatusCode::OK, "{source:?}");
+            let live = state.live_metrics.read().unwrap();
+            let applications = state.live_applications.read().unwrap();
+            let kept =
+                |system: &str| (live.contains_key(system), applications.contains_key(system));
+            assert_eq!(
+                kept(&id),
+                (false, false),
+                "{source:?}: the deleted system's"
+            );
+            assert_eq!(kept("other"), (true, true), "{source:?}: another system's");
+        }
     }
 
     #[tokio::test]
@@ -867,7 +899,7 @@ mod tests {
                 enabled: true,
             })
             .unwrap();
-        state.db.insert_metric("id-1", "cpu", 42.0, 100).unwrap();
+        state.db.plant_point("id-1", "cpu", 42.0, 100).unwrap();
 
         let res = router(state)
             .oneshot(
@@ -922,8 +954,8 @@ mod tests {
                 enabled: true,
             })
             .unwrap();
-        state.db.insert_metric("id-1", "cpu", 10.0, 1).unwrap();
-        state.db.insert_metric("id-1", "memory", 20.0, 1).unwrap();
+        state.db.plant_point("id-1", "cpu", 10.0, 1).unwrap();
+        state.db.plant_point("id-1", "memory", 20.0, 1).unwrap();
 
         let res = router(state)
             .oneshot(

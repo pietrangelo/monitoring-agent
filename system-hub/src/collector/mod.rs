@@ -14,19 +14,26 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::registry::{MemoryCapacity, memory_capacity_refresh};
+use crate::registry::{
+    LastSeen, MemoryCapacity, enabled_systems, memory_capacity_refresh, needs_system_info,
+};
 use serde::Deserialize;
+use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::time::{Duration, interval};
 
-use crate::models::{
-    AlertRecord, DiskSnapshot, MetricSnapshot, ProcessSnapshot, SystemInfo, SystemStatus,
-};
+use crate::clock::{now_iso, unix_now};
+use crate::db::SnapshotStored;
+use crate::models::{AlertRecord, SystemId, SystemInfo, SystemStatus};
+use crate::snapshot::{LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime};
+use crate::snapshot_intake;
 use crate::state::AppState;
 
 mod application_poll;
+mod capped_body;
 use application_poll::poll_applications;
+use capped_body::{CappedBodyError, read_capped};
 
 // ── Agent response shape (maps the system-agent /api/system JSON) ──
 
@@ -39,10 +46,7 @@ struct AgentResponse {
     memory: Option<AgentMemory>,
     swap: Option<AgentSwap>,
     load_average: Option<AgentLoad>,
-    uptime_seconds: Option<u64>,
-    uptime_display: Option<String>,
     disks: Option<Vec<AgentDisk>>,
-    top_processes: Option<Vec<AgentProcess>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,8 +66,6 @@ struct AgentCpu {
 struct AgentMemory {
     total_bytes: Option<u64>,
     total_display: Option<String>,
-    used_display: Option<String>,
-    used_bytes: Option<u64>,
     usage_percent: Option<f32>,
 }
 
@@ -76,85 +78,128 @@ struct AgentSwap {
 struct AgentLoad {
     one: Option<f64>,
     five: Option<f64>,
-    fifteen: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AgentDisk {
     mount_point: Option<String>,
     usage_percent: Option<f32>,
-    total_display: Option<String>,
-    used_display: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentProcess {
-    pid: Option<u32>,
-    name: Option<String>,
-    cpu_usage: Option<f32>,
-    memory_usage_display: Option<String>,
-    memory_percent: Option<f32>,
 }
 
 // ── Collector ──────────────────────────────────────────
 
-fn now_iso() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    unix_to_iso8601(secs)
+pub fn start_collectors(state: Arc<AppState>) {
+    tokio::spawn(poll_every(state, Duration::from_secs(30)));
 }
 
-pub fn start_collectors(state: Arc<AppState>) {
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        let mut refresh_tick = interval(Duration::from_secs(30));
-        loop {
-            refresh_tick.tick().await;
-            state_clone.refresh_cache();
-            let systems = state_clone.get_enabled_systems();
-            for system in systems {
-                let s = state_clone.clone();
-                tokio::spawn(async move {
-                    poll_system(s, &system).await;
-                });
-            }
+/// Polls the registry's enabled systems every `period`. The registry is read at each tick, so
+/// no cache can go stale; a tick whose read fails polls the systems of the last read that
+/// succeeded (RFC 0007 §2).
+async fn poll_every(state: Arc<AppState>, period: Duration) {
+    let mut tick = interval(period);
+    let mut systems = Vec::new();
+    loop {
+        tick.tick().await;
+        systems = read_registry(&state, systems).await;
+        for system in enabled_systems(&systems) {
+            let (state, system) = (Arc::clone(&state), system.clone());
+            tokio::spawn(async move { poll_system(state, &system).await });
         }
-    });
+    }
+}
+
+/// The registry's systems, read on the blocking pool, or `last_read` when the read fails.
+async fn read_registry(state: &Arc<AppState>, last_read: Vec<SystemInfo>) -> Vec<SystemInfo> {
+    let app = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || app.db.list_systems()).await {
+        Ok(Ok(systems)) => systems,
+        Ok(Err(err)) => {
+            tracing::warn!("Couldn't read the registry; polling the last read's systems: {err}");
+            last_read
+        }
+        Err(err) => {
+            tracing::error!("Reading the registry failed; polling the last read's systems: {err}");
+            last_read
+        }
+    }
 }
 
 async fn poll_system(state: Arc<AppState>, system: &SystemInfo) {
+    let now = now_iso();
+    // Parsed once, first. Only a row stored before RFC 0005 can fail; no agent can push to it
+    // again, so without this marking it would keep its last status for good.
+    let Ok(id) = SystemId::try_from(system.id.clone()) else {
+        return mark_offline(&state, system, now, "invalid system id".to_string()).await;
+    };
     let Some(client) = poll_client(system) else {
         return;
     };
-    let now = now_iso();
-    let url = format!("{}/api/system", system.url.trim_end_matches('/'));
-    let answer = match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => resp.json::<AgentResponse>().await,
-        Ok(resp) => return mark_offline(&state, system, &now, &format!("HTTP {}", resp.status())),
-        Err(e) => return mark_offline(&state, system, &now, &e.to_string()),
-    };
-    let agent = match answer {
+    let agent = match fetch_system(&client, system).await {
         Ok(agent) => agent,
-        Err(e) => return mark_offline(&state, system, &now, &format!("JSON parse error: {e}")),
+        Err(failure) => {
+            // Dropped before the marking's await: a client holds its CA store, and a woken
+            // poll can queue behind the rest of the tick's polls.
+            drop(client);
+            return mark_offline(&state, system, now, failure.last_error()).await;
+        }
     };
-
-    let online = state
-        .db
-        .update_system_status(&system.id, &SystemStatus::Online, &now, None);
-    warn_on_failure(online, "mark online", system);
-    if system.hostname.is_none() || system.os.is_none() {
-        record_system_info(&state, system, &agent);
+    if store_answer(&state, system, &id, PolledAnswer::from(agent), now)
+        .await
+        .is_break()
+    {
+        return;
     }
-    refresh_memory_capacity(&state, system, &agent).await;
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    store_metrics(&state, &metric_snapshot(&system.id, agent, now_secs));
     store_agent_alerts(&state, system, &client).await;
-    poll_applications(&state, system, &client).await;
+    poll_applications(&state, system, &id, &client).await;
+}
+
+/// The largest `/api/system` answer the hub reads: eight times the push message limit, so
+/// every snapshot a push frame can carry fits, with room for the answer's processes and
+/// networks (RFC 0007 §1).
+const MAX_SYSTEM_BODY: usize = 4 * 1024 * 1024;
+
+/// Why a system poll found its system offline.
+#[derive(Debug)]
+enum PollFailure {
+    Transport(reqwest::Error),
+    Status(reqwest::StatusCode),
+    TooLarge,
+    BadJson(serde_json::Error),
+}
+
+impl PollFailure {
+    /// The system's `last_error` for this failure.
+    fn last_error(&self) -> String {
+        match self {
+            Self::Transport(err) => err.to_string(),
+            Self::Status(status) => format!("HTTP {status}"),
+            Self::TooLarge => "body over 4 MiB".to_string(),
+            Self::BadJson(err) => format!("JSON parse error: {err}"),
+        }
+    }
+}
+
+/// Fetches the system's `/api/system` answer, reading at most `MAX_SYSTEM_BODY`, and parses it.
+async fn fetch_system(
+    client: &reqwest::Client,
+    system: &SystemInfo,
+) -> Result<AgentResponse, PollFailure> {
+    let url = format!("{}/api/system", system.url.trim_end_matches('/'));
+    let mut resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(PollFailure::Transport)?;
+    if !resp.status().is_success() {
+        return Err(PollFailure::Status(resp.status()));
+    }
+    let body = read_capped(&mut resp, MAX_SYSTEM_BODY)
+        .await
+        .map_err(|err| match err {
+            CappedBodyError::TooLarge => PollFailure::TooLarge,
+            CappedBodyError::Transport(err) => PollFailure::Transport(err),
+        })?;
+    serde_json::from_slice(&body).map_err(PollFailure::BadJson)
 }
 
 /// The HTTP client for one system's polls: its token as `X-API-Key`, a 10 s timeout, and no
@@ -184,114 +229,159 @@ fn warn_on_failure(result: Result<(), rusqlite::Error>, what: &str, system: &Sys
     }
 }
 
-fn mark_offline(state: &AppState, system: &SystemInfo, now: &str, error: &str) {
-    let offline =
-        state
-            .db
-            .update_system_status(&system.id, &SystemStatus::Offline, now, Some(error));
-    warn_on_failure(offline, "mark offline", system);
+/// Marks the system offline, `error` as its last error, off the async runtime.
+async fn mark_offline(state: &Arc<AppState>, system: &SystemInfo, now: String, error: String) {
+    let (app, id) = (Arc::clone(state), system.id.clone());
+    let unit = move || {
+        app.db
+            .update_system_status(&id, &SystemStatus::Offline, &now, Some(&error))
+    };
+    match tokio::task::spawn_blocking(unit).await {
+        Ok(offline) => warn_on_failure(offline, "mark offline", system),
+        Err(err) => tracing::error!("Poll of {:?}: the offline marking failed: {err}", system.id),
+    }
+}
+
+/// What a successful poll's answer reports, parsed at the edge (RFC 0007 §1): the snapshot,
+/// the system info, and the memory capacity. A value the agent didn't report stays `None`.
+struct PolledAnswer {
+    reported: ReportedSnapshot,
+    info: PolledInfo,
+    /// `None` unless the answer reports both halves within `MemoryCapacity::reported`'s bounds.
+    memory: Option<MemoryCapacity>,
+}
+
+/// The system info a poll's answer reports.
+struct PolledInfo {
+    os_name: Option<String>,
+    hostname: Option<String>,
+    kernel: Option<String>,
+    cpu_model: Option<String>,
+    cpu_cores: Option<usize>,
+}
+
+impl From<AgentResponse> for PolledAnswer {
+    fn from(agent: AgentResponse) -> Self {
+        let memory = agent.memory.as_ref();
+        let memory = MemoryCapacity::reported(
+            memory.and_then(|m| m.total_display.as_deref()),
+            memory.and_then(|m| m.total_bytes),
+        );
+        let cpu = agent.cpu.as_ref();
+        let info = PolledInfo {
+            os_name: agent
+                .os
+                .as_ref()
+                .and_then(|o| o.pretty_name.clone().or(o.name.clone())),
+            hostname: agent.hostname.clone(),
+            kernel: agent.kernel.clone(),
+            cpu_model: cpu.and_then(|c| c.model.clone()),
+            cpu_cores: cpu.and_then(|c| c.logical_cores),
+        };
+        Self {
+            reported: reported_snapshot(agent),
+            info,
+            memory,
+        }
+    }
+}
+
+/// The snapshot an agent's `/api/system` answer reports, before the snapshot rule.
+fn reported_snapshot(agent: AgentResponse) -> ReportedSnapshot {
+    let load = agent.load_average.as_ref();
+    let disks = agent.disks.unwrap_or_default().into_iter();
+    ReportedSnapshot {
+        cpu: agent.cpu.as_ref().and_then(|c| c.usage_percent),
+        memory: agent.memory.as_ref().and_then(|m| m.usage_percent),
+        swap: agent.swap.as_ref().and_then(|s| s.usage_percent),
+        load1: load.and_then(|l| l.one),
+        load5: load.and_then(|l| l.five),
+        disks: disks
+            .map(|d| ReportedDisk {
+                mount_point: d.mount_point,
+                usage_percent: d.usage_percent,
+            })
+            .collect(),
+    }
+}
+
+/// Stores a successful poll's answer off the async runtime, stamped with the hub's clock.
+/// The poll ends when the system is gone; a store that fails is logged, and the poll goes on.
+async fn store_answer(
+    state: &Arc<AppState>,
+    system: &SystemInfo,
+    id: &SystemId,
+    answer: PolledAnswer,
+    polled_at: String,
+) -> ControlFlow<()> {
+    let Ok(time) = SnapshotTime::try_from(unix_now()) else {
+        tracing::warn!("Poll of {:?}: the hub's clock is past i64::MAX", system.id);
+        return ControlFlow::Break(());
+    };
+    let (app, sys, id) = (Arc::clone(state), system.clone(), id.clone());
+    let unit = move || store_polled(&app, &sys, &id, answer, time, polled_at);
+    match tokio::task::spawn_blocking(unit).await {
+        Ok(Ok(SnapshotStored::Stored(_))) => ControlFlow::Continue(()),
+        Ok(Ok(SnapshotStored::SystemGone)) => {
+            tracing::debug!("Poll of {:?}: the system is gone", system.id);
+            ControlFlow::Break(())
+        }
+        Ok(Err(err)) => {
+            warn_on_failure(Err(err), "store the snapshot", system);
+            ControlFlow::Continue(())
+        }
+        Err(err) => {
+            tracing::error!(
+                "Poll of {:?}: the snapshot's store failed: {err}",
+                system.id
+            );
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+/// The poll's one unit of blocking work: the snapshot's store, which marks the system online,
+/// then, only once it is stored, the registry fill.
+fn store_polled(
+    app: &AppState,
+    system: &SystemInfo,
+    id: &SystemId,
+    answer: PolledAnswer,
+    time: SnapshotTime,
+    polled_at: String,
+) -> Result<SnapshotStored<LeftOutLog>, rusqlite::Error> {
+    let last_seen = LastSeen::PolledAt(polled_at);
+    let now = Instant::now();
+    let stored = snapshot_intake::store_snapshot(app, id, answer.reported, time, last_seen, now)?;
+    if let SnapshotStored::Stored(_) = stored {
+        if needs_system_info(system) {
+            record_system_info(app, system, &answer.info);
+        }
+        refresh_memory_capacity(app, system, answer.memory);
+    }
+    Ok(stored)
 }
 
 /// Fills in a system's static info from its first successful poll.
-fn record_system_info(state: &AppState, system: &SystemInfo, agent: &AgentResponse) {
-    let os_name = agent
-        .os
-        .as_ref()
-        .and_then(|o| o.pretty_name.as_deref().or(o.name.as_deref()));
-    let cpu_model = agent.cpu.as_ref().and_then(|c| c.model.as_deref());
-    let cpu_cores = agent.cpu.as_ref().and_then(|c| c.logical_cores);
-    let recorded = state.db.update_system_info(
+fn record_system_info(app: &AppState, system: &SystemInfo, info: &PolledInfo) {
+    let recorded = app.db.update_system_info(
         &system.id,
-        os_name,
-        agent.hostname.as_deref(),
-        agent.kernel.as_deref(),
-        cpu_model,
-        cpu_cores,
+        info.os_name.as_deref(),
+        info.hostname.as_deref(),
+        info.kernel.as_deref(),
+        info.cpu_model.as_deref(),
+        info.cpu_cores,
     );
     warn_on_failure(recorded, "record system info", system);
 }
 
 /// Stores the memory capacity the answer reports when it differs from the stored one
-/// (RFC 0014 §8): unlike the rest of the system's info, it follows every poll. The write runs
-/// on the blocking pool, awaited, so SQLite never holds a runtime thread.
-async fn refresh_memory_capacity(
-    state: &Arc<AppState>,
-    system: &SystemInfo,
-    agent: &AgentResponse,
-) {
-    let memory = agent.memory.as_ref();
-    let reported = MemoryCapacity::reported(
-        memory.and_then(|m| m.total_display.as_deref()),
-        memory.and_then(|m| m.total_bytes),
-    );
-    let Some(capacity) = memory_capacity_refresh(MemoryCapacity::stored(system).as_ref(), reported)
-    else {
-        return;
-    };
-    let (state, id) = (Arc::clone(state), system.id.clone());
-    let refreshed =
-        tokio::task::spawn_blocking(move || state.db.update_memory_capacity(&id, &capacity)).await;
-    match refreshed {
-        Ok(result) => warn_on_failure(result, "refresh the memory capacity", system),
-        Err(err) => tracing::warn!(
-            "Poll of {:?}: the memory capacity write failed: {err}",
-            system.id
-        ),
-    }
-}
-
-/// The snapshot an agent's `/api/system` answer describes, stamped with the hub's clock.
-fn metric_snapshot(system_id: &str, agent: AgentResponse, now_secs: u64) -> MetricSnapshot {
-    let cpu = agent.cpu.as_ref();
-    let memory = agent.memory.as_ref();
-    let load = agent.load_average.as_ref();
-    MetricSnapshot {
-        system_id: system_id.to_string(),
-        timestamp: now_secs,
-        cpu_percent: cpu.and_then(|c| c.usage_percent).unwrap_or(0.0),
-        memory_percent: memory.and_then(|m| m.usage_percent).unwrap_or(0.0),
-        swap_percent: agent
-            .swap
-            .as_ref()
-            .and_then(|s| s.usage_percent)
-            .unwrap_or(0.0),
-        load_one: load.and_then(|l| l.one).unwrap_or(0.0),
-        load_five: load.and_then(|l| l.five).unwrap_or(0.0),
-        load_fifteen: load.and_then(|l| l.fifteen).unwrap_or(0.0),
-        uptime_seconds: agent.uptime_seconds.unwrap_or(0),
-        uptime_display: agent.uptime_display.clone().unwrap_or_default(),
-        memory_used_display: memory
-            .and_then(|m| m.used_display.clone())
-            .unwrap_or_default(),
-        memory_total_display: memory
-            .and_then(|m| m.total_display.clone())
-            .unwrap_or_default(),
-        memory_used_bytes: memory.and_then(|m| m.used_bytes).unwrap_or(0),
-        memory_total_bytes: memory.and_then(|m| m.total_bytes).unwrap_or(0),
-        cpu_logical_cores: cpu.and_then(|c| c.logical_cores).unwrap_or(0),
-        disks: agent
-            .disks
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| DiskSnapshot {
-                mount_point: d.mount_point.unwrap_or_default(),
-                usage_percent: d.usage_percent.unwrap_or(0.0),
-                total_display: d.total_display.unwrap_or_default(),
-                used_display: d.used_display.unwrap_or_default(),
-            })
-            .collect(),
-        top_processes: agent
-            .top_processes
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| ProcessSnapshot {
-                pid: p.pid.unwrap_or(0),
-                name: p.name.unwrap_or_default(),
-                cpu_usage: p.cpu_usage.unwrap_or(0.0),
-                memory_usage_display: p.memory_usage_display.unwrap_or_default(),
-                memory_percent: p.memory_percent.unwrap_or(0.0),
-            })
-            .collect(),
+/// (RFC 0014 §8): unlike the rest of the system's info, it follows every poll.
+fn refresh_memory_capacity(app: &AppState, system: &SystemInfo, reported: Option<MemoryCapacity>) {
+    let stored = MemoryCapacity::stored(system);
+    if let Some(capacity) = memory_capacity_refresh(stored.as_ref(), reported) {
+        let refreshed = app.db.update_memory_capacity(&system.id, &capacity);
+        warn_on_failure(refreshed, "refresh the memory capacity", system);
     }
 }
 
@@ -348,94 +438,19 @@ fn alert_record(
     }
 }
 
-fn store_metrics(state: &AppState, snap: &MetricSnapshot) {
-    let ts = snap.timestamp;
-    let sid = &snap.system_id;
-
-    let _ = state.db.insert_metric(sid, "cpu", snap.cpu_percent, ts);
-    let _ = state
-        .db
-        .insert_metric(sid, "memory", snap.memory_percent, ts);
-    let _ = state.db.insert_metric(sid, "swap", snap.swap_percent, ts);
-    let _ = state
-        .db
-        .insert_metric(sid, "load1", snap.load_one as f32, ts);
-    let _ = state
-        .db
-        .insert_metric(sid, "load5", snap.load_five as f32, ts);
-
-    for disk in &snap.disks {
-        let metric = format!("disk:{}", disk.mount_point);
-        let _ = state.db.insert_metric(sid, &metric, disk.usage_percent, ts);
-    }
-
-    // Update live metrics cache
-    let mut live = state.live_metrics.write().unwrap();
-    live.insert(
-        sid.clone(),
-        crate::state::LiveMetrics {
-            cpu_percent: snap.cpu_percent,
-            memory_percent: snap.memory_percent,
-            load_one: snap.load_one,
-            disks: snap
-                .disks
-                .iter()
-                .map(|d| (d.mount_point.clone(), d.usage_percent))
-                .collect(),
-            updated_at: ts,
-        },
-    );
-}
-
-fn unix_to_iso8601(secs: u64) -> String {
-    let days_since_epoch = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let mins = (time_of_day % 3600) / 60;
-    let s = time_of_day % 60;
-
-    let mut y = 1970i64;
-    let mut d = days_since_epoch as i64;
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if d < days_in_year {
-            break;
-        }
-        d -= days_in_year;
-        y += 1;
-    }
-    let month_days = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 1;
-    for &md in &month_days {
-        if d < md as i64 {
-            break;
-        }
-        d -= md as i64;
-        m += 1;
-    }
-    let day = d + 1;
-    format!("{y:04}-{m:02}-{day:02}T{hours:02}:{mins:02}:{s:02}Z")
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::snapshot::Scalar;
     use axum::{Json, Router, routing::get};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_state() -> (Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-        let state = AppState::new(db);
+        let state = AppState::new(db).unwrap();
         (state, dir)
     }
 
@@ -521,7 +536,227 @@ mod tests {
         assert_eq!(disk_points.len(), 1);
 
         let live = state.live_metrics.read().unwrap();
-        assert_eq!(live.get("id-1").unwrap().cpu_percent, 12.5);
+        let cpu = live.get("id-1").unwrap().snapshot().scalar(Scalar::Cpu);
+        assert_eq!(cpu, Some(12.5));
+    }
+
+    /// A mock agent answering `/api/system` with `system_json` and reporting no alerts.
+    async fn agent_answering(system_json: serde_json::Value) -> String {
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let v = system_json.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(|| async { Json(serde_json::json!({"active": []})) }),
+            );
+        spawn_mock_agent(app).await
+    }
+
+    fn point_count(state: &AppState, metric: &str) -> usize {
+        state
+            .db
+            .get_metrics("id-1", metric, 2_000, None)
+            .unwrap()
+            .len()
+    }
+
+    /// RFC 0007 §1: a poll keeps what the snapshot rule keeps. A value the agent didn't report
+    /// is no point (not `0.0`), a disk without a mount point is no `disk:` point, and only the
+    /// first 1024 valid disks are kept.
+    #[tokio::test]
+    async fn a_poll_stores_what_the_snapshot_rule_keeps() {
+        let (state, _dir) = temp_state();
+        let mut disks: Vec<_> = (0..1025)
+            .map(|i| serde_json::json!({"mount_point": format!("/d{i}"), "usage_percent": 1.0}))
+            .collect();
+        disks.insert(1, serde_json::json!({"usage_percent": 99.0}));
+        let url = agent_answering(serde_json::json!({
+            "cpu": {"logical_cores": 4},
+            "memory": {"usage_percent": 50.0},
+            "swap": {"usage_percent": 5.0},
+            "load_average": {"one": 0.5, "five": 0.25},
+            "disks": disks,
+        }))
+        .await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        let cases = [
+            ("cpu", 0),
+            ("memory", 1),
+            ("swap", 1),
+            ("load1", 1),
+            ("load5", 1),
+            ("disk:", 0),
+            ("disk:/d0", 1),
+            ("disk:/d1023", 1),
+            ("disk:/d1024", 0),
+        ];
+        for (metric, expected) in cases {
+            assert_eq!(point_count(&state, metric), expected, "metric: {metric}");
+        }
+        let live = state
+            .live_metrics
+            .read()
+            .unwrap()
+            .get("id-1")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            live.snapshot().scalar(Scalar::Cpu),
+            None,
+            "live cpu left out"
+        );
+        assert_eq!(live.snapshot().disks().count(), 1024, "live disks");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Online);
+    }
+
+    /// RFC 0007 §1: the poll parses the system's id once, before anything else. An id that
+    /// breaks the rule (a row stored before RFC 0005) is marked offline, naming why, and is
+    /// never fetched.
+    #[tokio::test]
+    async fn a_system_whose_id_breaks_the_rule_is_marked_offline_without_a_fetch() {
+        let (state, _dir) = temp_state();
+        let (url, polls) = counted_agent().await;
+        let system = sample_system("..", url);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(polls_seen(&polls), 0, "never fetched");
+        let sys = state.db.get_system("..").unwrap().unwrap();
+        let status = (sys.status, sys.last_error.as_deref());
+        assert_eq!(status, (SystemStatus::Offline, Some("invalid system id")));
+    }
+
+    /// RFC 0007 §4: a snapshot that fails to store (here, a trigger aborts every metric
+    /// insert) leaves no point and no online status, and the poll goes on to the alerts.
+    #[tokio::test]
+    async fn a_failed_snapshot_store_writes_nothing_and_the_poll_goes_on() {
+        let (state, dir) = temp_state();
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(|| async { Json(serde_json::json!({"cpu": {"usage_percent": 12.5}})) }),
+            )
+            .route(
+                "/api/alerts",
+                get(|| async { Json(serde_json::json!({"active": [agent_alert("inc-1", 95.0)]})) }),
+            );
+        let system = sample_system("id-1", spawn_mock_agent(app).await);
+        state.db.insert_system(&system).unwrap();
+        rusqlite::Connection::open(dir.path().join("test.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON metrics
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 0, "nothing stored");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Unknown, "not marked online");
+        assert!(!state.live_metrics.read().unwrap().contains_key("id-1"));
+        let alerts = state.db.get_alerts(Some("id-1"), None, 10).unwrap();
+        assert_eq!(alerts.len(), 1, "the alerts are still polled");
+    }
+
+    /// RFC 0007 §4: a poll racing a delete writes nothing, not even live metrics.
+    #[tokio::test]
+    async fn a_system_deleted_before_its_poll_gets_no_points_and_no_live_metrics() {
+        let (state, _dir) = temp_state();
+        let url = agent_answering(serde_json::json!({"cpu": {"usage_percent": 12.5}})).await;
+        let system = sample_system("id-1", url);
+        state.db.insert_system(&system).unwrap();
+        state.db.delete_system("id-1").unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 0);
+        assert!(!state.live_metrics.read().unwrap().contains_key("id-1"));
+        assert!(state.db.get_system("id-1").unwrap().is_none());
+    }
+
+    /// A mock agent answering every `/api/system` poll with `{}`, and how many it answered.
+    async fn counted_agent() -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let polls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&polls);
+        let app = Router::new().route(
+            "/api/system",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Json(serde_json::json!({})) }
+            }),
+        );
+        (spawn_mock_agent(app).await, polls)
+    }
+
+    /// Whether `check` holds within 5 seconds.
+    async fn within_5_s(mut check: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn polls_seen(polls: &std::sync::atomic::AtomicU64) -> u64 {
+        polls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// RFC 0007 §2: the poller reads the registry at every tick, so a system inserted after
+    /// startup is polled on the next one.
+    #[tokio::test]
+    async fn a_system_inserted_after_startup_is_polled_on_the_next_tick() {
+        let (state, _dir) = temp_state();
+        let (url, polls) = counted_agent().await;
+        tokio::spawn(poll_every(state.clone(), Duration::from_millis(50)));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        state.db.insert_system(&sample_system("id-1", url)).unwrap();
+
+        assert!(within_5_s(|| polls_seen(&polls) > 0).await, "polled");
+    }
+
+    /// RFC 0007 §2: a tick whose registry read fails polls the systems of the last read that
+    /// succeeded. One row that no read can map fails the read for every row.
+    #[tokio::test]
+    async fn a_tick_whose_registry_read_fails_polls_the_last_reads_systems() {
+        let (state, dir) = temp_state();
+        let (url, polls) = counted_agent().await;
+        state.db.insert_system(&sample_system("id-1", url)).unwrap();
+        tokio::spawn(poll_every(state.clone(), Duration::from_millis(50)));
+        assert!(
+            within_5_s(|| polls_seen(&polls) > 0).await,
+            "polled at first"
+        );
+
+        state
+            .db
+            .insert_system(&sample_system("id-2", "http://127.0.0.1:9".into()))
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("test.db"))
+            .unwrap()
+            .execute_batch("UPDATE systems SET poll_interval_secs = -1 WHERE id = 'id-2'")
+            .unwrap();
+        assert!(state.db.list_systems().is_err(), "the registry read fails");
+        let before = polls_seen(&polls);
+
+        let still_polled = within_5_s(|| polls_seen(&polls) >= before + 3).await;
+        assert!(still_polled, "the last read's system is still polled");
     }
 
     /// RFC 0014 §8: a poll refreshes the memory capacity when its answer has both halves, and
@@ -765,6 +1000,65 @@ mod tests {
         assert!(updated.last_error.unwrap().contains("JSON parse error"));
     }
 
+    /// A mock agent answering `/api/system` with `body`, as given, and no alerts.
+    async fn agent_with_body(body: axum::body::Body) -> String {
+        let body = Arc::new(std::sync::Mutex::new(Some(body)));
+        let app = Router::new()
+            .route(
+                "/api/system",
+                get(move || {
+                    let body = body.lock().unwrap().take().unwrap_or_default();
+                    async move { body }
+                }),
+            )
+            .route(
+                "/api/alerts",
+                get(|| async { Json(serde_json::json!({"active": []})) }),
+            );
+        spawn_mock_agent(app).await
+    }
+
+    /// RFC 0007 §1: the poll reads `/api/system` up to 4 MiB, inclusive.
+    #[tokio::test]
+    async fn a_system_body_of_exactly_4_mib_is_read() {
+        let frame = r#"{"cpu":{"usage_percent":12.5},"pad":""}"#;
+        let pad = "x".repeat(4 * 1024 * 1024 - frame.len());
+        let body = frame.replace(r#""pad":"""#, &format!(r#""pad":"{pad}""#));
+        assert_eq!(body.len(), 4 * 1024 * 1024);
+        let (state, _dir) = temp_state();
+        let system = sample_system("id-1", agent_with_body(body.into()).await);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 1, "the answer was read");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        assert_eq!(sys.status, SystemStatus::Online);
+    }
+
+    /// RFC 0007 §1: a larger answer is refused while it streams, whatever its headers say, and
+    /// the system shows offline, naming the cap.
+    #[tokio::test]
+    async fn a_chunked_system_body_over_4_mib_is_refused_and_marks_the_system_offline() {
+        // No Content-Length: only a cap on the bytes read can refuse it.
+        let pad = "x".repeat(1024);
+        let chunks = std::iter::once(r#"{"cpu":{"usage_percent":12.5},"pad":""#.to_string())
+            .chain(std::iter::repeat_n(pad, 4 * 1024 + 1))
+            .chain(std::iter::once(r#""}"#.to_string()))
+            .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)));
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(chunks));
+        let (state, _dir) = temp_state();
+        let system = sample_system("id-1", agent_with_body(body).await);
+        state.db.insert_system(&system).unwrap();
+
+        poll_system(state.clone(), &system).await;
+
+        assert_eq!(point_count(&state, "cpu"), 0, "the answer wasn't stored");
+        let sys = state.db.get_system("id-1").unwrap().unwrap();
+        let status = (sys.status, sys.last_error.as_deref());
+        assert_eq!(status, (SystemStatus::Offline, Some("body over 4 MiB")));
+    }
+
     #[tokio::test]
     async fn poll_system_marks_offline_on_http_error_status() {
         let (state, _dir) = temp_state();
@@ -797,66 +1091,90 @@ mod tests {
         assert!(updated.last_error.is_some());
     }
 
+    /// Characterisation (`rosette-auditor` on RFC 0007): every offline marking of a poll writes
+    /// the poll's own time as `last_seen`, so a polled system's last seen moves on while it is
+    /// down. RFC 0010's contact time is where that changes.
+    #[tokio::test]
+    async fn a_failed_poll_writes_its_own_time_as_last_seen() {
+        let (state, _dir) = temp_state();
+        let failing = Router::new().route(
+            "/api/system",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let refused = "http://127.0.0.1:1".to_string();
+        let cases = [
+            (
+                "an HTTP error",
+                "http-error",
+                spawn_mock_agent(failing).await,
+            ),
+            ("a connection error", "refused", refused.clone()),
+            ("an id that breaks the rule", "..", refused),
+        ];
+        for (name, id, url) in cases {
+            let system = SystemInfo {
+                last_seen: "before the poll".into(),
+                ..sample_system(id, url)
+            };
+            state.db.insert_system(&system).unwrap();
+
+            let before = now_iso();
+            poll_system(state.clone(), &system).await;
+            let after = now_iso();
+
+            let seen = state.db.get_system(id).unwrap().unwrap().last_seen;
+            let polled = before.as_str()..=after.as_str();
+            assert!(
+                polled.contains(&seen.as_str()),
+                "{name}: last seen {seen:?}"
+            );
+        }
+    }
+
+    /// RFC 0007 §1: the poll's edge maps what the agent reported, and nothing it didn't:
+    /// a value missing from the answer stays `None`, never `0.0`, and so does a mount point.
     #[test]
-    fn store_metrics_writes_all_metrics_and_updates_live_cache() {
-        let (state, _dir) = {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("test.db");
-            let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-            db.insert_system(&sample_system("id-1", "http://x".to_string()))
-                .unwrap();
-            (AppState::new(db), dir)
-        };
-
-        let snap = MetricSnapshot {
-            system_id: "id-1".to_string(),
-            timestamp: 100,
-            cpu_percent: 10.0,
-            memory_percent: 20.0,
-            swap_percent: 5.0,
-            load_one: 0.1,
-            load_five: 0.2,
-            load_fifteen: 0.3,
-            uptime_seconds: 60,
-            uptime_display: "1m".to_string(),
-            memory_used_display: "1 GB".to_string(),
-            memory_total_display: "4 GB".to_string(),
-            memory_used_bytes: 1_000_000,
-            memory_total_bytes: 4_000_000,
-            cpu_logical_cores: 4,
-            disks: vec![DiskSnapshot {
-                mount_point: "/".to_string(),
-                usage_percent: 33.0,
-                total_display: "10G".to_string(),
-                used_display: "3G".to_string(),
-            }],
-            top_processes: vec![],
-        };
-
-        store_metrics(&state, &snap);
-
-        assert_eq!(
-            state.db.get_metrics("id-1", "cpu", 10, None).unwrap()[0].value,
-            10.0
-        );
-        assert_eq!(
-            state.db.get_metrics("id-1", "memory", 10, None).unwrap()[0].value,
-            20.0
-        );
-        assert_eq!(
-            state.db.get_metrics("id-1", "swap", 10, None).unwrap()[0].value,
-            5.0
-        );
-        assert_eq!(
-            state.db.get_metrics("id-1", "disk:/", 10, None).unwrap()[0].value,
-            33.0
-        );
-
-        let live = state.live_metrics.read().unwrap();
-        let m = live.get("id-1").unwrap();
-        assert_eq!(m.cpu_percent, 10.0);
-        assert_eq!(m.disks, vec![("/".to_string(), 33.0)]);
-        assert_eq!(m.updated_at, 100);
+    fn a_poll_answer_parses_into_what_the_agent_reported_and_nothing_more() {
+        let full = r#"{"cpu":{"usage_percent":12.5},"memory":{"usage_percent":50.0},
+            "swap":{"usage_percent":5.0},"load_average":{"one":0.5,"five":0.25},
+            "disks":[{"mount_point":"/","usage_percent":40.0},{"usage_percent":60.0}]}"#;
+        let cases = [
+            (
+                "every value reported",
+                full,
+                ReportedSnapshot {
+                    cpu: Some(12.5),
+                    memory: Some(50.0),
+                    swap: Some(5.0),
+                    load1: Some(0.5),
+                    load5: Some(0.25),
+                    disks: vec![
+                        ReportedDisk {
+                            mount_point: Some("/".into()),
+                            usage_percent: Some(40.0),
+                        },
+                        ReportedDisk {
+                            mount_point: None,
+                            usage_percent: Some(60.0),
+                        },
+                    ],
+                },
+            ),
+            ("nothing reported", "{}", ReportedSnapshot::default()),
+            (
+                "empty sections",
+                r#"{"cpu":{},"memory":{},"swap":{},"load_average":{},"disks":[{}]}"#,
+                ReportedSnapshot {
+                    disks: vec![ReportedDisk::default()],
+                    ..ReportedSnapshot::default()
+                },
+            ),
+        ];
+        for (case, body, expected) in cases {
+            let agent: AgentResponse = serde_json::from_str(body).unwrap();
+            let answer = PolledAnswer::from(agent);
+            assert_eq!(answer.reported, expected, "case: {case}");
+        }
     }
 
     #[test]
@@ -866,7 +1184,6 @@ mod tests {
         assert!(resp.os.is_none());
         assert!(resp.cpu.is_none());
         assert!(resp.disks.is_none());
-        assert!(resp.top_processes.is_none());
     }
 
     #[test]
@@ -874,24 +1191,6 @@ mod tests {
         let resp: AgentResponse =
             serde_json::from_str(r#"{"cpu":{"usage_percent":42.0}}"#).unwrap();
         assert_eq!(resp.cpu.unwrap().usage_percent, Some(42.0));
-    }
-
-    #[test]
-    fn unix_to_iso8601_epoch_zero() {
-        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn unix_to_iso8601_leap_day_boundary() {
-        assert_eq!(unix_to_iso8601(1_709_251_200), "2024-03-01T00:00:00Z");
-    }
-
-    #[test]
-    fn is_leap_rules() {
-        assert!(is_leap(2000));
-        assert!(!is_leap(1900));
-        assert!(is_leap(2024));
-        assert!(!is_leap(2023));
     }
 
     mod applications {

@@ -20,6 +20,7 @@
 use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
+use super::capped_body::{CappedBodyError, read_capped};
 use crate::application_wire::{ApplicationsResponseDto, PolledRound};
 use crate::applications::{ScrapeRound, ScrapeRoundError};
 use crate::clock::unix_now;
@@ -34,22 +35,17 @@ use crate::state::AppState;
 pub async fn poll_applications(
     state: &Arc<AppState>,
     system: &SystemInfo,
+    id: &SystemId,
     client: &reqwest::Client,
 ) {
-    // Parsed once, so every live entry this poll touches is keyed by a valid id. A stored id
-    // that breaks today's rule can't be pushed to either, and keeps no rounds.
-    let Ok(id) = SystemId::try_from(system.id.clone()) else {
-        tracing::debug!("Not polling applications of an invalid system id");
-        return;
-    };
     match fetch_applications(client, system).await {
         ApplicationsAnswer::Absent | ApplicationsAnswer::Polled(PolledRound::NoRound) => {
-            forget_shown_round(state, &id)
+            forget_shown_round(state, id)
         }
         ApplicationsAnswer::Polled(PolledRound::Round(round)) => {
-            store_polled_round(state, id, round).await
+            store_polled_round(state, id.clone(), round).await
         }
-        ApplicationsAnswer::Unusable(Unusable::Refused(err)) => log_refused_round(state, &id, err),
+        ApplicationsAnswer::Unusable(Unusable::Refused(err)) => log_refused_round(state, id, err),
         ApplicationsAnswer::Unusable(Unusable::Status(code)) => {
             tracing::debug!(
                 "Applications poll of {:?} answered HTTP {code}",
@@ -104,7 +100,10 @@ async fn fetch_applications(client: &reqwest::Client, system: &SystemInfo) -> Ap
     }
     let body = match read_capped(&mut resp, MAX_APPLICATIONS_BODY).await {
         Ok(body) => body,
-        Err(why) => return ApplicationsAnswer::Unusable(why),
+        Err(CappedBodyError::TooLarge) => return ApplicationsAnswer::Unusable(Unusable::TooLarge),
+        Err(CappedBodyError::Transport(err)) => {
+            return ApplicationsAnswer::Unusable(Unusable::Transport(err));
+        }
     };
     let response = match serde_json::from_slice::<ApplicationsResponseDto>(&body) {
         Ok(response) => response,
@@ -114,22 +113,6 @@ async fn fetch_applications(client: &reqwest::Client, system: &SystemInfo) -> Ap
         Ok(polled) => ApplicationsAnswer::Polled(polled),
         Err(err) => ApplicationsAnswer::Unusable(Unusable::Refused(err)),
     }
-}
-
-/// Reads a body chunk by chunk, refusing it once it passes `cap` bytes, whatever
-/// `Content-Length` claims.
-async fn read_capped(resp: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, Unusable> {
-    if resp.content_length().is_some_and(|len| len > cap as u64) {
-        return Err(Unusable::TooLarge);
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(Unusable::Transport)? {
-        if body.len() + chunk.len() > cap {
-            return Err(Unusable::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 /// The agent has no round: it was downgraded, or its applications were unconfigured. The

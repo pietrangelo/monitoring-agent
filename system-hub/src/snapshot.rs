@@ -7,8 +7,6 @@ use std::time::Instant;
 use crate::hourly_warning::{HourlyWarning, hourly_warning};
 
 /// A snapshot as an adapter read it, before the snapshot rule. `None`: not reported.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReportedSnapshot {
     pub cpu: Option<f32>,
@@ -21,8 +19,6 @@ pub struct ReportedSnapshot {
 }
 
 /// One disk as an adapter read it, before the snapshot rule.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReportedDisk {
     pub mount_point: Option<String>,
@@ -82,8 +78,6 @@ impl TryFrom<String> for MountPoint {
 }
 
 /// When a snapshot was taken, in Unix seconds: at most `i64::MAX` (SQLite's integer).
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotTime(i64);
 
@@ -93,10 +87,14 @@ pub struct SnapshotTimeOutOfRange;
 
 impl SnapshotTime {
     /// The time in Unix seconds.
-    // Wired into the adapters by RFC 0007 §2 (store_snapshot).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn seconds(self) -> i64 {
         self.0
+    }
+
+    /// The time `retention_secs` before this one, never before 0: a series' points older
+    /// than it are past their retention.
+    pub fn cutoff(self, retention_secs: u64) -> Self {
+        Self(self.0.saturating_sub_unsigned(retention_secs).max(0))
     }
 }
 
@@ -150,8 +148,6 @@ pub const MAX_MOUNT_POINT_BYTES: usize = 256;
 
 /// The snapshot rule: keeps every reported, finite value, and the first `MAX_DISKS` disks
 /// that pass, and counts the rest by reason.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn snapshot_rule(reported: ReportedSnapshot) -> (Snapshot, LeftOut) {
     let mut left_out = LeftOut::default();
     let scalars = keep_scalars(&reported, &mut left_out);
@@ -210,8 +206,6 @@ fn finite(value: Option<f32>) -> Result<f32, Refusal> {
     }
 }
 
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 impl Snapshot {
     /// The snapshot's metric points: cpu, memory, swap, load1, load5, then disk:<mount point>.
     pub fn metric_points(&self) -> impl Iterator<Item = (String, f32)> + '_ {
@@ -225,6 +219,21 @@ impl Snapshot {
             .map(|(MountPoint(mount), value)| (format!("disk:{mount}"), *value));
         scalars.chain(disks)
     }
+
+    /// The kept value of `scalar`; `None` when the rule left it out.
+    pub fn scalar(&self, scalar: Scalar) -> Option<f32> {
+        self.scalars
+            .iter()
+            .find(|(kept, _)| *kept == scalar)
+            .map(|(_, value)| *value)
+    }
+
+    /// The kept disks, as mount point and usage, in reported order.
+    pub fn disks(&self) -> impl Iterator<Item = (&str, f32)> + '_ {
+        self.disks
+            .iter()
+            .map(|(MountPoint(mount), usage)| (mount.as_str(), *usage))
+    }
 }
 
 /// How one snapshot's left-out values are logged.
@@ -237,8 +246,6 @@ pub enum LeftOutLog {
 
 /// Decides from when this system last warned, and returns the warning time the system's
 /// next live metrics keep: `previous` unchanged, or `now` after a `Warn`.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn left_out_log(
     previous: Option<Instant>,
     left_out: &LeftOut,
@@ -253,13 +260,57 @@ pub fn left_out_log(
     }
 }
 
+/// A system's latest snapshot, as the snapshot rule kept it, held for the dashboard (RFC 0007
+/// §4), with when its left-out values were last logged at `warn`. Built only by `following`,
+/// so no entry starts its warning time from a default.
+#[derive(Debug)]
+pub struct LiveMetrics {
+    snapshot: Snapshot,
+    time: SnapshotTime,
+    left_out_warned_at: Option<Instant>,
+}
+
+impl LiveMetrics {
+    /// The entry that follows `previous` with a newly stored snapshot, and how the snapshot's
+    /// left-out values are logged. The warning time comes from `left_out_log` alone, so a host
+    /// leaving something out of every snapshot warns once an hour, not every snapshot.
+    pub fn following(
+        previous: Option<&LiveMetrics>,
+        snapshot: Snapshot,
+        time: SnapshotTime,
+        left_out: &LeftOut,
+        now: Instant,
+    ) -> (Self, LeftOutLog) {
+        let warned_at = previous.and_then(|entry| entry.left_out_warned_at);
+        let (log, left_out_warned_at) = left_out_log(warned_at, left_out, now);
+        let entry = Self {
+            snapshot,
+            time,
+            left_out_warned_at,
+        };
+        (entry, log)
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    pub fn time(&self) -> SnapshotTime {
+        self.time
+    }
+
+    /// When this system's left-out values were last logged at `warn`.
+    #[cfg(test)]
+    pub fn left_out_warned_at(&self) -> Option<Instant> {
+        self.left_out_warned_at
+    }
+}
+
 /// The retention of a metric with no valid `metric_retention` row: a day, in seconds.
 const DEFAULT_RETENTION_SECS: u64 = 86_400;
 
 /// A metric's retention in seconds, from its stored `metric_retention` value: no row or a
 /// negative value is a day, otherwise the stored value.
-// Wired into the adapters by RFC 0007 §2 (store_snapshot).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn snapshot_retention(stored: Option<i64>) -> u64 {
     stored
         .and_then(|secs| u64::try_from(secs).ok())
@@ -746,6 +797,30 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_reads_back_each_kept_scalar_and_none_for_one_left_out() {
+        let snapshot = kept(
+            &[(Scalar::Memory, 20.0), (Scalar::Load5, 2.5)],
+            &[("/", 50.0), ("/home", 70.0)],
+        );
+        let cases = [
+            ("cpu, left out", Scalar::Cpu, None),
+            ("memory, kept", Scalar::Memory, Some(20.0)),
+            ("swap, left out", Scalar::Swap, None),
+            ("load1, left out", Scalar::Load1, None),
+            ("load5, kept", Scalar::Load5, Some(2.5)),
+        ];
+        for (case, scalar, expected) in cases {
+            assert_eq!(snapshot.scalar(scalar), expected, "case: {case}");
+        }
+        let disks: Vec<(&str, f32)> = snapshot.disks().collect();
+        assert_eq!(
+            disks,
+            [("/", 50.0), ("/home", 70.0)],
+            "disks in reported order"
+        );
+    }
+
+    #[test]
     fn metric_points_keep_the_scalar_order_for_every_subset_of_scalars() {
         let names = ["cpu", "memory", "swap", "load1", "load5"];
         for mask in 0u8..32 {
@@ -799,6 +874,32 @@ mod tests {
             let expected = i64::try_from(input).map_err(|_| SnapshotTimeOutOfRange);
             let time = SnapshotTime::try_from(input).map(SnapshotTime::seconds);
             assert_eq!(time, expected, "case: {case}");
+        }
+    }
+
+    #[test]
+    fn a_retention_cutoff_is_the_retention_before_the_time_and_never_before_zero() {
+        let max = i64::MAX as u64;
+        let cases = [
+            (
+                "a day before a 2026 time",
+                1_790_000_000,
+                86_400,
+                1_789_913_600,
+            ),
+            ("an hour before", 100_000, 3_600, 96_400),
+            ("no retention", 100_000, 0, 100_000),
+            ("exactly the time since 0", 86_400, 86_400, 0),
+            ("more than the time since 0", 5, 86_400, 0),
+            ("at 0", 0, 86_400, 0),
+            ("i64::MAX, no retention", max, 0, i64::MAX),
+            ("i64::MAX, a day", max, 86_400, i64::MAX - 86_400),
+            ("i64::MAX, all of it", max, max, 0),
+            ("u64::MAX of retention", 1_790_000_000, u64::MAX, 0),
+        ];
+        for (case, time, retention, expected) in cases {
+            let time = SnapshotTime::try_from(time).unwrap();
+            assert_eq!(time.cutoff(retention).seconds(), expected, "case: {case}");
         }
     }
 
@@ -907,6 +1008,78 @@ mod tests {
             (LeftOutLog::Debug, Some(at(100))),
             "case: {case}"
         );
+    }
+
+    /// RFC 0007 §1, §4: an entry takes its warning time from the entry it follows, through
+    /// `left_out_log`, never from a default.
+    #[test]
+    fn a_live_metrics_entry_carries_the_warning_time_over_from_the_one_it_follows() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(10);
+        let entry = |warned_at: Option<Instant>| LiveMetrics {
+            snapshot: Snapshot::default(),
+            time: SnapshotTime(1),
+            left_out_warned_at: warned_at,
+        };
+        let one_left_out = LeftOut {
+            not_finite: 1,
+            ..LeftOut::default()
+        };
+        let an_hour_before_now = now - Duration::from_secs(3_600);
+        let cases = [
+            (
+                "first entry, nothing left out",
+                None,
+                LeftOut::default(),
+                (LeftOutLog::Nothing, None),
+            ),
+            (
+                "first entry, left out",
+                None,
+                one_left_out,
+                (LeftOutLog::Warn, Some(now)),
+            ),
+            (
+                "never warned, left out",
+                Some(entry(None)),
+                one_left_out,
+                (LeftOutLog::Warn, Some(now)),
+            ),
+            (
+                "warned 10 s ago, left out",
+                Some(entry(Some(start))),
+                one_left_out,
+                (LeftOutLog::Debug, Some(start)),
+            ),
+            (
+                "warned 10 s ago, nothing left out",
+                Some(entry(Some(start))),
+                LeftOut::default(),
+                (LeftOutLog::Nothing, Some(start)),
+            ),
+            (
+                "warned an hour ago, left out",
+                Some(entry(Some(an_hour_before_now))),
+                one_left_out,
+                (LeftOutLog::Warn, Some(now)),
+            ),
+        ];
+        for (case, previous, left_out, expected) in cases {
+            let kept = kept(&[(Scalar::Cpu, 1.0)], &[("/", 2.0)]);
+            let (next, log) = LiveMetrics::following(
+                previous.as_ref(),
+                kept.clone(),
+                SnapshotTime(7),
+                &left_out,
+                now,
+            );
+            assert_eq!((log, next.left_out_warned_at()), expected, "case: {case}");
+            assert_eq!(
+                (next.snapshot(), next.time()),
+                (&kept, SnapshotTime(7)),
+                "case: {case}"
+            );
+        }
     }
 
     #[test]

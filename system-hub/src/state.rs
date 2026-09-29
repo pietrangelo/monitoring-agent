@@ -15,35 +15,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
+
+use tokio::sync::watch;
 
 use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
 use crate::db::Database;
-use crate::models::SystemInfo;
-use serde::Serialize;
-
-/// Latest snapshot per system_id, kept in memory for the dashboard.
-#[derive(Debug, Clone, Serialize)]
-pub struct LiveMetrics {
-    pub cpu_percent: f32,
-    pub memory_percent: f32,
-    pub load_one: f64,
-    pub disks: Vec<(String, f32)>,
-    pub updated_at: u64,
-}
-
-impl Default for LiveMetrics {
-    fn default() -> Self {
-        Self {
-            cpu_percent: 0.0,
-            memory_percent: 0.0,
-            load_one: 0.0,
-            disks: Vec::new(),
-            updated_at: 0,
-        }
-    }
-}
+use crate::routes::sse::Summary;
+use crate::snapshot::LiveMetrics;
 
 /// What the hub holds in memory of one system's applications (RFC 0009 §8).
 #[derive(Debug, Default)]
@@ -60,120 +40,85 @@ pub struct SystemApplications {
 
 pub struct AppState {
     pub db: Arc<Database>,
-    pub systems_cache: RwLock<Vec<SystemInfo>>,
-    /// Per-system latest live metrics (updated by push or poll).
-    pub live_metrics: RwLock<HashMap<String, LiveMetrics>>,
+    /// Per-system live metrics, written with each stored snapshot, keyed by system id, and
+    /// evicted when a push connection ends or the system is deleted. Lock order: the database
+    /// mutex, then this; never take the database mutex while holding it.
+    pub live_metrics: RwLock<HashMap<String, Arc<LiveMetrics>>>,
     /// Per-system applications, keyed by system id. Lock order: the database mutex, then
     /// this; never take the database mutex while holding it.
     pub live_applications: RwLock<HashMap<String, SystemApplications>>,
     /// The one digest key every ingestion path shares.
     pub digester: RoundDigester,
+    /// The latest summary (RFC 0007 §5): the publisher replaces it, and every SSE subscriber
+    /// watches it.
+    pub summary: watch::Sender<Summary>,
 }
 
 impl AppState {
-    pub fn new(db: Arc<Database>) -> Arc<Self> {
-        let systems = db.list_systems().unwrap_or_default();
-        Arc::new(Self {
+    /// Builds the hub's state with its first summary, so the channel never holds an empty
+    /// value. The summary reads the database, so `main` runs this on the blocking pool.
+    pub fn new(db: Arc<Database>) -> Result<Arc<Self>, serde_json::Error> {
+        let live_metrics = RwLock::new(HashMap::new());
+        let summary = watch::Sender::new(Summary::build(&db, &live_metrics)?);
+        Ok(Arc::new(Self {
             db,
-            systems_cache: RwLock::new(systems),
-            live_metrics: RwLock::new(HashMap::new()),
+            live_metrics,
             live_applications: RwLock::new(HashMap::new()),
             digester: RoundDigester::new(),
-        })
+            summary,
+        }))
     }
 
-    pub fn refresh_cache(&self) {
-        if let Ok(systems) = self.db.list_systems() {
-            *self.systems_cache.write().unwrap() = systems;
-        }
-    }
-
-    pub fn get_enabled_systems(&self) -> Vec<SystemInfo> {
-        self.systems_cache
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|s| s.enabled)
-            .cloned()
-            .collect()
+    /// Removes a system's live metrics (RFC 0007 §4) and hands the entry back, so the caller
+    /// drops it after the live lock is released.
+    pub fn evict_live_metrics(&self, system_id: &str) -> Option<Arc<LiveMetrics>> {
+        self.live_metrics
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(system_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::snapshot::{ReportedSnapshot, SnapshotTime, snapshot_rule};
 
-    fn temp_db() -> (Arc<Database>, tempfile::TempDir) {
+    fn app() -> (Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-        (db, dir)
+        (AppState::new(db).unwrap(), dir)
     }
 
-    fn sample_system(id: &str, name: &str, enabled: bool) -> SystemInfo {
-        SystemInfo {
-            id: id.to_string(),
-            name: name.to_string(),
-            url: "http://example.com".to_string(),
-            token: String::new(),
-            status: crate::models::SystemStatus::Unknown,
-            last_seen: String::new(),
-            last_error: None,
-            os: None,
-            hostname: None,
-            kernel: None,
-            cpu_model: None,
-            cpu_cores: None,
-            total_memory_display: None,
-            total_memory_bytes: None,
-            poll_interval_secs: 10,
-            enabled,
-        }
+    fn plant(app: &AppState, system_id: &str) -> Arc<LiveMetrics> {
+        let (snapshot, left_out) = snapshot_rule(ReportedSnapshot::default());
+        let time = SnapshotTime::try_from(1_700_000_000).unwrap();
+        let (entry, _) = LiveMetrics::following(None, snapshot, time, &left_out, Instant::now());
+        let entry = Arc::new(entry);
+        let mut live = app.live_metrics.write().unwrap();
+        live.insert(system_id.to_string(), Arc::clone(&entry));
+        entry
     }
 
+    /// RFC 0007 §4: an eviction hands back the system's own entry, for its caller to drop
+    /// outside the live lock, and leaves every other entry in place.
     #[test]
-    fn live_metrics_default_is_zeroed() {
-        let live = LiveMetrics::default();
-        assert_eq!(live.cpu_percent, 0.0);
-        assert_eq!(live.memory_percent, 0.0);
-        assert_eq!(live.load_one, 0.0);
-        assert!(live.disks.is_empty());
-        assert_eq!(live.updated_at, 0);
-    }
+    fn evicting_live_metrics_hands_back_only_that_systems_entry() {
+        let (app, _dir) = app();
+        let planted = plant(&app, "sys-1");
+        plant(&app, "sys-2");
 
-    #[test]
-    fn app_state_new_loads_systems_from_db() {
-        let (db, _dir) = temp_db();
-        db.insert_system(&sample_system("id-1", "web", true))
-            .unwrap();
-        let state = AppState::new(db);
-        assert_eq!(state.systems_cache.read().unwrap().len(), 1);
-    }
+        let evicted = app.evict_live_metrics("sys-1");
+        let again = app.evict_live_metrics("sys-1");
 
-    #[test]
-    fn refresh_cache_picks_up_new_rows() {
-        let (db, _dir) = temp_db();
-        let state = AppState::new(db.clone());
-        assert!(state.systems_cache.read().unwrap().is_empty());
-
-        db.insert_system(&sample_system("id-1", "web", true))
-            .unwrap();
-        state.refresh_cache();
-        assert_eq!(state.systems_cache.read().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn get_enabled_systems_filters_disabled() {
-        let (db, _dir) = temp_db();
-        db.insert_system(&sample_system("id-1", "enabled-sys", true))
-            .unwrap();
-        db.insert_system(&sample_system("id-2", "disabled-sys", false))
-            .unwrap();
-        let state = AppState::new(db);
-
-        let enabled = state.get_enabled_systems();
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].id, "id-1");
+        assert!(
+            evicted.is_some_and(|entry| Arc::ptr_eq(&entry, &planted)),
+            "the system's entry comes back"
+        );
+        assert!(again.is_none(), "nothing is left to evict");
+        let live = app.live_metrics.read().unwrap();
+        let kept: Vec<&str> = live.keys().map(String::as_str).collect();
+        assert_eq!(kept, ["sys-2"], "another system's entry stays");
     }
 }

@@ -1,6 +1,6 @@
 # RFC 0007: One Snapshot Rule, One Transaction, One Serialisation
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-25 (revised 2026-09-29 for the first five `rfc-adversary` passes, against the
   hub as RFCs 0006, 0009, 0014 and 0015 left it)
@@ -1160,8 +1160,10 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
 
 ## Implementation progress
 
-On branch `feat/push-ingestion-cost`, in the order Rollout sets. Each step went through
-`red-test-adversary` (EVIDENCE) and the hub gate.
+On branch `feat/push-ingestion-cost`, continued on `claude/peaceful-einstein-acohge`, in the
+order Rollout sets. Each step went through `red-test-adversary` (EVIDENCE; from §2 on as an
+in-process check at medium effort, with mutation runs: every cheat tried was killed) and the
+hub gate.
 
 | Step | State | Commit |
 |---|---|---|
@@ -1170,20 +1172,215 @@ On branch `feat/push-ingestion-cost`, in the order Rollout sets. Each step went 
 | §6 split of `db.rs` into `db/mod.rs` and `db/history.rs` | done | `ebc6a4a` |
 | `hourly_warning` moved into a pure module | done | `9f0ff1d` |
 | §1 the snapshot rule (`snapshot.rs`) | done, not yet wired into the adapters | `0059304` |
-| §2 `store_snapshot`, capped prune, `LastSeen`/`UptimeDisplay`/`StatusUpdate`, `MemoryCapacity` bounds | next | |
-| §1/§2/§4 wiring both adapters: push and poll through the rule and `store_snapshot`, poll on the blocking pool, 4 MiB poll body, no systems cache, `insert_system_if_absent`, `registry unavailable` | to do | |
-| §3 decode budget (`TokenBucket`, `DecodeBudget`) | to do | |
-| §4 `Arc<LiveMetrics>`, `end_connection`, eviction on delete | to do | |
-| §5 SSE publisher (`watch`, `send_replace`) | to do | |
-| README, ARCHITECTURE, end-to-end measurement in the Appendix, `rosette-auditor` on the whole diff, status `Implemented` | to do | |
+| §2 `store_snapshot`, capped prune, `LastSeen`/`UptimeDisplay`/`StatusUpdate`, `MemoryCapacity` bounds | done, `store_snapshot` not yet wired into the adapters | `3d7d610` |
+| §4 registration: `insert_system_if_absent`, `registry unavailable` for a returned error and for a `JoinError` | done | `5d43dcc` |
+| Characterisation of the SSE `summary` event's bytes | done | `e90812d` |
+| §1/§2 both adapters through the rule and `store_snapshot` (`snapshot_intake.rs`), with §4's `Arc<LiveMetrics>` value, its left-out warning time, `SystemGone` ending the push connection, and push store errors counted | done | `920e28a` |
+| §1 the 4 MiB poll body; the poll's offline marking on the blocking pool | done | `42b0241` |
+| §2 no systems cache: the poller reads the registry each tick (`enabled_systems`) | done | `71178dd` |
+| `rosette-auditor` on the wiring (`918638e..71178dd`): its one VIOLATED and six AT-RISK fixed | done | `c70c7a1` |
+| §3 `TokenBucket` under `SourcePace`'s tests; the connection's state split into `push/connection.rs` | done | `7a96072`, `f77ac56` |
+| §3 decode budget (`DecodeBudget`, `PushConfig::decode_refill`), spent before either decode | done | `c9c3c51` |
+| §4 `end_connection`, eviction on delete (`AppState::evict_live_metrics`) | done | `69d23f2` |
+| §5 SSE publisher (`watch`, `send_replace`) | done | `160862a` |
+| README and ARCHITECTURE | done | `0a7278f` |
+| `rosette-auditor` on the whole diff: its VIOLATED and two AT-RISK acted on; a failed poll's client dropped before its offline marking | done | `2bd1c1c` |
+| End-to-end measurement in the Appendix, status `Implemented` | done | the commit that sets it |
 
 Open items to settle on the way:
-- `snapshot.rs` has temporary `#[cfg_attr(not(test), allow(dead_code))]` attributes, to be removed
-  once `store_snapshot` and the adapters use the items.
+- §2 added `SnapshotTime::cutoff` (the retention cutoff, never before 0), a pure rule the RFC's
+  text leaves inside `store_snapshot`; it keeps the arithmetic out of the SQL adapter.
+- The wiring added names the design doesn't have:
+  - `snapshot_intake.rs` (Ingestion, beside `round_intake.rs`): the one step both paths share,
+    the rule, then `store_snapshot`, then the live metrics entry (`keep_live_metrics`, the
+    `on_stored` of both paths) and the left-out log. The warning time's carry-over and the
+    replaced entry (`Arc::ptr_eq`) are tested there;
+  - `LiveMetrics` lives in `snapshot.rs`, and its fields are private, unlike §4's block: it is
+    built only by `LiveMetrics::following(previous, snapshot, time, &left_out, now)`, which
+    takes the warning time from `left_out_log` and the entry it follows, so no entry can
+    start from a default;
+  - `registry::needs_system_info`: the fill rule both adapters apply (hostname or OS missing);
+  - `SnapshotFrame` / `PushedInfo` (push) and `PolledAnswer` / `PolledInfo` (poll): each edge's
+    parsed frame, with the system info the registry fill reads;
+  - `Snapshot::scalar` and `Snapshot::disks`, read by the SSE summary's `LiveMetricsDto`. The DTO
+    lands in `routes/sse.rs` now, not with §5, since `LiveMetrics` stopped being the wire shape;
+  - `ConnectionRounds` became `ConnectionState`, with one `Tally` per count (refused application
+    frames, refused snapshot frames, store errors); `Occurrence` replaces `RefusedFrame`.
+    `ARCHITECTURE.md` still names the old two, until the docs row;
+  - `collector/capped_body.rs` (`read_capped`, `CappedBodyError`), now shared by both polls, and
+    `PollFailure`, the poll's offline causes. A transport error while reading the body now
+    shows as itself instead of `JSON parse error: …`, and a body that isn't JSON shows
+    serde's message.
+- The poll parses the system's id once, before its fetch. A row whose id breaks the rule
+  (stored before RFC 0005) is marked offline with `invalid system id` and never fetched, where
+  the fetch of its `push://` URL used to fail with reqwest's error.
+- **The SSE summary's `load_one` keeps its bytes.** The summary goes through `serde_json::Value`,
+  which widens an `f32` to `f64`, so a load the agent sent as 0.52 (an `f64`) would have shown
+  as 0.5199999809265137 once kept as `f32`. `LiveMetricsDto` shows the kept load as the `f64` its
+  shortest decimal names, and the characterisation pins a load of 0.52. The percentages were
+  `f32` on the wire already, and keep their widened bytes. §5's publisher must keep the
+  characterised bytes too: serialising a struct with `serde_json::to_string` would print the
+  percentages' shortest form and change their bytes.
+- A refused snapshot frame (its timestamp) is counted and logged as §3 describes, the first per
+  connection at `warn`: it landed with the refusal, before the budget.
+- `Database::plant_point`, test-only, replaces `insert_metric` wherever a test needs history in
+  place.
+- The connection's state split out of `push/mod.rs` (529 lines before its tests) before §3
+  grew it: `push/connection.rs` holds `ConnectionState`, `Tally`, `Occurrence`, `warn_first`
+  and the budget. `push/mod.rs` has 466 lines before its tests.
+- §3 added names the design doesn't have:
+  - `Refill` is a bucket's capacity (`NonZeroU8`) and its period, so a bucket that never holds a
+    token can't be built. `token_bucket::Empty` is the bucket's refusal, which `SourcePace` maps
+    to `TooSoon` and `DecodeBudget` to `OutOfBudget`;
+  - `ConnectionState::spend_decode_budget` spends the budget and counts a drop in one step, so
+    no caller can drop a message without counting it. `ingest` calls it first, with the time the
+    message was read;
+  - `DECODE_REFILL` sits in `push/config.rs` with the other production timings, and
+    `DECODE_BURST` beside `DecodeBudget`.
+- A zero period has no quotient (`checked_div`), and the bucket is full at every take. That is
+  the rule's limit, not a sentinel, and `Refill` and `PushConfig::decode_refill` document it.
+- `an_authenticated_client_that_only_sends_frames_or_pongs_stays_connected` sends ten messages
+  a second, so it uses a zero refill, as §3 foresaw for tests that send several frames. None
+  of the others needed one.
+- The budget's real-server tests add one row the plan doesn't list: a second connection of
+  the same system, opened after the first dropped a message, stores its first frame at once.
+  The budget is per connection, and a budget shared by a system's connections passed every
+  other row.
+- `red-test-adversary` on §3, as an in-process check with mutation runs in a sandbox: the pure
+  table was `DECORATION` twice before it held. A budget that ignored its period (1 s
+  hard-coded, zero special-cased) passed, until a 100 ms row. An uncapped partial refill
+  passed, until a 5 s quiet row. The wiring's tests killed spending on snapshot frames only,
+  spending after decoding, closing the connection when out of budget, ignoring
+  `decode_refill`, a burst of 2, a budget shared across connections, and an uncounted drop.
+- `rosette-auditor` on §3, as an in-process check: no VIOLATED. Three AT-RISK, each decided:
+  the zero refill (kept, as above); "decode budget" has no glossary entry yet (the docs row
+  adds it with the RFC's other terms); `token_bucket.rs` has no tests of its own (both
+  wrappers' tables cover it, at capacities 2 and 3 and periods of 8 s, 1 s, 100 ms and 0).
+- §4's eviction added `AppState::evict_live_metrics`, which both `end_connection` and the
+  delete handler call. It takes the id as a `&str`, not a `SystemId`, since the delete route
+  deliberately takes stored ids that break RFC 0005's rule. It hands the entry back, so the
+  caller drops it outside the live lock. `end_connection` now logs a failed offline marking at
+  `warn`, where `mark_offline` discarded it. It keeps the `""` it writes as `last_seen`, which
+  a characterisation pins; `StatusUpdate` has no offline form yet.
+- `red-test-adversary` on §4, as an in-process check with mutation runs in a sandbox:
+  EVIDENCE. These cheats were all killed: evicting only while the row exists, clearing every
+  entry, evicting without marking offline, also forgetting the applications, evicting in
+  `handle_push` instead of `end_connection`, and a delete that evicts only push systems, only
+  polled ones, or every entry. Two orders stay unpinned, since only a race harness could see
+  them: offline before the eviction in `end_connection`, and the row before the entry in the
+  delete. Each is a commented line.
+- `rosette-auditor` on §4, as an in-process check: no VIOLATED. Two AT-RISK, each decided:
+  the `&str` key and the `""` `last_seen`, both as above. The delete handler still calls
+  SQLite on the runtime, as every REST handler does; moving it alone would widen this RFC, and
+  RFC 0010 replaces that store.
+- §5 added names the design doesn't have:
+  - `Summary`, the serialised summary: a newtype over `Arc<str>` whose field is private, so no
+    empty or placeholder summary can be built outside `routes/sse.rs`. `state.rs` imports it
+    from there;
+  - `SummaryFailure` (the serialisation, or the blocking task), which both the publisher and
+    `main` report. `AppState::new` returns `serde_json::Error`, since the first summary
+    serialises; `main` refuses to start with `StartupError::FirstSummary` when it fails or
+    panics;
+  - `SummaryDto` beside `LiveMetricsDto`, still serialised through a `Value`, so the keys stay
+    sorted and the percentages keep their widened bytes (as above); `summaries`, the watch
+    stream, and `summary_event`.
+- The publisher's first tick comes one period after it starts (`interval_at`), since
+  `AppState::new` built the first summary.
+- The serialisation counter became a shared-allocation check, with no test-only field: every
+  subscriber's summary of a tick is the same `Arc<str>`, so three subscribers over two ticks
+  hold two allocations. A serialisation or a copy per subscriber holds six.
+- One test the plan doesn't list: the running binary (`tests/fail_closed.rs`) lists a system
+  registered after startup within one tick. No unit test sees `main` start the publisher.
+- The summary's read fallbacks stay as they were: a `list_systems` that fails shows no systems
+  (the open question the docs row adds), and a `count_active_alerts` that fails shows no
+  active alerts. The poller warns when the registry can't be read.
+- `red-test-adversary` on §5, as an in-process check with mutation runs in a sandbox:
+  EVIDENCE. The published-not-fresh and shared-serialisation tests were red on assertions
+  against the stubs. These cheats were all killed: `send` for `send_replace`,
+  `WatchStream::from_changes`, a copy per subscriber, `main` not starting the publisher, a
+  publisher every 60 s, a startup summary from another database, and a publish that keeps
+  serving the startup summary. Three things stay unpinned, since no test can see them: the
+  build on the blocking pool rather than the runtime, keeping the previous summary when a
+  build fails (no failure can be injected), and the missed-tick policy.
+- `rosette-auditor` on §5, as an in-process check: no VIOLATED. Three AT-RISK, each decided:
+  the read fallbacks' empty list and zero (kept, as above: changing them is a behaviour
+  change §5 doesn't make); `state.rs` depending on `routes/sse.rs` for `Summary` (`AppState`
+  is the adapters' shared state, and the summary is the SSE adapter's wire value); "summary"
+  has no glossary entry (it is a wire document, which `ARCHITECTURE.md` already calls the SSE
+  summary; the docs row decides).
+- Removing `ORDER BY timestamp` from the capped prune survives the tests: SQLite reads the
+  subquery through `idx_metrics_system_time`, already in timestamp order. The `ORDER BY` stays,
+  so oldest-first is a guarantee rather than a planner choice.
+- In a container without IPv6, `tests/fail_closed.rs`'s `[::]:0` case (RFC 0015) fails to bind;
+  CI's runners have IPv6.
 - `POST /api/systems` accepts a `poll_interval_secs` above `i64::MAX` and answers 500; it should
   parse through `PollInterval` too. A `PUT` of 0 is still stored while `POST` clamps to 5 (out
   of this RFC's scope; an open question).
-- `rosette-auditor` hasn't run on any step yet.
+- The docs row decided what the earlier steps left to it:
+  - the glossary gains **snapshot rule**, **mount point**, **decode budget**, **live metrics**
+    and **last seen**, and changes **system status**, **snapshot**, **retention**, **push
+    handshake**, **memory capacity** and **source pace** (whose "In code" named
+    `ConnectionRounds`);
+  - "summary" gets no glossary entry: it is a wire document, the SSE summary, which
+    `ARCHITECTURE.md` describes under Components with its publisher;
+  - `token_bucket.rs` and `hourly_warning.rs` sit below the context table, in no context;
+  - the open questions gain the ones the implementation found: `POST /api/systems` taking
+    `poll_interval_secs` without `PollInterval`, and the cost of the poller's client per
+    system (below).
+- The docs row also fixed what the docs already got wrong: `ARCHITECTURE.md` named
+  `refused_poll`, which is `log_refused_round` since RFC 0009 moved its rule into
+  `hourly_warning.rs`, and the README's tree listed a `push/application_wire.rs` that doesn't
+  exist and left out `registry.rs`, `clock.rs` and `listen.rs`.
+- **The measurement found a standing cost outside this RFC, and a regression inside it.**
+  - The poller polls every enabled row, `push://` ones included (a known open question: they
+    flap offline), and builds a new reqwest client for each poll, on a runtime worker,
+    loading the CA roots each time. With OpenSSL 3.0.13 that costs about 0.36 s of CPU per
+    poll in the measurement's 4-core container, on `main` and on this branch alike (between 440
+    and 490 polls in 45 s on all four cores, in each run). The measurement's first table held 1,000
+    enabled `push://` rows (the Appendix's fleet-sized `systems` table), and neither hub
+    answered `/api/health` within 60 s. The measurement disables those rows, which the push
+    path doesn't read, and `ARCHITECTURE.md`'s open question records the cost. Fixing it (one
+    client per system, no poll of `push://` rows) is outside this RFC.
+  - Under that load this branch's hub grew where `main`'s didn't: 415 MB after 45 s and
+    3.4 GB after ten minutes, against 26 MB. Since `42b0241` a failed poll awaits its offline
+    marking on the blocking pool, and it held its client (and its CA store) across that
+    await, until the runtime came back to it behind the rest of the tick's polls. `2bd1c1c`
+    drops the client first, and the hub stays at 27 MB under the same load. No test can see
+    a client's lifetime, so the change went in as a refactor under the poll tests, with the
+    measurement as its evidence.
+- `rosette-auditor` ran on the whole diff (`origin/main..12bd748`, 25 commits), as a subagent.
+  Its clippy and test runs were clean, apart from the `[::]:0` row without IPv6 (as above).
+  No VIOLATED in the code; one VIOLATED in the docs row (then uncommitted, now `0a7278f`),
+  and two AT-RISK:
+  - VIOLATED: the new **last seen** glossary entry and `LastSeen`'s doc comment said the
+    column holds the time of the last *successful* poll, but every offline marking of a poll
+    writes the failed poll's time, and **system status** left out the handshake's online
+    registration of a new push id. Fixed in `2bd1c1c`: both entries and the doc comment name
+    every writer, and a characterisation test pins a failed poll's time (an HTTP error, a
+    connection error, an id that breaks the rule). `red-test-adversary` in mutation mode, as
+    an in-process check: a blank from the network failures' marking and a blank from the
+    invalid id's marking each turn it red on its assertion. EVIDENCE. The behaviour itself
+    stays; RFC 0010's contact time is where it changes.
+  - AT-RISK, decided: the snapshot rule keeps any finite percentage, where the glossary's
+    **percent** is 0–100. Kept on purpose, since the rule maps what both paths mapped before
+    it. **percent** is now scoped to the agent, and an open question records the hub's range.
+    A hub-side percent with an out-of-range left-out reason would be a behaviour change, for
+    an RFC of its own.
+  - AT-RISK, decided: `collector/mod.rs` had grown from 427 to 481 lines before its tests.
+    The ISO clock (`now_iso`, `unix_to_iso8601`, `is_leap`) moved into `clock.rs`, which now
+    holds every read of the hub's wall clock. The file is back to 440. The alerts poll
+    (`store_agent_alerts`) is the next boundary if it grows again.
+  - Closest call: `SnapshotFrame::try_from` in `push/ingest.rs`, 48 lines of code, mostly
+    destructuring. If it grows, it takes a `reported_snapshot` helper, as the poll's side has.
+- `rosette-auditor` on `2bd1c1c`'s own diff, as an in-process check: no VIOLATED. The closest
+  call is the moved `unix_to_iso8601`, which keeps its `for` loop; it moved unchanged, under
+  its tests.
+- `rosette-auditor` ran on the wiring (`918638e..71178dd`): one VIOLATED (the poll parsed the
+  system id twice, after the fetch) and six AT-RISK (the `load_one` bytes, `LiveMetrics`'s public
+  fields, the fill rule written in both adapters, the registry fill's discarded errors, no test
+  of a poll whose store fails, and a frame's strings copied rather than moved). All seven were
+  fixed in `c70c7a1`. The closest call was the `load_one` bytes. It hasn't run on the steps
+  before the wiring; the last row runs it on the whole diff.
 
 ## Rollout / migration notes
 
@@ -1265,9 +1462,8 @@ Environment, on 2026-09-29:
     today's cost per point on the measured disk, about 9.7 ms (97 ms for a 10-point frame,
     9.9 s for 1029 points, status and registry reads included). 0010 takes it when it is next
     amended.
-- These figures are SQLite's cost alone, from Python. **The implementation re-measures end to
-  end,** through the hub, on a table filled to 24 h, and records the figures here before this
-  RFC is marked `Implemented`.
+- These figures are SQLite's cost alone, from Python. The implementation re-measured them end
+  to end, through the hub, on a table filled to 24 h (below).
 
 Run as `python3 bench.py bench.db 0 20` (one row per series) and
 `python3 bench.py bench.db 86400 20` (filled to 24 h), on the storage being measured:
@@ -1335,6 +1531,147 @@ for disks in (1024, 5):
             times.append((time.perf_counter() - t) * 1000)
         c.close(); times.sort()
         print(f'{disks:5} disks, {mode:16}: median {times[len(times) // 2]:8.1f} ms, max {times[-1]:8.1f} ms', flush=True)
+```
+
+### End to end, through the hub
+
+The implementation's measurement, on 2026-09-29. Environment:
+- a cloud development container: Linux 6.18 in a Firecracker VM, 4 vCPUs (Intel Xeon,
+  2.1 GHz), 15 GiB, ext4 on a virtio disk. One commit costs about 0.95 ms on it, a fifth of
+  the disk above, so these figures compare with each other, not with the table above;
+- both hubs built with `cargo build --release`: today's at `5cf6297` (`main`), and this
+  RFC's at `12bd748`;
+- the table filled by `bench.py`'s `fill()` to 24 h (44,453,829 rows, 13.3 GiB), then every
+  `systems` row disabled, which the push path doesn't read (see Implementation progress: the
+  poller's cost);
+- a push client in Node 22 with no dependencies (below). It authenticates, sends one snapshot
+  frame at a time, with timestamps 2 s apart, and times each from its send until
+  `GET /api/systems/:id` shows the frame's `uptime_display` as `last_seen`. The status write
+  that carries it comes after the frame's points: in the same transaction here, after the
+  last point today (today's `update_registry` read and `refresh_cache` scan follow it, and
+  aren't timed). So a figure covers the socket, the decode, the store, and one HTTP round
+  trip. Frames go at least 1.1 s apart, inside the decode budget, and each run's first two
+  aren't counted;
+- each run starts its hub afresh on the same file, and waits until the hub's CPU time stops
+  moving (its startup and first `app:*` prune);
+- "SQLite alone" runs `bench.py`'s `frame()` on the same file, with the hub stopped, the
+  timestamps carrying on from the hubs' runs.
+
+Median of 20 frames, or of 5 for today's 1024-disk frame, with the slowest in brackets:
+
+| Frame | Today's hub | This RFC's hub | SQLite alone, today | SQLite alone, one transaction, cached |
+|---|---|---|---|---|
+| 5 disks (1 KiB) | 30.7 ms (59.8) | 5.7 ms (11.9) | 26.1 ms (30.4) | 1.9 ms (3.1) |
+| 1024 disks (115 KiB) | 2,554 ms (2,689) | 63.7 ms (79.2) | 2,516 ms (2,820) | 53.8 ms (62.5) |
+
+- Through the hub, a 5-disk snapshot costs a fifth of what it costs today, and a 1024-disk
+  one a fortieth.
+- Today's hub costs what `bench.py`'s model of its statements predicts, within 18% at 5
+  disks and 2% at 1024.
+- This RFC's hub adds about 4 ms at 5 disks, and 10 ms at 1024, to SQLite's share: the
+  socket, the decode, the rule, the hop to the blocking pool, the live metrics entry (written
+  under the mutex, after the commit), and the observing request. The registry read that
+  follows the store may or may not fall inside the timing, and SQLite alone includes one.
+- The database mutex is held for the store alone, about SQLite's share: roughly 2 ms per
+  5-disk snapshot and 54 ms per 1024-disk one on this disk. By itself it would admit about
+  1,000 five-disk systems, or 37 with 1024 disks, pushing every 2 s, before the REST
+  handlers, the SSE summary and the polls take their share.
+- Steady state held: after the last run the measured system's `cpu` series held 43,201
+  points, one window's worth, as the fill left it.
+- The capped prune's worst case (§2), through this RFC's hub, on a second fill with a 12 h
+  `metric_retention` row on each of the measured system's series: half of each series was
+  expired at once, so every snapshot pruned the most it may, 16 rows per point. A 1024-disk
+  snapshot, which deletes 16,464 rows, took 192.8 ms (333.6), against 63.7 ms steady; a
+  5-disk one 10.1 ms (17.9), against 5.7 ms. The `cpu` series went from 43,201 to 42,541
+  points over the 44 frames, exactly 15 a frame (16 pruned, one inserted), so the cap held
+  on every frame. At 1024 disks that is three times the steady cost, the ratio the fourth
+  `rfc-adversary` pass measured from Python (136–147 ms against 45–51 ms).
+- A smoke run on a table of one row per series, before the fill (3 to 5 frames, so only
+  indicative): 4.6 ms against today's 17.2 ms at 5 disks, and 22 ms against 1,634 ms at 1024.
+
+The procedure, in a directory holding `bench.py`, the client and both hub binaries:
+1. `python3 -c "…fill()…"` with `bench.py`'s constants, window 86400, to `system-hub.db`, then
+   `UPDATE systems SET enabled = 0`, and `echo 2000000000 > ts.txt`;
+2. for each hub and each disk count: start the hub with `HUB_LISTEN=127.0.0.1:19091` in that
+   directory, wait for `/api/health` and for its CPU time to stop moving, run
+   `node push-bench.mjs 127.0.0.1:19091 <disks> <frames> ts.txt`, and stop the hub;
+3. with no hub running, time `frame()` on the same file for each mode, two warm-up frames
+   first, carrying the timestamps on from `ts.txt`.
+
+```js
+// node push-bench.mjs <host:port> <disks> <frames> <ts-file>
+// Pushes snapshot frames of <disks> disks to a running hub, one at a time, and times each from
+// its send until GET /api/systems/<id> shows its uptime display as last_seen: the frame's
+// points and status are committed. Frames are spaced at least 1.1 s apart, inside RFC 0007's
+// decode budget. Two warm-up frames aren't counted. Timestamps continue from <ts-file>, 2 s a
+// frame, so each frame deletes one row per series: steady state.
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const [host, disksArg, framesArg, tsFile] = process.argv.slice(2);
+const DISKS = Number(disksArg), FRAMES = Number(framesArg), WARMUP = 2, SPACING = 1100;
+const SID = '0f4e2a9c7b1d4e8f9a3c5b7d1e2f4a6c';
+const MOUNTS = Array.from({ length: 1024 }, (_, i) =>
+  `/var/lib/docker/overlay2/${i.toString(16).padStart(64, '0')}/merged`);
+
+class Pack { // the MessagePack subset the push frame needs, as rmp_serde reads it
+  parts = [];
+  put(...b) { this.parts.push(Uint8Array.from(b)); return this; }
+  typed(tag, len, set) {
+    const b = new Uint8Array(1 + len); b[0] = tag; set(new DataView(b.buffer), 1);
+    this.parts.push(b); return this;
+  }
+  arr(n) { return n < 16 ? this.put(0x90 | n) : this.put(0xdc, n >> 8, n & 255); }
+  str(s) {
+    const u = new TextEncoder().encode(s), n = u.length;
+    if (n < 32) this.put(0xa0 | n); else if (n < 256) this.put(0xd9, n); else this.put(0xda, n >> 8, n & 255);
+    this.parts.push(u); return this;
+  }
+  f32(x) { return this.typed(0xca, 4, (v, o) => v.setFloat32(o, x)); }
+  f64(x) { return this.typed(0xcb, 8, (v, o) => v.setFloat64(o, x)); }
+  uint(x) { return x < 128 ? this.put(x) : this.typed(0xcf, 8, (v, o) => v.setBigUint64(o, BigInt(x))); }
+  bytes() { return Buffer.concat(this.parts); }
+}
+
+function frame(ts, uptime) { // PushPayload's 21 fields, in order
+  const p = new Pack().arr(21).str(SID).str('measured').str('Linux').str('6.18')
+    .f32(1).uint(4).str('cpu').f32(1).str('1 GB').str('4 GB').uint(1e9).uint(4e9)
+    .f32(1).f64(1).f64(1).f64(1).uint(100).str(uptime).arr(DISKS);
+  for (const m of MOUNTS.slice(0, DISKS)) p.arr(4).str(m).f32(1).str('10 GB').str('1 GB');
+  return p.arr(0).uint(ts).bytes();
+}
+
+async function lastSeen() {
+  const r = await fetch(`http://${host}/api/systems/${SID}`);
+  return (await r.json()).last_seen;
+}
+
+const ws = new WebSocket(`ws://${host}/api/push`);
+const inbox = [];
+ws.onmessage = (e) => inbox.push(e.data);
+await new Promise((ok, fail) => { ws.onopen = ok; ws.onerror = fail; });
+ws.send(JSON.stringify({ type: 'auth', system_id: SID, token: '' }));
+while (!inbox.length) await new Promise((r) => setTimeout(r, 5));
+if (!String(inbox[0]).includes('auth_ok')) throw new Error(`handshake: ${inbox[0]}`);
+
+let ts = Number(readFileSync(tsFile, 'utf8')), sent = 0;
+const times = [];
+for (let k = 0; k < WARMUP + FRAMES; k++) {
+  await new Promise((r) => setTimeout(r, Math.max(0, sent + SPACING - performance.now())));
+  ts += 2;
+  const uptime = `run ${ts}`, bytes = frame(ts, uptime);
+  sent = performance.now();
+  ws.send(bytes);
+  while ((await lastSeen()) !== uptime) {
+    if (performance.now() - sent > 120_000) throw new Error(`frame ${ts} not stored`);
+  }
+  if (k >= WARMUP) times.push(performance.now() - sent);
+  writeFileSync(tsFile, String(ts));
+}
+ws.close();
+times.sort((a, b) => a - b);
+const kib = (frame(ts, 'run 0000000000').length / 1024).toFixed(0);
+console.log(`${DISKS} disks (${kib} KiB), ${FRAMES} frames: median ${times[times.length >> 1].toFixed(1)} ms,` +
+  ` max ${times.at(-1).toFixed(1)} ms, min ${times[0].toFixed(1)} ms`);
 ```
 
 ## Review

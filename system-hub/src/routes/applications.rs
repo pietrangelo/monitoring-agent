@@ -134,7 +134,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Arc::new(Database::new(path.to_str().unwrap()).unwrap());
-        (AppState::new(db), dir)
+        (AppState::new(db).unwrap(), dir)
     }
 
     fn now() -> u64 {
