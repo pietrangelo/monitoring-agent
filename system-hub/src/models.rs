@@ -73,7 +73,7 @@ pub struct SystemId(String);
 pub const MAX_SYSTEM_ID_BYTES: usize = 255;
 
 /// Why a value isn't a system id.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemIdError {
     /// The empty string.
     Empty,

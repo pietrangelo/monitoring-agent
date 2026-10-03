@@ -21,6 +21,7 @@ mod collector;
 mod db;
 mod hourly_warning;
 mod listen;
+mod mail_intake;
 mod models;
 mod presence;
 mod push;
