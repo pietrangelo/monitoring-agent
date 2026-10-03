@@ -62,7 +62,7 @@ the store; this RFC's adapter, `storage/`, defines their encoding.
 | `alerts_api_id` | first 16 bytes of SHA-256 of the API id (§5) → record key |
 | `mail_receipts` | system key ‖ run (16-byte UUID) ‖ u64 BE seq → `MailReceipt` (§7) |
 | `mail_receipts_by_time` | `created_at` (u64 BE) ‖ receipt key → () |
-| `mail_newest` | system key → the newest current receipt's key, `created_at` and interval (§7) |
+| `mail_newest` | system key → the newest current receipt's key, `created_at`, `received_at` and interval (§7) |
 | `meta`, keys under `hub/` | `hub/generation`, `hub/key_id`, `hub/push_systems` (0008) |
 
 The store owns `tombstones`, `retention` and the unprefixed `meta` keys (0010).
@@ -109,7 +109,9 @@ sees `SystemRecord`.
 
 ```rust
 /// Domain value (Fleet Registry).
-pub struct System { id: SystemId, generation: Generation, name: SystemName, source: Source, info: Option<SystemInfoFields> }
+pub struct System { id: SystemId, generation: Generation, name: SystemName, source: Source, info: Option<SystemInfoFields>, registered: Registered }
+/// In memory only (RFC 0008 §3's sweep grace): every system loaded at open is `BeforeOpen`.
+pub enum Registered { BeforeOpen, At(Instant) }
 pub enum Source {
     Push,
     /// Registered by its first accepted mail report (RFC 0017). `enabled` silences its overdue
@@ -407,8 +409,9 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
      means a pruned receipt's replay can never pass as new;
   then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
   insert the receipt; the alert records (§5); and for a `Newest` report, `mail_newest/<key>`
-  and, **if it is the system's newest `Newest` report of the scan** (by `created_at`), its
-  newest snapshot's points, staged at hub now (`CatalogTxn::append`, 0010 §2 *Mail points*), so
+  and, **if it is the system's newest accepted `Newest` report of the scan** (by `(created_at,
+  seq)`, known only once every report's refusals are, so staged **at the end of `f`**, once per
+  system), its newest snapshot's points, staged at hub now (`CatalogTxn::append`, 0010 §2 *Mail points*), so
   two reports of one system in a scan never stamp the same second.
   A skipped report writes and stages nothing. **After the commit**, the live metrics, the info
   fill and the round (`append_round`) run once per system, for its newest `Newest` report of the
