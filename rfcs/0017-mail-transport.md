@@ -1,11 +1,12 @@
 # RFC 0017: Mail Transport: Sealed Reports over SMTP for Agents Without Internet Access
 
-- Status: Draft
+- Status: Accepted
 - Author: Claude (pairing with pietrangelomasalaMD)
-- Date: 2026-10-03 (revised the same day for three `rfc-adversary` passes; see Review)
+- Date: 2026-10-03 (revised the same day for four `rfc-adversary` passes; accepted after the
+  fourth, see Review)
 - Affects: both. `system-agent` gains a third way to reach a hub (`mail/`, an SMTP client and
   the `MAIL_*` variables). `system-hub` gains a mail intake (`mail_intake/`, a Maildir reader
-  and the `HUB_MAIL_*` variables), two tables (`mail_receipts`, `mail_tombstones`), an overdue sweep, and a
+  and the `HUB_MAIL_*` variables), one table (`mail_receipts`), an overdue sweep, and a
   `mail-key` subcommand. The push handshake gains one refusal (`transport mismatch`, §6).
   No endpoint, push frame or poll response changes.
 - **Owner's decision (2026-10-03):** the hub reads a Maildir. An SMTP server inside the
@@ -294,13 +295,16 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
      check: `insert_system_if_absent(id, url)` reads the row's `url` in the same hold of the
      mutex and returns `Registered | Known | TransportMismatch`, so no check-then-insert can
      race a mail scan registering the same id. Both transports call it, each with its own
-     URL. This amends RFC 0007 §4's rule that the check "reads no column" (it now reads
-     `url`, still nothing that can fail to map) and its `query_only` test, and the glossary's
+     URL. This amends RFC 0007 §4's rule that the check "reads no column": it now reads
+     `url`, through `ValueRef`, so nothing can fail to map (a `url` that isn't text, such as
+     a hand-edited blob, counts as "not `mail://`", as `history.rs::integer` treats a value
+     that isn't an integer). It also amends RFC 0007 §4's `query_only` test, and the glossary's
      *refusal*. The hub logs this refusal through `hourly_warning`, per system, since a
      shipped agent retries it every 5 s. Otherwise
      insert the row if absent, with `url = "mail://"`.
   3. **Recency** (pure, `receipt::recency(created_at, previous_newest) -> Recency`), from
-     the system's newest receipt **read before this report's receipt is inserted**: the
+     the system's newest **current** receipt (not retired, see *Deleting a system* below)
+     **read before this report's receipt is inserted**: the
      report is `Newest` when the system has no receipt yet, or when its `created_at` is at
      least the previous newest's (an incident report and a scheduled one in the same second
      are both `Newest`, the later arrival winning); otherwise it is `Backfill` (delivered
@@ -321,7 +325,8 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
      system back online.
   6. **Alerts**: each through the alert-record rule (`INSERT OR IGNORE`).
   7. **Prune**: delete the system's receipts older than the receipt window, **except its
-     newest**, which `mail_status` (§7) reads.
+     newest current one**, which `mail_status` (§7) reads. Retired receipts are pruned by
+     the window alone.
 
   After the commit, the round of a `Newest` report (if any) goes through
   `round_intake::store_round` with the system's mail source pace; its own duplicate rule
@@ -335,19 +340,25 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
   system by the receipts and the key holder's own rate.
 - **Mail systems are never polled.** `SystemSource` (RFC 0016) gains a `Mail` variant for
   exactly `MAIL_URL` (`"mail://"`), matched exhaustively; the poller polls only `Poll`.
-- **Deleting a system** deletes its receipts: `delete_system` gains an explicit
-  `DELETE FROM mail_receipts WHERE system_id = ?`, as it already deletes `metrics`, `alerts`
-  and `metric_retention` by hand (the hub sets no `PRAGMA foreign_keys`, so no cascade can
-  be relied on). In the same transaction it writes a **tombstone**
-  (`mail_tombstones(system_id, deleted_at)`, hub clock): a later report for that id whose
-  `created_at` is at or before `deleted_at` is refused (`Deleted`, counted) in step 2, so a
-  relay duplicate or a replay of a report ingested before the deletion can't re-register the
-  system or store its points again. A report created after the deletion (the agent is still
-  running) registers the system anew, as a push reconnect does. Tombstones are pruned past
-  the receipt window.
+- **Deleting a system retires its receipts** instead of deleting them, so they act as the
+  tombstone without comparing the agent's clock with the hub's. `delete_system` becomes
+  **one transaction** (today it runs four autocommit statements under the mutex): it deletes
+  `metrics`, `alerts`, `metric_retention` and the `systems` row by hand, as now (the hub sets
+  no `PRAGMA foreign_keys`, so no cascade can be relied on), and sets `retired = 1` on the
+  id's receipts. A relay duplicate or a replay of any report accepted before the deletion
+  still hits its `(run, seq)` in step 4 and is refused as a duplicate, which rolls back its
+  registration too, so it can neither re-register the system nor store its points again.
+  The first report not among them (the agent still running) registers the system anew, as a
+  push reconnect does, and Recency and `mail_status` read current receipts only, so the new
+  registration starts with no newest receipt. A genuine report mailed before the deletion
+  but never accepted (still in a relay queue) does re-register the system: the migration
+  order in Rollout drains the mailbox first.
 - **`enabled`** means "polled" for poll rows and nothing else today. For mail rows: the
   intake ignores it (a disabled mail system's reports are still stored), and the overdue
-  sweep skips disabled rows, so disabling a mail system silences its offline marking.
+  sweep skips disabled rows, so disabling a mail system silences its offline marking. Its
+  `Newest` reports still mark it online, so a disabled mail system's status can stay online
+  while its reports have stopped: the *system status* glossary entry says so, and a
+  disabled system's status means only "last known".
 
 ### 7. Status of a mail system
 
@@ -562,11 +573,13 @@ Adapters:
   wrong token is still answered as a wrong token; `insert_system_if_absent` table: absent →
   `Registered`, same URL → `Known`, other URL → `TransportMismatch`, a row that doesn't map
   otherwise still `Known` (RFC 0007 §4's test, amended).
-- Hub tombstone: after `delete_system`, a replayed report created before the deletion is
-  refused `Deleted`; one created after it registers the system; tombstones past the window
-  are pruned. The sweep skips a disabled mail row; the intake stores its reports.
+- Hub deletion: after `delete_system`, a replayed report accepted before the deletion is a
+  duplicate and registers nothing, whatever the agent's clock; a new report registers the
+  system with no newest receipt (`Newest`); retired receipts are pruned by the window;
+  a failure injected on `delete_system`'s third statement leaves the whole system in
+  place. `insert_system_if_absent` with a blob `url` returns `Known`, never an error. The sweep skips a disabled mail row; the intake stores its reports.
 - Hub: the poller skips `mail://` rows (`SystemSource::Mail`); the sweep marks an overdue
-  mail system offline and evicts its live metrics; `delete_system` removes the receipts.
+  mail system offline and evicts its live metrics; `delete_system` retires the receipts.
 - Hub `mail-key` subcommand: prints the derived key for an id, refuses an invalid id, never
   opens the database.
 - Agent outbox against a scripted SMTP server on an ephemeral port (a small Tokio test
@@ -586,7 +599,7 @@ new published contract, the glossary terms above, amended *system status* and *l
 § Trust boundaries (Agent → Hub (mail): relays untrusted, per-system keys, receipts), § Storage
 (`mail_receipts`), § Testing architecture (the golden sealed report), and § Open architectural
 questions (outbox lost on restart, no per-system revocation, mail registrations unbounded).
-While this RFC is a Draft, the document is unchanged: it describes the system as it is.
+Until this RFC is implemented, the document is unchanged: it describes the system as it is.
 
 ## Rollout / migration notes
 
@@ -601,13 +614,11 @@ While this RFC is a Draft, the document is unchanged: it describes the system as
       created_at    INTEGER NOT NULL,
       interval_secs INTEGER NOT NULL,
       received_at   INTEGER NOT NULL,
+      retired       INTEGER NOT NULL DEFAULT 0,  -- 1 once the system was deleted
       PRIMARY KEY (system_id, run, seq)
   );
-  CREATE INDEX IF NOT EXISTS mail_receipts_newest ON mail_receipts (system_id, created_at);
-  CREATE TABLE IF NOT EXISTS mail_tombstones (
-      system_id  TEXT    NOT NULL PRIMARY KEY,
-      deleted_at INTEGER NOT NULL
-  );
+  CREATE INDEX IF NOT EXISTS mail_receipts_newest
+      ON mail_receipts (system_id, retired, created_at);
   ```
 
   If RFC 0010 (Draft) is accepted, the table becomes a catalog table of the hub store.
@@ -617,7 +628,7 @@ While this RFC is a Draft, the document is unchanged: it describes the system as
 - **Moving an agent between push and mail** (either way), in this order: stop the old
   transport on the agent (reconfigure and restart it with neither `PUSH_TO` nor `MAIL_TO`);
   for mail, also let the mailbox drain (the hub's scans empty it) — reports still in a relay
-  queue are refused by the tombstone once the system is deleted; then delete the system on
+  queue and already accepted are refused by the retired receipts once the system is deleted; then delete the system on
   the hub; then start the agent with the new transport. Deleting first loses the race: a
   still-pushing agent re-registers `push://` within 5 s, and a late mail report would
   re-create `mail://`. Its history goes with it; until the old row is deleted, the new
@@ -694,5 +705,23 @@ and one PLAUSIBLE, all addressed:
 - (PLAUSIBLE) A push agent stuck on `transport mismatch` would log every 5 s: logged through
   `hourly_warning`. Decided: adopted.
 
-These amendments change the design again (the registration check, a new table), so one more
-`rfc-adversary` pass is due before the RFC becomes `Accepted`.
+These amendments changed the design again, so a fourth pass followed.
+
+A fourth pass (2026-10-03) confirmed the third pass's fixes against the code (the refusal
+from the registration unit with no new blocking on the runtime, the migration order, the
+`enabled` rule) and found one CONFIRMED blocker, one CONFIRMED wording gap and two PLAUSIBLE:
+
+- The tombstone compared the agent's clock (`created_at`) with the hub's (`deleted_at`): a
+  slow agent clock hid the re-registered system, and a fast one let a replay through. The
+  `mail_tombstones` table is gone: deletion retires the receipts, which refuse a replay by
+  its `(run, seq)` with no clock involved. This is the pass's own proposed fix.
+- `delete_system` isn't a transaction today: it becomes one, with a test that fails it
+  partway.
+- (PLAUSIBLE) Reading `url` with `get::<String>` would fail on a hand-edited blob: read
+  through `ValueRef`. Decided: adopted.
+- (PLAUSIBLE) A disabled mail system's status freezes at online: stated, and *system status*
+  will say a disabled system's status is only "last known". Decided: accepted as is.
+
+The fourth pass named the clock comparison as the only blocker to `Accepted`. The amendment
+adopts its proposed fix, so no fifth pass was run (CLAUDE.md: no second pass on one's own
+fixes to a finding); the RFC is `Accepted`.
