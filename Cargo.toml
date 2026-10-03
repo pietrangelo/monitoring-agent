@@ -33,6 +33,7 @@ subtle = "2"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 chacha20poly1305 = "0.10"
 base64 = "0.22"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-native-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -17,5 +17,6 @@
 //! The mail transport (RFC 0017): sealed reports mailed through the network's own SMTP relay,
 //! for agents that can reach neither the hub nor the internet.
 
+pub mod batch;
 pub mod report;
 pub mod seal;
