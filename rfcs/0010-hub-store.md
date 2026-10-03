@@ -195,9 +195,12 @@ impl HubClock {
   timestamp to `min(last, system clock)`, applies `min(x, system clock)` to every other persisted hub
   time (0011's receipts' and `MailNewest`'s `received_at`, `last_seen_active`, the flushed
   `LiveStatus` times, alert records' `stored_at` and their `alerts_listed` keys, tombstones'
-  times, each series record's last span per tier, the `alerts_seen` keys, and
+  times, each series record's last span per tier, and
   `meta/retention_clock`, and 0011's `mail_prune_floor`, set to `min(floor, rewound retention
-  clock − receipt window)`), in each tier's **current span** rewrites every series' chunks and
+  clock − receipt window)`), **rebuilds each alert record's `alerts_seen` entry** as its rewound
+  `last_seen_active` plus its class bound (the old key deleted, the new one inserted, in the same
+  transaction, so 0011 §5's key invariant holds and no orphan key can name a refreshed incident
+  as a victim), in each tier's **current span** rewrites every series' chunks and
   tail without the points and buckets after the system clock (at most three spans per active
   series), **reopens into the tail a closed bucket that straddles the system clock**, rebuilding
   its accumulators from the surviving raw points of its interval (raw retention is at least an
