@@ -269,14 +269,14 @@ fn after_newest(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::Database;
     use crate::mail_intake::report::tests::{CREATED, sample, with};
     use crate::mail_intake::seal::tests::seal_for_test;
     use std::sync::Arc;
 
-    const NOW: u64 = CREATED + 60;
+    pub(crate) const NOW: u64 = CREATED + 60;
 
     fn app() -> (Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -285,7 +285,7 @@ mod tests {
         (AppState::new(db).unwrap(), dir)
     }
 
-    fn master() -> MailMasterKey {
+    pub(crate) fn master() -> MailMasterKey {
         MailMasterKey::from_base64(&base64_of(&[1; 32])).unwrap()
     }
 
@@ -331,6 +331,11 @@ mod tests {
 
     fn mail_for(id: &str, change: impl FnOnce(&mut report::tests::TestReport)) -> Vec<u8> {
         message(&armour(&sealed_for(id, change)), "7bit")
+    }
+
+    /// A valid message for `id`: report `seq`, created at `CREATED`.
+    pub(crate) fn valid_mail(id: &str, seq: u64) -> Vec<u8> {
+        mail_for(id, |r| r.seq = seq)
     }
 
     /// RFC 0017 §6: a first report registers a mail system, stores its samples and alerts,

@@ -24,7 +24,7 @@ mod history;
 mod mail;
 mod sources;
 pub use history::{RoundStored, SnapshotStored};
-pub use mail::{MailReceipt, MailStored, MailWrite};
+pub use mail::{MailPresenceRow, MailReceipt, MailStored, MailWrite};
 pub use sources::SourceRow;
 
 /// What a registration found (RFC 0016 §2): the id was absent and is now inserted, or it was

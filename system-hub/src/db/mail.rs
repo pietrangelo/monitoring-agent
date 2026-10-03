@@ -24,7 +24,7 @@ use super::history::{store_unexpired_points, write_status};
 use super::{Database, INSERT_SYSTEM, insert_alert_record, system_params};
 use crate::mail_intake::receipt::Recency;
 use crate::models::{AlertRecord, SystemId, SystemInfo};
-use crate::registry::StatusUpdate;
+use crate::registry::{MAIL_URL, StatusUpdate};
 use crate::snapshot::{Snapshot, SnapshotTime};
 
 /// One accepted report's receipt.
@@ -71,7 +71,41 @@ pub enum MailStored<R> {
     TransportMismatch,
 }
 
+/// One mail system as the overdue sweep reads it: its newest current receipt, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MailPresenceRow {
+    pub id: String,
+    pub status: crate::models::SystemStatus,
+    pub enabled: bool,
+    /// The newest current receipt's creation time and interval.
+    pub newest: Option<(SnapshotTime, u64)>,
+}
+
 impl Database {
+    /// Every mail system's status, `enabled` and newest current receipt. Rows that don't map
+    /// are skipped.
+    pub fn mail_presence(&self) -> Result<Vec<MailPresenceRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.status, s.enabled, r.created_at, r.interval_secs
+             FROM systems s LEFT JOIN mail_receipts r ON r.rowid = (
+                 SELECT rowid FROM mail_receipts
+                 WHERE system_id = s.id AND retired = 0
+                 ORDER BY created_at DESC LIMIT 1)
+             WHERE s.url = ?1",
+        )?;
+        let rows = stmt.query_map([MAIL_URL], |row| {
+            Ok(presence_row(
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+            ))
+        })?;
+        Ok(rows.filter_map(|row| row.ok().flatten()).collect())
+    }
+
     /// Stores one report in one transaction. `decide` gets the system's newest current receipt
     /// time, read before this report's receipt is inserted; `on_newest` gets the newest
     /// sample of a `Newest` report after the commit, still under the mutex, and must not call
@@ -113,6 +147,26 @@ impl Database {
             newest,
         })
     }
+}
+
+/// One row, or `None` when its id, status or `enabled` doesn't map.
+fn presence_row(
+    id: rusqlite::Result<String>,
+    status: rusqlite::Result<String>,
+    enabled: rusqlite::Result<bool>,
+    created_at: rusqlite::Result<Option<u64>>,
+    interval_secs: rusqlite::Result<Option<u64>>,
+) -> Option<MailPresenceRow> {
+    let created_at = created_at
+        .ok()
+        .flatten()
+        .and_then(|secs| SnapshotTime::try_from(secs).ok());
+    Some(MailPresenceRow {
+        id: id.ok()?,
+        status: super::parse_status(&status.ok()?),
+        enabled: enabled.ok()?,
+        newest: created_at.zip(interval_secs.ok().flatten()),
+    })
 }
 
 fn known_url(tx: &Transaction, system: &SystemInfo) -> Result<Option<bool>, rusqlite::Error> {
