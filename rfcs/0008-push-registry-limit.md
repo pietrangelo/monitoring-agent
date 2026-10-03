@@ -209,8 +209,11 @@ adapter only feeds it.
   one tick) owns a `HashMap<SystemId, Instant>` of warned-at instants, pruned each tick to the
   tick's `polled_systems` (so it is bounded by the registry and drops deleted ids) and handed to
   each task behind an `Arc<Mutex<_>>`; it creates no `live_applications` entry.
-  `forget_shown_round` clears `shown` by id and creates nothing; a stale poll clearing a
-  re-registered id's `shown` is restored by the next poll. A `LiveStatus` write for an id with no
+  `forget_shown_round` (a poll answered 404 or `null`) is recorded as an ordinal too: it bumps
+  the admission's counter and sets `shown` to `Forgotten { at }`, so a queued older *show* can't
+  resurrect a round the agent said it no longer has; it creates nothing. The throttle is a value,
+  `RefusalThrottle::note(id, now) -> HourlyWarning` with `prune(ids)`, table-tested on its own
+  (log capture across spawned tasks is not testable), and `poll_every` owns it. A `LiveStatus` write for an id with no
   entry is dropped, since entries are created only by the registration hook, which replaces an
   entry of another generation; the delete's hook removes only the deleted generation's entries,
   and nothing removes entries by id after the transaction (0011 §3, amended). So a fill or a
@@ -391,7 +394,11 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - **Registration-time rows that need seams** are under *Registration* below.
 - **Call-site follow-through** (released with authority author, quoted in the change summary):
   the `presence.rs`, `push/sweep.rs` and `push/ingest.rs` tests in `HEAD` whose calls gain the
-  generation argument keep every expectation.
+  generation argument keep every expectation;
+  `routes/api.rs::deleting_a_system_forgets_its_live_metrics_and_applications`, whose fixture
+  plants a `SystemApplications::default()` with no generation; and
+  `round_intake.rs::a_push_connections_pace_and_the_systems_poll_pace_stay_apart`, which reads
+  `poll_pace` from `live_applications` and now reads it from the admission.
 - **Registration** (a temporary store, with a **writer gate**: a test seam in `StoreOptions`
   that holds the writer before it runs the next submitted transaction until the test releases
   it, so two transactions are ordered deterministically):
@@ -428,8 +435,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     (between *record* and *show*): the second is `Duplicate` or `TooSoon`, never stored twice;
     `overlapping_polls_of_one_system_share_one_pace` stays deterministic (its empty rounds are
     `Stored`, as today); two rounds whose *show* steps run in reverse order through the seam
-    leave `shown` on the newer; an empty round is `Stored` and replaces `shown`; a refused
-    round on two consecutive ticks logs one `warn` and one `debug`;
+    leave `shown` on the newer; an empty round is `Stored` and replaces `shown`; a forget
+    followed by a queued older *show* leaves `shown` forgotten; `RefusalThrottle` as a table
+    (first note warns, a second within the hour is quiet, at the hour warns, `prune` drops ids);
   - a delete through a seam **inside *show***, between the generation check and the insert: the
     delete's hook waits for the Registry guard, and no orphan entry exists afterwards;
   - a delete between a round's `append` and *show*: no `live_applications` entry; a later
@@ -660,6 +668,14 @@ Came closest and survived: the at-once `AlreadyRegistered` (only the id's own un
 | `transact` used `A` undeclared | CONFIRMED (low) | `transact<T: Send, A: Send>` (0010 §9) |
 | "the paces" could mean the push pace in the admission | PLAUSIBLE (low) | the poll pace only; the push pace stays per connection (§3) |
 | inventory: line 208, `delete_system`'s eviction, 0009 §8, `forget_shown_round` | PLAUSIBLE (low) | reworded and listed (§3, Impact) |
+
+`rfc-adversary`, verification of the seventh pass (commit d8eb544), with 0010's. The 0008 part:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| a forget by id had no ordinal, so a queued older *show* could resurrect a round | PLAUSIBLE (low) | a forget bumps the ordinal and sets `Forgotten { at }` (§3) |
+| the throttle's row asserted log lines across spawned tasks | PLAUSIBLE (low) | `RefusalThrottle` as a value, table-tested (§3, Testing) |
+| two fixture tests in `HEAD` change with the generation and the pace's move | noted | listed as author releases (Testing) |
 
 **Still open**: nothing CONFIRMED.
 

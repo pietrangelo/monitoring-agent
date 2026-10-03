@@ -356,8 +356,12 @@ of the intake as `last_seen_active`. Where a rule below says "poll", it means ei
     **class bound**, which is **2 hours or twice its system's poll interval, whichever is
     longer**, and for a mail system the **receipt window** (7 days), since a relay outage or a
     lost outbox can delay a still-firing incident's refresh by hours, and 0017 treats that as
-    normal. The entry is re-keyed when `last_seen_active` is refreshed and when a `PUT` changes
-    the system's interval, in the same transaction. The first entry is the only candidate, so a
+    normal. The entry is re-keyed when `last_seen_active` is refreshed, when a `PUT` changes
+    the system's interval, and by `HUB_CLOCK_REWIND` (0010 §2), in the same transaction, so the
+    key always equals the record's `last_seen_active + bound`. **`evictable_at` is compared with
+    the retention clock** (`meta/retention_clock`, read inside `f`), as `events` retention is,
+    so a forward clock fault can't make every unrefreshed record a victim; records refreshed at a
+    faulty hub time stay unevictable until the rewind repairs their key. The first entry is the only candidate, so a
     victim is found or refused in one read, and old mail records can't hide an evictable polled
     record behind them. A still-firing incident is refreshed at least once per coalescing
     window (1 h) of polls, so its `last_seen_active` is never older than the window plus one
@@ -391,8 +395,8 @@ transaction per report becomes one `Batched` transaction per scan, holding each 
 in turn (0010 §10's `store_mail_scan`). The pure decisions stay 0017's (`receipt::fresh` on the
 system clock, `receipt::recency`, `mail_status`, which 0010 §10 moves onto `received_at`). The
 amendment adds two pure rules of its own, in `mail_intake/receipt.rs` and table-tested:
-`newest_of_scan(reports) -> per-system choice` (by `(created_at, seq)` within a run, else arrival
-order; 0010 §2) and `stale_before(created_at, prune_floor) -> bool`.
+`newest_of_scan(reports) -> per-system choice` (by `created_at`; ties by `seq` within a run, by
+arrival order across runs; 0010 §2) and `stale_before(created_at, prune_floor) -> bool`.
 
 ```rust
 /// Persistence struct: a leading version byte, then postcard.
@@ -421,7 +425,10 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
      that lowers it is `HUB_CLOCK_REWIND` (0010 §2), to `min(floor, rewound retention clock −
      window)`: otherwise a floor raised during a long forward fault would refuse every current
      report as stale until real time passed it. The cost, a replay of a receipt pruned during the
-     fault and still inside the window, is taken once; `/api/storage` shows the floor;
+     fault and still inside the window, is taken once; and, for a mail system deleted during the fault whose retired
+     receipt was pruned by the fault-driven clock, such a replay can **re-register it** (as a
+     report never accepted does, 0017 §6) until its agent is stopped; `/api/storage` shows the
+     floor;
   then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
   insert the receipt; the alert records (§5). **Then, at the end of `f`, once per system**, for
   the system's choice by `newest_of_scan` among its accepted `Newest` reports (known only once
@@ -438,10 +445,12 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   commit holding the scan, accepted or refused, as 0017 deletes every handled message; a
   fail-stop before it leaves them for the next scan.
 - **Pruning** runs from 0010's retention pass through its `Store::on_retention_pass` hook
-  (0010 §9), after the pass has committed its retention clock, which loops the hook while it
-  answers `More` under the pass's usual bound (so a prune never exceeds one transaction's
-  50,000 entries, and at 10,000 mail systems on the default interval, 20,000 new rows per pass,
-  it keeps up with margin): receipts whose `created_at` is older than the
+  (0010 §9), after the pass has committed its retention clock and **after its own steps**
+  (tier deletions, purge, GC, the storage cap), looping the hook while it answers `More`, which a
+  transaction may answer only after deleting at least one entry, for **at most 10 transactions
+  per pass** (the rest wait for the next pass), each under the pass's 50,000-entry bound. At
+  10,000 mail systems on the default interval, 20,000 new receipt rows per pass are 40,000
+  entries with their `_by_time` keys, under one transaction's bound: receipts whose `created_at` is older than the
   receipt window (7 days) on the **retention clock** are removed, with their
   `mail_receipts_by_time` entries, in its bounded transactions, **except each system's newest
   current receipt** (the one `mail_newest` names), as 0017 keeps it, and raises
@@ -628,7 +637,9 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   - `newest_of_scan` and `stale_before` as tables (ties on `created_at` across runs and within
     one; the floor's edge); the global cap full of 1,001 mail records seen a day ago and one
     polled record seen 3 hours ago: the polled record is the victim, in one read; a refreshed
-    record and a changed interval move the entry's key; after a forward fault, a prune, the
+    record and a changed interval move the entry's key; after a rewind every key equals its
+    record's `last_seen_active + bound`, and a search never returns a record refreshed since; a
+    +1 year system clock step makes no cap victim; after a forward fault, a prune, the
     correction and a rewind, a current report is accepted;
   - the prune keeps each system's newest current receipt
     (`db/mail.rs::the_prune_keeps_the_newest_current_receipt`, ported);
@@ -657,8 +668,10 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
       `overdue.rs::a_report_stored_since_the_read_isnt_marked_overdue` (ported for its guarantee,
       but its `last_seen == CREATED + 60` assertion becomes `received_at`, so it is released
       too);
-    - *no SQL*: `overdue.rs::a_mail_row_with_no_receipt_is_overdue_once` (its row can't be
-      re-created by hand; its `last_error` assertion is kept by the row above);
+    - *no SQL, retired by generation*: `overdue.rs::a_mail_row_with_no_receipt_is_overdue_once`
+      (its row can't be re-created by hand; its `last_error` assertion is kept by the row above)
+      and `db/mail.rs::deleting_a_system_retires_its_receipts` (its `retired` column assertion
+      becomes "the entry is present with a generation other than the system's"; the rest holds);
     - *fail-stop instead of rollback*: `db/mail.rs::a_failure_partway_leaves_nothing_and_a_retry_stores_once`
       and `db/mail.rs::a_delete_that_fails_partway_deletes_nothing` (a SQLite trigger with no
       redb equivalent).
@@ -849,7 +862,23 @@ covers both.
 | releases naming categories; a "ported" test whose assertion changes; `a_backlog_is_stored_whole` | CONFIRMED (low) | each named `file::test` (Testing) |
 | `on_retention_pass` couldn't signal more work; prune throughput | PLAUSIBLE | `More`/`Done` looped under the bound; the throughput stated (§7) |
 
-**Still open**: whether one timer per polled system scales to 10,000 polled systems (it is one
+`rfc-adversary`, verification of that round. Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the rewind clamped the `alerts_seen` keys as plain hub times, breaking the new `evictable_at` invariant and leaving an orphan key that evicted a refreshed incident | CONFIRMED | the rewind rebuilds each entry as rewound `last_seen_active` + bound; a row (0010 §2; §5) |
+| `deleting_a_system_retires_its_receipts` asserts the `retired` column | CONFIRMED (low) | named, with its replacement assertion (Testing) |
+| the clock `evictable_at` is compared with | PLAUSIBLE | the retention clock, as `events`; a +1 year row (§5) |
+| after a long fault the lowered floor can let a replay re-register a deleted mail system | PLAUSIBLE (low) | stated in the cost sentence (§7) |
+| the prune hook's throughput arithmetic and an unbounded loop before the pass's own steps | PLAUSIBLE (low) | after the pass's steps, at most 10 transactions, `More` only after a deletion; entries counted (§7) |
+| `newest_of_scan`'s order wording | PLAUSIBLE (low) | `created_at` first; ties by `seq` in a run, by arrival across runs (§7; 0010 §2) |
+
+Came closest and survived: a backlog drained days late refreshing `last_seen_active` of
+incidents that stopped, which only delays their eviction.
+
+**Still open**: nothing CONFIRMED.
+
+**Still open** (performance): whether one timer per polled system scales to 10,000 polled systems (it is one
 tokio timer each, which is cheap, but the performance test checks it).
 
 **Earlier passes, as written against the custom catalog.** Section references in these tables
