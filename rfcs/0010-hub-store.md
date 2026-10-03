@@ -8,7 +8,7 @@
 - Depends on: RFC 0009 (Accepted, ships first on SQLite; this RFC takes over its `app:*`
   series, its interim prune and its guarded store)
 - **Carries RFC 0017 (Implemented): mail systems.** A mail report holds up to 60 snapshots at
-  agent-clock times and may arrive late. **This store keeps one point per series per report: the
+  agent-clock times and may arrive late. **This store keeps at most one point per series per system per scan: the
   newest snapshot's, stamped at hub time when the hub accepts it** (owner's decision,
   2026-10-03, §2 *Mail points*), so mail fits the hub-time, append-only series every other
   source uses. A report's points commit with its receipt (§6, §9), and mail `LiveStatus`
@@ -195,9 +195,10 @@ impl HubClock {
   timestamp to the system clock, applies `min(x, system clock)` to every other persisted hub
   time (0011's receipts' and `MailNewest`'s `received_at`, `last_seen_active`, the flushed
   `LiveStatus` times, alert records' `stored_at` and their `alerts_listed` keys, tombstones'
-  times, and each series record's last span per tier), discards tail accumulators and open
-  rollup chunks whose bucket starts after the system clock, and logs the counts at `warn`. Misdated points inside the current span stay,
-  and age out with retention. A value that doesn't match is logged at `error` and ignored.
+  times, each series record's last span per tier, the `alerts_seen` keys, and
+  `meta/retention_clock`), and in each tier's **current span** rewrites every series' chunks and
+  tail without the points and buckets after the system clock (at most three spans per active
+  series), so no misdated bucket stays behind an older one; it logs the counts at `warn`.  A value that doesn't match is logged at `error` and ignored.
 
 **Mail points** (RFC 0017; owner's decision, 2026-10-03). A mail report carries up to 60
 samples taken at agent-clock times over one mail interval, and may sit in a relay for hours.
@@ -206,11 +207,15 @@ found samples lost or reordered at report boundaries, bucket closures and clock 
 So a mail report is ingested like a push snapshot:
 
 - **Only one report per system per scan stores points**: the system's newest `Newest` report of
-  the scan, by `(created_at, seq)`, and only its **newest snapshot's**, at **hub now**
+  the scan, chosen by one pure function, `receipt::newest_of_scan` (by `(created_at, seq)` within
+  a run, else arrival order), which also picks the report for live metrics, the info fill, the
+  round and `mail_newest` (0011 §7), and **only if it is current**: `created_at` no older than one
+  mail interval plus 15 minutes on the system clock. A backlog drained after an outage therefore
+  stores no point until its current reports arrive. It stores only its **newest snapshot's**, at **hub now**
   (`append`'s ordinary stamping), with the same snapshot rule as a push frame. Its other samples
   are not stored; its alert records all are (0011 §5), and so is its round (§10). A mail system's
-  history therefore has one point per series per report: one every 5 minutes at 0017's default
-  interval. *Behaviour change: RFC 0017 stores every sample at its own `collected_at`.*
+  history therefore has at most one point per series per report it receives: one every 5 minutes at 0017's
+  default interval. *Behaviour change: RFC 0017 stores every sample at its own `collected_at`.*
 - **A `Backfill` report stores no point** (decided by 0017's `Recency` read before any write):
   its newest snapshot is older than what is already shown, and stamping it at hub now would
   present old data as current. Its alert records are stored.
@@ -477,7 +482,7 @@ send it requests over a bounded channel and wait for its answer:
   `Answer::AtOnce` (a refusal that a retry corrects, RFC 0008 §3). A transaction that writes is
   always answered after its commit. The mail intake uses it, so a report's receipt and its points commit together or not
   at all (RFC 0017 §6), as one SQLite transaction does today. Staged points refused for any
-  reason (`Degraded` included) don't abort the transaction: the report is accepted, its
+  reason don't abort the transaction: the report is accepted, its
   refusals counted, and the message deleted, as RFC 0017 deletes every handled message.
   **An `f` may abort only before its first write.** Every refusal a transaction can make
   (a wrong source, a duplicate or stale receipt, a backfill report's points, a push registry
@@ -540,31 +545,20 @@ one atomic redb transaction.
   failed write or `sync_data` and refuses every later operation on that `Database`
   (`StorageError::PreviousIo`, `cached_file.rs`), so the process can't keep serving from it.
   The interval's points are lost, as a crash would lose them; nothing is answered as committed.
-- **Degraded mode is an open-time state.** At open, before the first ingest commit, the writer
-  checks free space against the **floor** (the larger of 1 GiB and 2% of the volume): both
-  `statvfs`'s `f_bavail` (the space an unprivileged process may use) and, because a user or group
-  quota (`EDQUOT`) is invisible to `statvfs`, by `fallocate`-ing a floor-sized scratch file in
-  `HUB_DATA_DIR` and removing it. Either failing opens the store degraded.
-  Below it, the store opens **degraded**: appends are refused (`Rejected::Degraded`) and counted,
-  queries and catalog reads work, the mail intake doesn't scan (the mailbox is the buffer: a scan
-  would store receipts whose points are refused) and the overdue sweep is held (§10). The writer
-  deletes the oldest raw span, then the oldest minute span, in small transactions, **whatever
-  the cap says**, logging each at `warn`; deletes reuse freed pages, so they need little free
-  disk. Once the floor is met it leaves degraded mode and logs that at `warn`. If redb can't even
-  open (its repair needs space), the hub exits naming the data volume and the space needed,
-  rather than looping.
-- **While running, the floor is kept before the disk fills**: every retention pass, and every
-  60 s, compares free space with the floor and, below it, deletes as above **before** any commit
-  can hit `ENOSPC`.
-- **The Maildir and the data on one filesystem** (RFC 0017's mailbox, which anyone can mail):
-  at startup the hub compares the `st_dev` of `HUB_MAIL_DIR` and `HUB_DATA_DIR`, and refuses to
-  start when they match unless `HUB_MAIL_SHARED_VOLUME=1` acknowledges it, so a mail flood can't
-  silently drive the floor deletes through the hub's history. The flag is shown in
-  `/api/storage`. While degraded, the intake still deletes messages that fail to open (they store
-  nothing) and keeps only authenticated ones for later, so unauthenticated mail can't hold the
-  store degraded.
-- **A fail-stop caused by `ENOSPC`, `EDQUOT` or `EIO`** never counts against a message (§10's
-  quarantine): the cause is the disk, not the message.
+- **There is no degraded mode** (owner's decision, 2026-10-03). The store never deletes history
+  to make room beyond what the storage cap already deletes. At open, if free space (`statvfs`'s
+  `f_bavail`) is below the **floor** (the larger of 1 GiB and 2% of the volume), the hub
+  **refuses to start**, logging the data volume, the free space and the floor, and exits with a
+  distinct status; Compose's restart then retries until the operator frees space or raises the
+  floor's denominator. While running, the storage cap (§5) is the only automatic deletion, and
+  a commit that hits `ENOSPC` or `EDQUOT` fails stop as above.
+- **Limits stated, not engineered around** (README): a user or group quota (`EDQUOT`) is
+  invisible to `statvfs`, so a hub under quota fails stop at its first commit and restarts until
+  the quota is raised; RFC 0017's Maildir, which anyone can mail, should sit on a volume other
+  than `HUB_DATA_DIR`, or a mail flood can fill the data volume; a message whose content makes
+  the store fail stop is retried on every restart (the intake logs the names of the scan in
+  flight at `error` when its transaction answers `StoreError::Failed`, so the operator can move
+  it aside).
 
 **Shutdown.** `Store::close(&self)` is idempotent: it flushes every tail and commits, and
 afterwards calls return `StoreError::Closed`. On SIGTERM or SIGINT the hub's `main`:
@@ -629,7 +623,6 @@ variable, never the value:
 | `HUB_STORE_CACHE` | redb's page cache, bytes with suffixes; at least 16 MiB | `256M` |
 | `HUB_STORE_COMPACT` | `1`: compact at start if over 1 GiB and 25% reclaimable (§5) | unset |
 | `HUB_CLOCK_REWIND` | the `last_issued` value `/api/storage` shows: rewinds a far-future clock at start (§2); one-shot | unset |
-| `HUB_MAIL_SHARED_VOLUME` | `1`: accept `HUB_MAIL_DIR` on the same filesystem as `HUB_DATA_DIR` (§6) | unset (refused) |
 
 The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's, `HUB_LISTEN`
 0015's, and `HUB_STATIC_DIR` the prerequisite's.
@@ -673,12 +666,16 @@ impl Store {
     /// Runs `f` inside the writer's transaction. A transaction that wrote is answered after the
     /// commit that holds it and the commit hook (`Durable` forces that commit at once); a
     /// write-free one as its `Answer` says (§6). `Abort` is answered at once.
-    pub fn transact<T: Send>(&self, class: Commit, f: impl FnOnce(&mut CatalogTxn) -> Result<(T, Answer), Abort> + Send) -> Result<T, StoreError>;
+    pub fn transact<T: Send>(&self, class: Commit, f: impl FnOnce(&mut CatalogTxn) -> Result<(T, Answer), Abort> + Send) -> Result<T, TransactError>;
     /// A redb read transaction over the catalog tables (MVCC: never waits for the writer).
     pub fn read_catalog<T>(&self, f: impl FnOnce(&CatalogRead) -> T) -> Result<T, StoreError>;
     /// Called on the writer thread after each commit, in commit order, with that commit's
     /// catalog changes (0011 maintains its in-memory Registry with it).
     pub fn on_commit(&self, hook: Box<dyn Fn(&[CatalogChange]) + Send + Sync>);
+    /// Called by each retention pass on the writer thread, **after** the pass has committed its
+    /// retention clock (§5 step 1), to run the hub's own pruning (0011's receipt prune) in
+    /// bounded transactions of its own.
+    pub fn on_retention_pass(&self, hook: Box<dyn Fn(&mut RetentionPassTxn) + Send + Sync>);
 
     pub fn stats(&self) -> StoreStats;
     pub fn close(&self) -> Result<(), StoreError>;
@@ -710,8 +707,11 @@ pub enum Order { Earliest, Latest }          // which end `limit` keeps; results
 pub struct Limit(u16);                       // 0 ..= 10,000; 0 returns nothing, as today
 
 pub struct AppendReport { at: u64, accepted: u16, rejected: Vec<(MetricName, Rejected)> }
-pub enum Rejected { NotAfterLast, SeriesCapReached, KindMismatch, OutOfDomain, InvalidName, SystemGone, Degraded }
+pub enum Rejected { NotAfterLast, SeriesCapReached, KindMismatch, OutOfDomain, InvalidName, SystemGone }
 pub enum StoreError { Closed, Failed, Io(IoKind) }
+/// What `transact` answers when it doesn't return `T`: `f`'s abort (answered at once, nothing
+/// written), or the store's error.
+pub enum TransactError { Aborted(Abort), Store(StoreError) }
 ```
 
 - **`SystemGone`**: a `tombstone` committed in a transaction takes effect on the writer thread
@@ -720,28 +720,35 @@ pub enum StoreError { Closed, Failed, Io(IoKind) }
 - **Queries** read committed chunks in a redb read transaction, and copy the series' unsealed
   points from the head under that series' shard lock (16 shards, taken only by the writer and
   by queries, never nested), then merge. A query never waits for a commit.
-- **Lock order, in full** (with 0011 and 0010 §10): no hub lock (the Registry, `live_status`,
-  `live_applications`, an admission lock) is ever held across a store call; the commit hook
-  takes the Registry's write lock on the writer thread, inside no store lock; a head shard lock
-  is a leaf. RFC 0009's admission lock is taken around an `append` call, and no store lock is
-  held while taking it. RFC 0016's presence lock comes first: it may be held while taking
-  `live_status` (a connection's end writes `Offline` under it), and is never taken while
-  holding any of them. **It is never held across a store call** (RFC 0008 §3): a push
-  registration commits first and takes the presence lock only to accept. It comes before the
-  Registry's read lock (claims, ends and the sweep read the current generation under it); the
-  commit hook takes the Registry's write lock and never the presence lock.
-  **The total order**: presence, then the Registry, then `live_status` and `live_metrics` (taken
-  one at a time, never nested in each other), then an admission lock, then a head shard. Every
-  path that needs two takes them in that order; the commit hook updates the Registry under its
-  write lock, **releases it**, and only then takes `live_status` or `live_metrics` for mail
-  status and eviction (comparing generations), so it never holds two hub locks at once.
+- **Lock order, in full** (with 0008 §3, 0011 and §10). The hub's locks, in their one order:
+  **presence → Registry → `live_status` | `live_metrics` → admission → `live_applications` →
+  head shard**. `live_status` and `live_metrics` are never nested in each other. Rules:
+  - **No hub lock is held across a store call, with one exception**: RFC 0009's admission lock
+    is held across `append` (lock the admission, `decide`, `append`, `on_stored`); nothing is
+    taken after it but `live_applications`, and the writer never takes it, so a caller waiting
+    on the writer under it can't close a cycle.
+  - **The Registry guard is never held while taking presence or while re-taking the Registry.**
+    A path that enumerates systems (the push sweep, the overdue sweep, 0012's offline-candidate
+    list, the SSE summary) copies `(id, generation, registered, name, enabled)` and drops the
+    guard before taking anything else.
+  - **The commit hook** takes the Registry's write lock, updates it, **releases it**, and only
+    then takes `live_status`, `live_metrics` or `live_applications` one at a time (mail status,
+    evictions after a delete, comparing generations). It never takes presence or an admission
+    lock, and never holds two hub locks at once.
+  - **Every path that holds two**, with its order: a claim or an end (presence → Registry read,
+    the generation check; then, after dropping the Registry, `live_status` or `live_metrics`
+    with a generation compare); a fill, `keep_live_metrics` (Registry read → `live_metrics`,
+    the only nested pair); `append_round`'s `on_stored` (admission → `live_applications`, its
+    generation compared after the admission is released, RFC 0008 §3). No other path nests.
+  - A head shard lock is a leaf, taken only by the writer and by queries.
+  No test can show a lock order; review must.
 
 **`/api/storage`** is owned by this RFC. It answers `StoreStats` as JSON: allocated bytes per
 tier and in total, the file size and reclaimable bytes, the cap and its source, the volume size
-and free space, the degraded-mode floor; active and interned series and the caps; points per
+and free space, the open-time floor; active and interned series and the caps; points per
 second, the commit interval, the last commit's duration; hub time, system time, `last_issued`,
 the retention clock and how far it trails hub time, any clock hold; counters per `Rejected`
-reason (`NotAfterLast` split by cause), degraded mode and cap deletions. RFC 0012 adds its
+reason (`NotAfterLast` split by cause) and cap deletions. RFC 0012 adds its
 refusal counters, and RFC 0008 its registry counters. It exposes no key, token or path beyond
 tier names, and is an open read like the rest of the hub API.
 
@@ -766,16 +773,9 @@ tier names, and is an open read like the rest of the hub API.
   commit are duplicates. One commit per scan instead of one per message keeps a busy mailbox
   from multiplying commits. The round of a system's newest `Newest` report of the scan goes
   through `append_round` after the commit, as 0017 does.
-- **A message that fails the store every time can't loop the hub.** Before a scan's transaction,
-  the intake writes the scan's message names to `meta/mail/in_flight` in a transaction of its
-  own, **awaited before the scan's transaction is submitted** (so the list is durable first); the
-  scan's commit clears it. At open, messages still listed there are taken **one per
-  transaction**, each preceded by an awaited write of `in_flight = { name, solo: true }`, whose
-  own commit clears only that entry. A `solo` entry found at open means that message alone
-  failed the store, unless the fail-stop's recorded cause was `ENOSPC`, `EDQUOT` or `EIO`; it is
-  moved to the Maildir's `quarantine/` folder and counted. Solo attempts wait while the store is
-  degraded. So one bad message can't keep a restarting hub down, and a full disk quarantines
-  nothing.
+- **The scan's messages are named in the log on a store failure**: when the scan's transaction
+  answers `StoreError::Failed`, the intake logs their Maildir names at `error` before the hub
+  exits, so a message that fails the store on every restart can be found and moved aside (§6).
 - **Freshness uses the system clock**, as 0017's `receipt::fresh` does today, never hub time: a
   hub time held in the future (§2) would otherwise make every report look older than the
   receipt window and refuse them all.
@@ -799,6 +799,9 @@ tier names, and is an open read like the rest of the hub API.
   ```
 
   - `Liveness` is one enum, so "online with an offline time" can't be represented.
+  - **Entries are created only by the registration hook** and removed by the delete's hook; a
+    status write for an id with no entry, or for another generation, is dropped, so a late
+    frame or poll can't recreate a deleted system's status (RFC 0008 §3).
   - Which push connection is current is **not** flushed: it means nothing across processes.
     It stays in RFC 0016's in-memory `PushPresence`, with each entry's liveness (its lease).
   - **Set only by contact and by transitions.** A successful frame or poll sets `Online` and
@@ -813,19 +816,20 @@ tier names, and is an open read like the rest of the hub API.
     **hub time at which the report was accepted** (`received_at`), never its agent-stamped
     `created_at`. A `Backfill` report touches neither.
   - **The overdue sweep** (every 60 s on hub time, only while the mail intake is on and the store
-    isn't degraded, skipping disabled systems) reads each mail system's `MailNewest` (0011 §7) and
+    skipping disabled systems) reads each mail system's `MailNewest` (0011 §7) and
     decides with `mail_status`, which measures from **`received_at`** (owner's decision,
     2026-10-03, a change to 0017 §7): *overdue* means "no report has arrived for 3 intervals plus
     15 minutes". **One write-free transaction per sweep** carries every candidate it read (overdue
     systems not already `Offline`, and on-time `Unknown` ones) with the receipt each read; `f`
     re-reads each `MailNewest` and, for those still naming that receipt, `notify`s an overdue
     mark or an on-time promotion. The hook applies them in commit order with the scans: `Offline`
-    with `since = min(now, received_at + 3 × interval + 15 min)`, **and evicts the system's live
+    with `since = min(now, received_at + 3 × interval + 15 min)` and `last_error = "mail
+    overdue"` (as 0017 does; the next `Online` clears it), **and evicts the system's live
     metrics** (as 0017 does), comparing the entry's generation, after releasing the Registry
     lock (§9); a promotion sets `Online` without touching `last_contact`. A report committed in
     between wins, as 0017's single-statement update does today. The transaction is
     `AfterCommit`, answered at once when nothing uncommitted lies beneath it.
-  - **After open, and after leaving degraded mode, the sweep waits for the mailbox's backlog**:
+  - **After open, the sweep waits for the mailbox's backlog**:
     it runs once a scan, whose listing succeeded, finds no file in `new/` delivered before that
     moment that it could read (Maildir names start with their delivery time; an empty `new/`
     counts; an unparseable name counts as delivered before; a file the scan can't read is
@@ -878,7 +882,7 @@ tier names, and is an open read like the rest of the hub API.
 
 - **New context: Fleet Storage** (`hub-store`): series and the series table, value kinds, tiers,
   chunks and the codec, the writer thread and group commit, the points log and tails, hub time
-  and the retention clock, retention enforcement and overrides, the storage cap, degraded mode,
+  and the retention clock, retention enforcement and overrides, the storage cap, the open-time floor,
   the data-directory checks. It knows no hub term but "system key" and "generation", and
   stores 0011's catalog values as opaque bytes.
 - **Fleet History**: `storage/` replaces `db.rs`; `RetentionPolicy` parsed from `HUB_RETENTION`;
@@ -894,12 +898,12 @@ tier names, and is an open read like the rest of the hub API.
     kind, value scale, domain range, tier (raw, minute, hour), rollup, span, chunk, tail, points
     log, group commit, commit interval, writer thread, hub time, clock hold, clock rewind,
     retention clock, retention policy, override, tier setting (global or fixed), pending
-    shortening, storage cap, degraded mode and its floor, compaction, series cap, container
-    mount, last contact (hub time, for every source), open-time degraded mode;
+    shortening, storage cap, the open-time floor, compaction, series cap, container
+    mount, last contact (hub time, for every source);
   - changed: **retention** (per tier, globally and per system; no longer per metric), **metric
     point** (stamped in hub time), **system status** (the typed `LiveStatus`), **last seen**
     (the last successful contact; for a mail system, when the hub accepted its newest report),
-    **mail system** (one point per series per report, the newest sample's, at hub time; overdue
+    **mail system** (at most one point per series per system per scan, the newest current report's newest sample, at hub time; overdue
     when no report has *arrived* for 3 intervals plus 15 minutes; its offline age counts from
     that moment),
     **snapshot** (container mounts are not metric points), **backfill report** (RFC 0017: its
@@ -964,7 +968,7 @@ tier names, and is an open read like the rest of the hub API.
 - **A04 Insecure Design:**
   - retention acts on a clock that can run at most twice as fast as real time and never past
     the system clock, so no clock fault can wipe history;
-  - the storage cap on by default, and a free-space floor that deletes before the disk fills;
+  - the storage cap on by default; a hub that won't start below the free-space floor;
   - domain and name refusal at the edge and in the store, `i128` sums;
   - atomic transactions with a stated content, and fail-stop on a writer panic or I/O error;
   - a per-system interned-series cap, so one system can't starve the rest.
@@ -980,7 +984,7 @@ tier names, and is an open read like the rest of the hub API.
   **2-phase commit** because agent-controlled data reaches the file (§1's cited attack on
   1-phase commits); our codec's format byte refuses an unknown version; decoders are total.
 - **A09 Logging & Monitoring Failures:** clock holds, rewinds, retention-clock lag, cap and
-  degraded deletions, series-cap refusals, fail-stops and compaction hints are logged and
+  series-cap refusals, fail-stops and compaction hints are logged and
   counted in `/api/storage`. No log line carries a token or a value.
 - **A10 SSRF:** N/A. The store makes no network requests.
 
@@ -992,7 +996,8 @@ tier names, and is an open read like the rest of the hub API.
 - **API2:** N/A (0012).
 - **API3:** `StoreStats` exposes counts, sizes and clock state only.
 - **API4:** active and interned series caps (per system and total); `limit` clamped to 10,000;
-  `auto` resolution; the bounded writer channel; the storage cap and floor.
+  `auto` resolution; the bounded writer channel; the storage cap and floor. A mail flood on a
+  shared volume is a stated limit (§6).
 - **API5–API7:** N/A here.
 - **API8:** see A05.
 - **API9:** `/metrics` gains `resolution` and `until`; `/history` keeps `since`; the clamp and
@@ -1065,8 +1070,10 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   snapshot's, at hub now, whatever its `collected_at` and the agent's clock; a `Backfill` report
   stores no point and all its alert records; a mail series behaves as any series under the
   sweep, caps and retention; **three `Newest` reports of one system in one scan store one point
-  per series, with the newest report's values** (and a tie on `created_at` broken by `seq`);
-  `NotAfterLast` never counts a mail point.
+  per series, with the newest report's values** (and a tie on `created_at` broken by `seq`), and
+  the same report feeds live metrics, info, round and `mail_newest`; **a backlog spanning
+  several scans stores no point until a current report arrives**; with an unheld clock, normal
+  scans never count `NotAfterLast` for a mail point (a clock hold may).
 - **Transactions and aborts**: an `f` that refuses by reads (a duplicate receipt, a transport
   mismatch) writes and stages nothing; **an `f` that stages points (including a new series) and
   then returns `Abort` fails the store stop** (a child-process test: at reopen there is no series
@@ -1076,16 +1083,11 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
 - **Overdue marks**: an overdue mark evicts the live metrics; a report committed after the
   sweep's read keeps the system online and its live metrics; one sweep over 2,000 candidates is
   one transaction; a stuck file in `new/` doesn't hold the gate, a failed listing does, and the
-  time bound opens it.
-- **Shared volume and quota**: `HUB_MAIL_DIR` on the data filesystem refuses startup without
-  `HUB_MAIL_SHARED_VOLUME=1`; a quota hit with free space on the volume opens degraded (the
-  scratch `fallocate`), with no restart loop; a degraded store deletes unauthenticated messages
-  and keeps authenticated ones; a fail-stop from `ENOSPC` with a scan in flight quarantines
-  nothing.
+  time bound opens it; an overdue mark sets `last_error = "mail overdue"` and the next report
+  clears it.
 - **Disk full**: a fault-injecting backend failing a commit with `ENOSPC` fails the store stop,
-  and the next open below the floor is degraded: appends refused, no mail scan, no overdue
-  sweep, deletes until the floor is met, then normal; the running floor check deletes before a
-  commit can fail; an open that can't repair exits naming the volume.
+  with the scan's message names logged at `error`; an open below the floor exits with its
+  distinct status, naming the volume, and creates nothing; at the floor it opens.
 - **Mail status**: the overdue sweep on `received_at` (on time, overdue, exactly at the bound);
   an agent clock 2 days slow stays `Online`; **a report committed between the sweep's read and
   its mark keeps the system `Online`** (a two-thread test through the writer gate); after a
@@ -1097,9 +1099,8 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   series timestamp (a child killed 1 minute after a frame whose flushed status was an hour old:
   `since` is 1 minute before the kill), and `received_at` for mail; freshness on the system
   clock while hub time is held a year ahead (reports accepted, none marked overdue);
-  `HUB_CLOCK_REWIND` brings every persisted hub time and tail bucket back to the system clock;
-  a message that fails the store twice is quarantined and the hub keeps running (a
-  child-process test).
+  `HUB_CLOCK_REWIND` brings every persisted hub time and tail bucket back to the system clock,
+  and a +2-day fault leaves no bucket after the system clock in any tier's current span.
 - **Storage cap**: the `80%` default from an injected volume size, re-read when it grows;
   deletion order; the cap unmet; `none`.
 - **Compaction**: `HUB_STORE_COMPACT=1` compacts only above the threshold; the reclaimable
@@ -1131,16 +1132,16 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
 - **Components**: the hub workspace and `hub-store` on redb; `storage/` replacing `db.rs` (with
   0011); `main`'s startup order (configuration, directory checks, store open, key, serve).
 - **Data flow**: the `db.rs (SQLite)` box becomes `storage/ → hub-store (writer thread) → redb`;
-  the mail intake's arrow goes through `store_mail_scan`, one point per series per report.
+  the mail intake's arrow goes through `store_mail_scan`, at most one point per series per system per scan.
 - **Open questions** (mail): "a report delivered late adds its history" becomes "the hub keeps
   each report's newest sample only; a backfill report adds alert records only"; overdue is
   measured on hub time (`received_at`); a hub time held ahead hides overdue mail systems until a
   rewind.
 - `README.md`'s mail section: the same sentences (its "A report delivered late adds its
-  history", and "every message in `new/` is deleted once handled", which gains the
-  `quarantine/` folder and its counter, and "not while the store is degraded"); that
+  history"); that
   `MAIL_SAMPLE_INTERVAL` no longer shapes the hub's history; that the Maildir belongs on a
-  volume other than `HUB_DATA_DIR`. ARCHITECTURE § Trust boundaries (mail) says the same.
+  volume other than `HUB_DATA_DIR`, with the quota and fail-stop-message limits of §6.
+  ARCHITECTURE § Trust boundaries (mail) and § Open questions say the same.
 - **Domain model**: the Fleet Storage context; Fleet History and Fleet Registry rows; the
   glossary per Domain impact.
 - **Trust boundaries**: the data directory (checks, modes, redb's lock).
@@ -1185,8 +1186,9 @@ the workspace gate. `docker-compose.yml` gains `restart: unless-stopped` and
   of which only the newest sample is kept (§2, owner's decision).
 - **Behaviour changes:** container-runtime and per-pod mounts disappear from disk lists and
   history; a mail report stores one point per series (its newest sample, at hub time) and a
-  backfill report none (its alert records are kept); a disk below the floor at open starts the
-  hub degraded, and an `ENOSPC` on commit fails it stop; a mail
+  backfill report none (its alert records are kept), nor a report from a backlog older than one
+  interval plus 15 minutes; a disk below the floor at open stops the hub from starting, and an
+  `ENOSPC` on commit fails it stop; a mail
   system's `last_seen` is when the hub accepted its newest report, and it is overdue when no
   report has *arrived* for 3 intervals plus 15 minutes; the store caps itself at 80% of its volume; `last_seen` is the last successful
   contact; the hub restarts itself (Compose) after a store fail-stop.
@@ -1196,7 +1198,7 @@ the workspace gate. `docker-compose.yml` gains `restart: unless-stopped` and
   2. the redb tables, the writer thread, the group commit, the points log and rotating tails,
      recovery, and the crash tests;
   3. the clock and retention clock, retention, overrides and pending shortenings, the purge,
-     GC, caps, the storage cap, degraded mode, compaction, directory safety;
+     GC, caps, the storage cap, the open-time floor, compaction, directory safety;
   4. with 0011: the hub adapter, `LiveStatus`, graceful shutdown, the routes, configuration, the
      workspace, the Dockerfile, compose and CI.
 - A step that outgrows one change is split, never merged half-working.
@@ -1363,6 +1365,32 @@ before the scan's transaction (now stated in §10).
 
 Came closest and survived: the overdue mark as a write-free transaction, sound once batched,
 delivered through `notify` and evicting.
+
+`rfc-adversary`, pass on the latest resolutions, and the **scope cut** that followed (owner's
+decision, 2026-10-03). The pass found the safety mechanisms added over the last rounds were the
+source of new defects: a degraded mode that could never leave (deleting spans inside `hub.redb`
+frees nothing on the volume) and erased history trying; a quarantine with nowhere to record a
+crash's cause, which blamed innocent messages; a shared-volume refusal that broke the documented
+single-disk mail setup on upgrade. The owner chose to cut them:
+
+| Finding | Verdict | Now |
+|---|---|---|
+| degraded mode never left and erased raw and minute history | CONFIRMED | **cut**: no degraded mode; below the floor at open the hub refuses to start; the storage cap is the only automatic deletion (§6) |
+| quarantine had no place to record a fail-stop's cause and blamed innocent messages | CONFIRMED | **cut**: no quarantine; the scan's message names logged at `error` on a store failure; a stated limit (§6, §10) |
+| `HUB_MAIL_SHARED_VOLUME` refused the documented single-disk setup | CONFIRMED | **cut**: no check; the README advises another volume, a stated limit (§6) |
+| while degraded, kept messages hid a flood | CONFIRMED | **moot**: no degraded mode |
+| a backlog drained over many scans showed day-old reports as current, one scan at a time | CONFIRMED | points only for a report current on the system clock (one interval + 15 min) (§2) |
+| the rewind kept misdated buckets in each tier's current span | CONFIRMED / PLAUSIBLE | current-span chunks and tails rewritten without them (§2) |
+| the rewind missed `alerts_seen` keys and the retention clock | PLAUSIBLE | named (§2) |
+| the scratch `fallocate` on NFS; a leftover file | PLAUSIBLE | **moot**: no `fallocate`; quotas a stated limit (§6) |
+| `st_dev` misses shared pools | PLAUSIBLE | **moot**: no check |
+| §9's order contradicted itself on the admission lock and left out `live_applications` | CONFIRMED (minor) | one order with the admission exception and every nested path listed (§9) |
+| "`NotAfterLast` never counts a mail point" can't hold under a hold | CONFIRMED (minor) | the row narrowed (Testing) |
+| "per report" text; two tie-breaks | CONFIRMED (minor) | corrected; one `newest_of_scan` (§2; 0011 §7) |
+
+From RFC 0008's fifth pass: `transact` returns `TransactError { Aborted, Store }` (§9), and a
+`LiveStatus` write for an absent entry is dropped (§10). Came closest and survived: the overdue
+mark as one write-free transaction delivered through `notify`.
 
 **Still open**, carried into the next `rfc-adversary` pass: whether the rotating tail flush plus
 the log meets the stated open time at the scale target (to be measured), and whether redb's

@@ -144,7 +144,8 @@ adapter only feeds it.
    `Register`, so it is answered after the commit that holds the transaction it read; a
    **refusal** (`RegistryFull`, `Reserved`) is answered at once, since one decided on state that
    then fails to commit costs only the agent's 5 s retry. An `AlreadyRegistered` is answered at
-   once too when the open transaction held no uncommitted write when `f` ran. So a refusal never
+   once too when the open transaction held no uncommitted **catalog** write by an earlier `f`
+   when `f` ran (appended or staged points don't count: a live hub always has some). So a refusal never
    waits for a commit; a flood of new ids **with room** still reaches the writer's bounded
    channel and waits on it, which RFC 0006's connection limits and `HUB_PUSH_TOKEN` bound, as for
    any push traffic.
@@ -159,8 +160,8 @@ adapter only feeds it.
   ids reach the writer, and only `Register` commits: durable transactions that arrive while a
   commit is in flight share the next one (the group commit), so the first registration of a
   1,000-agent fleet after the upgrade costs well under the measured ≈ 69 commits a second. A
-  refused id over the limit costs the writer one `f` with no commit; one held by another source
-  costs nothing on the writer.
+  refused id, over the limit or held by another source, costs only the step-1 read and nothing
+  on the writer.
 - **The presence lock** (RFC 0016 §2) is taken only to accept the connection, after step 2,
   never across a store call. RFC 0016 held it across registration because the SQLite mutex
   serialised every store anyway; on redb a registration waits for a commit, and holding the
@@ -181,11 +182,15 @@ adapter only feeds it.
   and poll alike: it takes the Registry's read lock, checks the current generation equals the
   frame's, report's or poll's, and only then takes the live-metrics write lock, inside it.
   `LiveMetrics::following` ignores a previous entry of another generation. Eviction compares the
-  generation. So a fill racing a delete can't leave an orphan for any source, and a stale end
-  evicts nothing. **The lock order, in full** (0010 §9 and ARCHITECTURE say the same): the
-  presence lock, then the Registry's read lock, then `live_status` / `live_metrics`; the commit
-  hook takes only the Registry's write lock. No path takes them in another order; a test can't
-  show that, so review must. The delete evicts after its
+  generation. **The same fence covers `live_applications` and `LiveStatus`**: `SystemApplications`
+  carries the generation; `append_round`'s `on_stored` releases the admission lock, then takes
+  the Registry read lock, checks the generation, and only then takes `live_applications` (never
+  `entry().or_default()` for an id the Registry doesn't hold at that generation); a `LiveStatus`
+  write for an id with no entry is dropped, since entries are created only by the registration
+  hook (0010 §10). So a fill or a round racing a delete can't leave an orphan for any source,
+  and a stale end evicts nothing. **The lock order** is 0010 §9's, which lists every path that
+  holds two hub locks; the commit hook takes only the Registry's write lock while holding any.
+  No test can show it; review must. The delete evicts after its
   commit hook. **An end always removes its own presence entry** when its connection number
   matches, whatever the generation; only its side effects (the offline write, the eviction) are
   generation-gated, so a deleted id leaves no dead entry. A connection whose append answered
@@ -305,8 +310,8 @@ re-creations.
 
 - **API4:** push registration is bounded, exactly, at 10,000 at most, and REST can't bypass it
   (§6). The Registry's memory is bounded per source (§2), and its total is shown in
-  `/api/storage`. A refused handshake costs an MVCC read, or one writer `f` with no commit for
-  an absent id over the limit (§3), so refusals can't load the commit path.
+  `/api/storage`. A refused handshake costs an MVCC read and nothing on the writer (§3), so
+  refusals can't load the commit path.
 - **A04 / API6: onboarding lock-out, accepted.** Registration is permanent and happens at the
   handshake. Anyone who can push (every token holder, or anyone while the token is unset) can
   fill the registry with 1000 handshakes. New and recreated hosts then get `registry full`, and
@@ -348,7 +353,15 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     {room, exactly full}, each with its `Registration`;
   - `PushPresence::claim` and `end` as tables over {current generation equal, stale, id absent}
     × {connection number current, not current};
-  - the sweep's grace as a table over {registered before open, after open} × {119 s, 120 s}.
+  - the sweep's grace as a table over {registered before open, after open} × {119 s, 120 s}, and
+    a fenced connection (a presence entry of a stale generation, still claimed) counted as no
+    connection;
+  - `LiveMetrics::following` with a previous entry of another generation: nothing carried over;
+  - with points appended and the record already committed (handshake seam), a step-2
+    `AlreadyRegistered` is answered before the next group commit;
+  - a delete between a round's `append` and its `on_stored` (a round seam) leaves no
+    `live_applications` entry, and a later registration of the id stores its agent's re-sent
+    round; a late `Online` status write after a delete creates no entry.
 - **Call-site follow-through** (released with authority author, quoted in the change summary):
   the `presence.rs`, `push/sweep.rs` and `push/ingest.rs` tests in `HEAD` whose calls gain the
   generation argument keep every expectation.
@@ -363,8 +376,8 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - a mail scan and a push handshake for the same new id, both submitted behind the gate, **in
     both orders**: mail first → one mail record, the push answer `Reserved(Mail)` from step 2;
     push first → one push record, the mail report `TransportMismatch`;
-  - a limit of 1 with one push system present refuses an unseen id, writes nothing and
-    **forces no commit** (the commit counter unchanged), and returns `AlreadyRegistered {
+  - a limit of 1 with one push system present refuses an unseen id from the step-1 read: **the
+    writer gate sees no submitted transaction**, nothing is written, and it returns `AlreadyRegistered {
     generation }` with the stored generation for the known id;
   - two handshakes for different new ids racing for the last slot, both submitted behind the
     gate before either runs: exactly one `Registered`, and a hook in `f` asserting the second
@@ -416,7 +429,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   registrations are unbounded "as push's are" becomes "bounded by the keys the operator
   derives, uncounted by the push limit").
 - § Components (`system-hub`): the presence lock is no longer held across registration; leases,
-  presence entries and live-metrics entries carry the generation.
+  presence entries, live-metrics and live-applications entries carry the generation; the
+  lock-order sentence ("the presence lock, then the database mutex, then the live state", also
+  in `state.rs`'s `AppState` comments) becomes 0010 §9's order.
 - `rfcs/0016-current-push-connection.md` (Implemented) gains a header note: "§2 and §4 amended by
   RFC 0008 (generation-fenced currency, sweep grace from registration)".
 - § Domain model, glossary: **push handshake**'s refusals become rejection, timeout, registry
@@ -554,6 +569,21 @@ Came closest and survived: generation-gating the end (today's connection-number 
 | the append-to-fill row had no seam; lock order untested | PLAUSIBLE | a frame seam; lock order a review item (Testing plan, §3) |
 
 Came closest and survived: generation fencing between a stale and a re-registered connection.
+
+`rfc-adversary`, fifth pass. Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the generation fence didn't cover `live_applications` or a status write for a removed entry | CONFIRMED (medium) | `SystemApplications` carries the generation; `on_stored` fenced after releasing the admission lock; status writes for absent entries dropped (§3; 0010 §10) |
+| the Cost and API4 sentences and a test row still described step-2 `RegistryFull` | CONFIRMED (low) | corrected; the row asserts no submitted transaction (§3, Security, Testing) |
+| `transact` couldn't return an abort; the admission-lock sentence contradicted itself | CONFIRMED (low) | `TransactError { Aborted, Store }`; the admission exception stated (0010 §9) |
+| ARCHITECTURE's and `state.rs`'s lock-order text not in the inventory | CONFIRMED (low) | listed (Impact) |
+| paths that could invert the order (sweeps, candidate lists, recursive Registry reads) | PLAUSIBLE | 0010 §9 lists every nested path and forbids holding the Registry guard while taking presence or re-taking it |
+| "uncommitted write" undefined | PLAUSIBLE (low) | catalog writes only; a row for the at-once branch (§3, Testing) |
+| no rows for `following` and a stale presence entry in the sweep | PLAUSIBLE (low) | added (Testing) |
+
+Came closest and survived: the Registry lagging redb between a commit and its hook (`transact`
+answers after the hook, and the next frame heals the window).
 
 **Still open**: nothing CONFIRMED.
 

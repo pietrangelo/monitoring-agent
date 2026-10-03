@@ -63,7 +63,7 @@ the store; this RFC's adapter, `storage/`, defines their encoding.
 | `mail_receipts` | system key ‖ run (16-byte UUID) ‖ u64 BE seq → `MailReceipt` (§7) |
 | `mail_receipts_by_time` | `created_at` (u64 BE) ‖ receipt key → () |
 | `mail_newest` | system key → the newest current receipt's key, `created_at`, `received_at` and interval (§7) |
-| `meta`, keys under `hub/` | `hub/generation`, `hub/key_id`, `hub/push_systems` (0008) |
+| `meta`, keys under `hub/` | `hub/generation`, `hub/key_id`, `hub/push_systems` (0008), `hub/mail_prune_floor` (§7) |
 
 The store owns `tombstones`, `retention` and the unprefixed `meta` keys (0010).
 
@@ -357,7 +357,10 @@ of the intake as `last_seen_active`. Where a rule below says "poll", it means ei
     interval; twice either bound leaves a margin.
 
   If no candidate qualifies, the new record is refused, counted, and logged once per system per
-  hour.
+  hour. **The victim search is bounded**: once a transaction finds no victim, it refuses every
+  further new record of that transaction without searching again, and each search reads at
+  most 1,000 `alerts_seen` entries before giving up; so a full table of recent mail records
+  costs one bounded search per transaction, not one per alert.
 - `GET /api/alerts?limit=` defaults to 100, and a larger `limit` is **clamped** to 1,000.
   `count_active_alerts` counts `alerts_listed` entries with `acknowledged = 0`, kept as a
   counter in `meta/hub/unacknowledged`, updated in the same transactions.
@@ -381,7 +384,10 @@ part of the implementation step.
 RFC 0017's `mail_receipts` SQLite table becomes three catalog tables (§1), and its one SQLite
 transaction per report becomes one `Batched` transaction per scan, holding each report's steps
 in turn (0010 §10's `store_mail_scan`). The pure decisions stay 0017's (`receipt::fresh` on the
-system clock, `receipt::recency`, `mail_status`, which 0010 §10 moves onto `received_at`).
+system clock, `receipt::recency`, `mail_status`, which 0010 §10 moves onto `received_at`). The
+amendment adds two pure rules of its own, in `mail_intake/receipt.rs` and table-tested:
+`newest_of_scan(reports) -> per-system choice` (by `(created_at, seq)` within a run, else arrival
+order; 0010 §2) and `stale_before(created_at, prune_floor) -> bool`.
 
 ```rust
 /// Persistence struct: a leading version byte, then postcard.
@@ -402,28 +408,29 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
      neither re-registers the system nor stores its points (0017 §6). Reads see the writes of
      earlier reports in the same scan, so a duplicate inside one scan is caught too;
   3. read `mail_newest/<key>` (written only for the current generation) for `Recency`;
-  4. read the persisted retention clock (0010 §2): a report whose `created_at` is older than it
-     minus the receipt window is **stale** (counted as 0017's `Stale`), skip the report. The
-     freshness check before the scan uses the system clock once per scan, and a retention pass
-     can prune between it and this transaction; refusing here on the same clock the prune uses
-     means a pruned receipt's replay can never pass as new;
+  4. read `meta/hub/mail_prune_floor`: a report with `stale_before(created_at, floor)` is
+     **stale** (counted as 0017's `Stale`), skip the report. The floor is the cutoff of the
+     latest receipt prune and **never decreases** (each prune writes `max(previous, cutoff)` in
+     the same transaction as its deletions), so a pruned receipt's replay can never pass as new,
+     even when the retention clock steps back after a corrected forward fault;
   then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
   insert the receipt; the alert records (§5); and for a `Newest` report, `mail_newest/<key>`
-  and, **if it is the system's newest accepted `Newest` report of the scan** (by `(created_at,
-  seq)`, known only once every report's refusals are, so staged **at the end of `f`**, once per
-  system), its newest snapshot's points, staged at hub now (`CatalogTxn::append`, 0010 §2 *Mail points*), so
+  and, **if it is the system's choice by `newest_of_scan`** among its accepted `Newest`
+  reports (known only once every report's refusals are, so staged **at the end of `f`**, once
+  per system) and current (0010 §2), its newest snapshot's points, staged at hub now (`CatalogTxn::append`, 0010 §2 *Mail points*), so
   two reports of one system in a scan never stamp the same second.
   A skipped report writes and stages nothing. **After the commit**, the live metrics, the info
-  fill and the round (`append_round`) run once per system, for its newest `Newest` report of the
-  scan by `created_at`, so an older report later in the scan never replaces what is shown. Every message of the scan is deleted after the
+  fill and the round (`append_round`) run once per system, for the same `newest_of_scan`
+  choice, and `mail_newest` is written for it alone, so an older report later in the scan never replaces what is shown. Every message of the scan is deleted after the
   commit holding the scan, accepted or refused, as 0017 deletes every handled message; a
   fail-stop before it leaves them for the next scan.
-- **Pruning** moves to 0010's retention pass: ******** whose `created_at` is older than the
+- **Pruning** runs from 0010's retention pass through its `Store::on_retention_pass` hook
+  (0010 §9), after the pass has committed its retention clock: receipts whose `created_at` is older than the
   receipt window (7 days) on the **retention clock** are removed, with their
-  `mail_********_by_time` entries, in its bounded transactions, **except each system's newest
-  current receipt** (the one `mail_newest` names), as 0017 keeps it. A report older than that
-  bound is refused in the transaction (step 4 above), so a pruned receipt's replay is always
-  stale, never new. Retired ******** are pruned by the window alone.
+  `mail_receipts_by_time` entries, in its bounded transactions, **except each system's newest
+  current receipt** (the one `mail_newest` names), as 0017 keeps it, and raises
+  `meta/hub/mail_prune_floor` to the cutoff in the same transaction. A report older than the
+  floor is refused (step 4 above), so a pruned receipt's replay is always stale, never new. Retired receipts are pruned by the window alone.
 - **The overdue sweep** reads `mail_newest` through `read_catalog` (MVCC: it never waits for
   the writer) on the blocking pool, and calls 0017's `mail_status` on the receipt's
   `received_at` (0010 §10). The mark is a write-free transaction that re-reads `mail_newest`
@@ -595,12 +602,15 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   - pruning at exactly the receipt window on the retention clock and one second before; a +1
     year system clock step prunes nothing early; `mail_newest` survives the prune;
   - the overdue sweep over `mail_newest`: on time, overdue, no entry (overdue), disabled
-    (skipped); a mail system's alert record survives the global cap while seen within twice its
-    mail interval;
+    (skipped); an overdue mark sets `last_error = "mail overdue"`, and the next report clears it;
   - a report committed between the overdue sweep's read and its write leaves the system online
     (`overdue.rs::a_report_stored_since_the_read_isnt_marked_overdue`, ported);
   - a retention pass pruning between the scan's freshness check and its transaction: the
-    replay of a deleted system's report is refused as stale, nothing registered;
+    replay of a deleted system's report is refused as stale, nothing registered; **the same
+    after the retention clock steps back an hour behind a prune**: the floor holds;
+  - `newest_of_scan` and `stale_before` as tables (ties on `created_at` across runs and within
+    one; the floor's edge); with the global table full of recent mail records, 256 reports of
+    64 alerts each search for a victim once;
   - the prune keeps each system's newest current receipt
     (`db/mail.rs::the_prune_keeps_the_newest_current_receipt`, ported);
   - two `Newest` reports of one system in one scan, in both orders: the shown metrics, info and
@@ -609,12 +619,21 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   - a mail system's acknowledged incident unseen for 3 hours survives the global cap; unseen for
     7 days + 1 s it is a victim;
   - the ported tests of `db/mail.rs`, `mail_intake/ingest.rs`, `mail_intake/overdue.rs` and
-    `mail_intake/scan.rs` keep their meaning, except: the backfill points (RFC 0010 §2, owner's
-    decision), `last_seen` and overdue on hub time (0010 §10, owner's decision), and
-    `db/mail.rs::a_failure_partway_leaves_nothing_and_a_retry_stores_once`, whose store error
-    after the first write now stops the hub (0010 §6) instead of rolling back; each is released
-    under the test-contract guard with the owner's authority when implemented, and quoted in the
-    change summary.
+    `mail_intake/scan.rs` keep their meaning, except these, each released under the
+    test-contract guard with `--authority user` when implemented (the owner's decisions of
+    2026-10-03), and quoted in the change summary:
+    - *newest snapshot only, at hub time*: `db/mail.rs::a_first_report_registers_its_system_and_stores_everything`,
+      `mail_intake/ingest.rs::a_first_report_registers_and_stores_its_system`, and the backfill
+      points tests;
+    - *expiry removed* (points are stamped at hub now): `db/mail.rs::a_point_past_its_retention_is_left_out_and_counted`,
+      and the `expired` field asserted in `db/mail.rs` and `mail_intake/ingest.rs`
+      (`MailStored::Stored`, `Ingested::Stored`);
+    - *`last_seen` and overdue on hub time*: the `last_seen` and overdue tests of `overdue.rs`;
+    - *no SQL*: `overdue.rs::a_mail_row_with_no_receipt_is_overdue_once` (its row can't be
+      re-created by hand; its `last_error` assertion is kept by the row above);
+    - *fail-stop instead of rollback*: `db/mail.rs::a_failure_partway_leaves_nothing_and_a_retry_stores_once`
+      and `db/mail.rs::a_delete_that_fails_partway_deletes_nothing` (a SQLite trigger with no
+      redb equivalent).
 - **Generations, deletion and tombstones**: delete then append to the old generation
   (`SystemGone` at that commit); **a poll's alert transaction in the same group commit as the
   delete, before and after it**: no alert record of the deleted system survives; delete while a
@@ -764,6 +783,21 @@ above; RFC 0012's fourth and fifth passes listed what this RFC must carry for th
 | the info fill from mail reports not carried | PLAUSIBLE | added to the info rule; a row (§2) |
 | ARCHITECTURE glossary lines for mail system and mail receipt | CONFIRMED (low) | listed (Impact) |
 | `MailNewest.receipt` could name a pruned receipt | PLAUSIBLE (low) | moot: the newest current receipt is never pruned (§7) |
+
+`rfc-adversary`, pass on the simplified amendment (findings written with "rcpt" for the receipt
+table, which a session filter redacted). Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| after a corrected forward fault the retention clock steps back, so a pruned rcpt's replay passes as new | CONFIRMED | a monotone `mail_prune_floor` written by each prune; step 4 refuses below it (§7) |
+| tests in `HEAD` the simplification contradicts weren't named | CONFIRMED | each named under its owner's decision, `--authority user` (Testing) |
+| §7 needed a retention-clock read and a prune hook 0010 §9 lacked | CONFIRMED | the floor replaces the clock read; `Store::on_retention_pass` in 0010 §9 (§7) |
+| three rules picked the newest report of a scan | CONFIRMED | one `newest_of_scan` for points, after-commit steps and `mail_newest` (§7; 0010 §2) |
+| the overdue mark dropped `last_error = "mail overdue"` | CONFIRMED | kept; cleared by the next report (0010 §10) |
+| the global-cap victim search was unbounded | PLAUSIBLE | one search per transaction, at most 1,000 entries (§5) |
+| a test row couldn't tell the 7-day rule from the old | CONFIRMED (low) | removed (Testing) |
+| `meta/mail/in_flight` had no owner | CONFIRMED (low) | **moot**: the quarantine was cut (0010 §10) |
+| the new rules had no pure home | PLAUSIBLE (low) | `newest_of_scan` and `stale_before` in `receipt.rs` (§7) |
 
 Came closest and survived: a message that fails every scan, and a delete sharing a group commit
 with a scan (store errors after a write stop the hub, and messages are deleted only after the
