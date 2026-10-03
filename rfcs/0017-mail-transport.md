@@ -284,10 +284,18 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
   2. **Transport** (in the transaction): if the id's row exists and its URL isn't `mail://`,
      refuse the report (`TransportMismatch`, counted): a mail report never writes into a
      pushed or polled system. The other direction is closed too: the **push handshake
-     refuses an id whose row is `mail://`** (a new `HandshakeRejection::TransportMismatch`,
-     answered `auth_error` with `transport mismatch`, checked after the token like the id
-     rule), so a push connection can never feed a mail row that the overdue sweep (§7) then
-     marks offline under it. Shipped agents retry any `auth_error` after 5 s, as today. Otherwise
+     refuses an id whose row is `mail://`**, answered `auth_error` with `transport
+     mismatch`, so a push connection can never feed a mail row that the overdue sweep (§7)
+     then marks offline under it. This is not a `HandshakeRejection`: `authenticate` stays a
+     pure parse of the message's content. It is a new `Refusal::TransportMismatch` returned
+     by the registration unit, which already runs on the blocking pool after the token
+     check: `insert_system_if_absent(id, url)` reads the row's `url` in the same hold of the
+     mutex and returns `Registered | Known | TransportMismatch`, so no check-then-insert can
+     race a mail scan registering the same id. Both transports call it, each with its own
+     URL. This amends RFC 0007 §4's rule that the check "reads no column" (it now reads
+     `url`, still nothing that can fail to map) and its `query_only` test, and the glossary's
+     *refusal*. The hub logs this refusal through `hourly_warning`, per system, since a
+     shipped agent retries it every 5 s. Otherwise
      insert the row if absent, with `url = "mail://"`.
   3. **Recency** (pure, `receipt::recency(created_at, previous_newest) -> Recency`), from
      the system's newest receipt **read before this report's receipt is inserted**: the
@@ -328,7 +336,16 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
 - **Deleting a system** deletes its receipts: `delete_system` gains an explicit
   `DELETE FROM mail_receipts WHERE system_id = ?`, as it already deletes `metrics`, `alerts`
   and `metric_retention` by hand (the hub sets no `PRAGMA foreign_keys`, so no cascade can
-  be relied on).
+  be relied on). In the same transaction it writes a **tombstone**
+  (`mail_tombstones(system_id, deleted_at)`, hub clock): a later report for that id whose
+  `created_at` is at or before `deleted_at` is refused (`Deleted`, counted) in step 2, so a
+  relay duplicate or a replay of a report ingested before the deletion can't re-register the
+  system or store its points again. A report created after the deletion (the agent is still
+  running) registers the system anew, as a push reconnect does. Tombstones are pruned past
+  the receipt window.
+- **`enabled`** means "polled" for poll rows and nothing else today. For mail rows: the
+  intake ignores it (a disabled mail system's reports are still stored), and the overdue
+  sweep skips disabled rows, so disabling a mail system silences its offline marking.
 
 ### 7. Status of a mail system
 
@@ -540,7 +557,12 @@ Adapters:
   86400 s interval; a point older than its series' retention is counted `Expired` while the
   same snapshot's other points are kept; a backfill report's round is dropped and counted.
 - Hub push handshake: an id whose row is `mail://` is answered `transport mismatch`, after a
-  wrong token is still answered as a wrong token.
+  wrong token is still answered as a wrong token; `insert_system_if_absent` table: absent →
+  `Registered`, same URL → `Known`, other URL → `TransportMismatch`, a row that doesn't map
+  otherwise still `Known` (RFC 0007 §4's test, amended).
+- Hub tombstone: after `delete_system`, a replayed report created before the deletion is
+  refused `Deleted`; one created after it registers the system; tombstones past the window
+  are pruned. The sweep skips a disabled mail row; the intake stores its reports.
 - Hub: the poller skips `mail://` rows (`SystemSource::Mail`); the sweep marks an overdue
   mail system offline and evicts its live metrics; `delete_system` removes the receipts.
 - Hub `mail-key` subcommand: prints the derived key for an id, refuses an invalid id, never
@@ -580,20 +602,30 @@ While this RFC is a Draft, the document is unchanged: it describes the system as
       PRIMARY KEY (system_id, run, seq)
   );
   CREATE INDEX IF NOT EXISTS mail_receipts_newest ON mail_receipts (system_id, created_at);
+  CREATE TABLE IF NOT EXISTS mail_tombstones (
+      system_id  TEXT    NOT NULL PRIMARY KEY,
+      deleted_at INTEGER NOT NULL
+  );
   ```
 
   If RFC 0010 (Draft) is accepted, the table becomes a catalog table of the hub store.
 - **Order:** upgrade the hub and set `HUB_MAIL_DIR` / `HUB_MAIL_KEY` first, derive each
   system's key, then configure agents. Reports mailed before the hub is ready wait in the
   mailbox and are ingested when it starts, as long as they are inside the 7-day window.
-- **Moving an agent between push and mail** (either way): delete the system on the hub
-  first, then reconfigure the agent. Its history goes with it; until it is deleted, the new
+- **Moving an agent between push and mail** (either way), in this order: stop the old
+  transport on the agent (reconfigure and restart it with neither `PUSH_TO` nor `MAIL_TO`);
+  for mail, also let the mailbox drain (the hub's scans empty it) — reports still in a relay
+  queue are refused by the tombstone once the system is deleted; then delete the system on
+  the hub; then start the agent with the new transport. Deleting first loses the race: a
+  still-pushing agent re-registers `push://` within 5 s, and a late mail report would
+  re-create `mail://`. Its history goes with it; until the old row is deleted, the new
   transport is refused (`TransportMismatch`) on both sides.
 - **Rolling back to a hub without this RFC:** first disable every mail system
   (`PUT /api/systems/:id` with `enabled: false`), since an older hub classifies `mail://`
   as a polled URL and would mark it offline every 30 s. An older `delete_system` leaves
   `mail_receipts` rows behind; they are harmless and ignored by that hub, and an upgraded hub
-  prunes them past the window.
+  prunes them past the window. After upgrading again, re-enable the mail systems, or the
+  overdue sweep keeps skipping them (§6).
 - **Deleting a mail system** from the dashboard deletes its receipts (`delete_system`); its agent's
   next report registers it again with no history, as a push system's reconnect does.
 - **Key rotation:** set a new `HUB_MAIL_KEY`, re-derive and redeploy every agent's
@@ -645,5 +677,20 @@ and found five new problems (three CONFIRMED, two PLAUSIBLE), all addressed:
   first. Decided: adopted, as a documented step rather than a change to RFC 0016.
 - Minor: 5 s of slack after `created_at` for a clock step; expiry is per point.
 
-The push handshake refusal touches the published push handshake contract, so a third pass is
-due before the RFC becomes `Accepted`.
+A third pass (2026-10-03) confirmed the second pass's fixes and found four CONFIRMED problems
+and one PLAUSIBLE, all addressed:
+
+- `TransportMismatch` can't come from `authenticate`, a pure parse with no registry: it is a
+  `Refusal` from the registration unit, whose `insert_system_if_absent` now reads `url` in
+  the same hold of the mutex (amending RFC 0007 §4's "reads no column").
+- Migrating between transports by deleting first loses a race in both directions: the
+  order is now stop the old transport, drain, delete, start the new one.
+- Deleting a mail system re-opened replay for the window: a tombstone refuses reports
+  created before the deletion.
+- `enabled` had no meaning for mail rows: the intake ignores it, the sweep honours it, and
+  Rollout says to re-enable after a rollback and re-upgrade.
+- (PLAUSIBLE) A push agent stuck on `transport mismatch` would log every 5 s: logged through
+  `hourly_warning`. Decided: adopted.
+
+These amendments change the design again (the registration check, a new table), so one more
+`rfc-adversary` pass is due before the RFC becomes `Accepted`.
