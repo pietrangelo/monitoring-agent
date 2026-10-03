@@ -212,14 +212,24 @@ pub enum SystemSource {
 
 impl SystemSource {
     /// `Push` for exactly `PUSH_URL`, `Poll` for any other url.
-    pub fn of(_url: &str) -> Self {
-        Self::Poll
+    pub fn of(url: &str) -> Self {
+        if url == PUSH_URL {
+            Self::Push
+        } else {
+            Self::Poll
+        }
     }
 }
 
 /// The systems the poller polls: the enabled polled systems, in the registry's order.
 pub fn polled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
-    systems.iter().filter(|system| system.enabled)
+    systems.iter().filter(|system| {
+        system.enabled
+            && match SystemSource::of(&system.url) {
+                SystemSource::Poll => true,
+                SystemSource::Push => false,
+            }
+    })
 }
 
 #[cfg(test)]

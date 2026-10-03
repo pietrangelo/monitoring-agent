@@ -45,11 +45,13 @@ impl ConnectionLease {
     }
 }
 
-/// A system's current connection: its number, and whether its task still runs.
+/// A system's current connection: its number, whether its task still runs, and whether a
+/// snapshot on it has claimed currency.
 #[derive(Debug)]
 struct Current {
     number: ConnectionNumber,
     task: Weak<ConnectionNumber>,
+    claimed: bool,
 }
 
 /// Every push system's current connection, keyed by system id.
@@ -88,29 +90,112 @@ pub enum OfflineReason {
 impl OfflineReason {
     /// The `last_error` the marking writes.
     pub fn last_error(self) -> &'static str {
-        ""
+        match self {
+            Self::NotConnected => "push disconnected",
+            Self::InvalidSystemId => "invalid system id",
+        }
+    }
+}
+
+impl Current {
+    /// Whether its connection's task still runs.
+    fn is_live(&self) -> bool {
+        self.task.strong_count() > 0
     }
 }
 
 impl PushPresence {
-    /// A handshake accepted: takes the next number, and makes it current only when the system
-    /// has no live current connection.
-    pub fn accept(&mut self, _system_id: &SystemId) -> ConnectionLease {
-        ConnectionLease(Arc::new(ConnectionNumber(0)))
+    /// How many systems have an entry. For tests: the map's size is what the sweep bounds.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.current.len()
     }
 
-    /// A snapshot frame on `lease`'s connection: that connection becomes current.
-    pub fn claim(&mut self, _system_id: &SystemId, _lease: &ConnectionLease) {}
+    /// A handshake accepted: takes the next number, and makes it current only when the system
+    /// has no live current connection.
+    pub fn accept(&mut self, system_id: &SystemId) -> ConnectionLease {
+        let number = ConnectionNumber(self.next);
+        self.next = self.next.wrapping_add(1);
+        let lease = ConnectionLease(Arc::new(number));
+        let taken = self
+            .current
+            .get(system_id.as_str())
+            .is_some_and(Current::is_live);
+        if !taken {
+            self.current
+                .insert(system_id.as_str().to_owned(), current(&lease, false));
+        }
+        lease
+    }
 
-    /// `connection` ended. When it was current, its entry is removed.
-    pub fn end(&mut self, _system_id: &SystemId, _connection: ConnectionNumber) -> Ending {
-        Ending::NotCurrent
+    /// A snapshot frame on `lease`'s connection: that connection becomes current, and has
+    /// claimed.
+    pub fn claim(&mut self, system_id: &SystemId, lease: &ConnectionLease) {
+        self.current
+            .insert(system_id.as_str().to_owned(), current(lease, true));
+    }
+
+    /// `lease`'s connection ended. When it was current, its entry is removed. Takes the lease
+    /// by value, so nothing can claim with it afterwards.
+    pub fn end(&mut self, system_id: &SystemId, lease: ConnectionLease) -> Ending {
+        let is_current = self
+            .current
+            .get(system_id.as_str())
+            .is_some_and(|current| current.number == lease.number());
+        if is_current {
+            self.current.remove(system_id.as_str());
+            Ending::Current
+        } else {
+            Ending::NotCurrent
+        }
     }
 
     /// What the sweep does with a push system stored with `status`, the hub up for `up_for`.
     /// An entry whose task is gone counts as none, and is removed.
-    pub fn sweep(&mut self, _system_id: &str, _status: &SystemStatus, _up_for: Duration) -> Sweep {
-        Sweep::Leave
+    pub fn sweep(&mut self, system_id: &str, status: &SystemStatus, up_for: Duration) -> Sweep {
+        let connection = self.connection_of(system_id);
+        let disconnected = match (status, connection) {
+            (SystemStatus::Offline, _) => false,
+            (SystemStatus::Online, Connection::Claimed) => false,
+            (SystemStatus::Online, Connection::Unclaimed) => true,
+            (SystemStatus::Unknown, Connection::Claimed | Connection::Unclaimed) => false,
+            (SystemStatus::Online | SystemStatus::Unknown, Connection::None) => true,
+        };
+        if !disconnected || up_for < RECONNECT_GRACE {
+            return Sweep::Leave;
+        }
+        match SystemId::try_from(system_id.to_owned()) {
+            Ok(_) => Sweep::MarkOffline(OfflineReason::NotConnected),
+            Err(_) => Sweep::MarkOffline(OfflineReason::InvalidSystemId),
+        }
+    }
+
+    /// The system's live current connection, forgetting an entry whose task is gone.
+    fn connection_of(&mut self, system_id: &str) -> Connection {
+        match self.current.get(system_id) {
+            None => Connection::None,
+            Some(current) if !current.is_live() => {
+                self.current.remove(system_id);
+                Connection::None
+            }
+            Some(current) if current.claimed => Connection::Claimed,
+            Some(_) => Connection::Unclaimed,
+        }
+    }
+}
+
+/// What the sweep sees of a system's current connection.
+enum Connection {
+    None,
+    Claimed,
+    Unclaimed,
+}
+
+fn current(lease: &ConnectionLease, claimed: bool) -> Current {
+    Current {
+        number: lease.number(),
+        task: Arc::downgrade(&lease.0),
+        claimed,
     }
 }
 
@@ -151,8 +236,18 @@ mod tests {
         // (case, whether a first connection is accepted before, and whether its task is gone)
         let cases = [
             ("no connection before", false, false, Ending::Current),
-            ("a live connection is current", true, false, Ending::NotCurrent),
-            ("the current one's task is gone", true, true, Ending::Current),
+            (
+                "a live connection is current",
+                true,
+                false,
+                Ending::NotCurrent,
+            ),
+            (
+                "the current one's task is gone",
+                true,
+                true,
+                Ending::Current,
+            ),
         ];
         for (name, first, first_gone, expected) in cases {
             let mut presence = PushPresence::default();
@@ -163,7 +258,7 @@ mod tests {
             let second = presence.accept(&sys);
 
             assert_eq!(
-                presence.end(&sys, second.number()),
+                presence.end(&sys, second),
                 expected,
                 "case {name}: the new connection's end"
             );
@@ -182,18 +277,39 @@ mod tests {
         }
         use Ending::{Current, NotCurrent};
         use Step::{Accept, Claim, End};
-        let cases: [(&str, &[Step]); 5] = [
+        // An end can't be counted twice: `end` takes the lease by value.
+        let cases: [(&str, &[Step]); 4] = [
             (
                 "a reconnect claims, then the old connection times out",
-                &[Accept, Claim(0), Accept, Claim(1), End(0, NotCurrent), End(1, Current)],
+                &[
+                    Accept,
+                    Claim(0),
+                    Accept,
+                    Claim(1),
+                    End(0, NotCurrent),
+                    End(1, Current),
+                ],
             ),
             (
                 "a connection that never claims can't take currency",
-                &[Accept, Claim(0), Accept, End(0, Current), End(1, NotCurrent)],
+                &[
+                    Accept,
+                    Claim(0),
+                    Accept,
+                    End(0, Current),
+                    End(1, NotCurrent),
+                ],
             ),
             (
                 "after the current end, a snapshot on the other claims",
-                &[Accept, Claim(0), Accept, End(0, Current), Claim(1), End(1, Current)],
+                &[
+                    Accept,
+                    Claim(0),
+                    Accept,
+                    End(0, Current),
+                    Claim(1),
+                    End(1, Current),
+                ],
             ),
             (
                 "newest exits first",
@@ -207,21 +323,17 @@ mod tests {
                     End(0, Current),
                 ],
             ),
-            (
-                "an end is counted once",
-                &[Accept, Claim(0), End(0, Current), End(0, NotCurrent)],
-            ),
         ];
         let sys = id("sys-1");
         for (name, steps) in cases {
             let mut presence = PushPresence::default();
-            let mut leases: Vec<ConnectionLease> = Vec::new();
+            let mut leases: Vec<Option<ConnectionLease>> = Vec::new();
             for (at, step) in steps.iter().enumerate() {
                 match *step {
-                    Accept => leases.push(presence.accept(&sys)),
-                    Claim(n) => presence.claim(&sys, &leases[n]),
+                    Accept => leases.push(Some(presence.accept(&sys))),
+                    Claim(n) => presence.claim(&sys, leases[n].as_ref().expect("not ended")),
                     End(n, expected) => assert_eq!(
-                        presence.end(&sys, leases[n].number()),
+                        presence.end(&sys, leases[n].take().expect("ended once")),
                         expected,
                         "case {name}, step {at}"
                     ),
@@ -233,14 +345,27 @@ mod tests {
     /// RFC 0016 §2: a connection's end concerns only its own system.
     #[test]
     fn an_end_concerns_only_its_own_system() {
-        let mut presence = PushPresence::default();
-        let a = presence.accept(&id("a"));
-        let b = presence.accept(&id("b"));
+        // (case, the system the lease was accepted for, the system its end names, the outcome)
+        let cases = [
+            ("another system's end", "a", "b", Ending::NotCurrent),
+            ("an unknown system", "a", "unknown", Ending::NotCurrent),
+            ("its own system", "a", "a", Ending::Current),
+        ];
+        for (name, accepted_for, ended_for, expected) in cases {
+            let mut presence = PushPresence::default();
+            let lease = presence.accept(&id(accepted_for));
+            let other = presence.accept(&id("b"));
+            let other_lease = (accepted_for != "b").then_some(other);
 
-        assert_eq!(presence.end(&id("b"), a.number()), Ending::NotCurrent);
-        assert_eq!(presence.end(&id("unknown"), a.number()), Ending::NotCurrent);
-        assert_eq!(presence.end(&id("a"), a.number()), Ending::Current);
-        assert_eq!(presence.end(&id("b"), b.number()), Ending::Current);
+            assert_eq!(presence.end(&id(ended_for), lease), expected, "case {name}");
+            if let Some(other) = other_lease {
+                assert_eq!(
+                    presence.end(&id("b"), other),
+                    Ending::Current,
+                    "case {name}: b's own connection is still current"
+                );
+            }
+        }
     }
 
     /// RFC 0016 §4: the sweep's table.
@@ -249,29 +374,125 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Connection {
             None,
+            /// Accepted, and a snapshot on it claimed.
             Live,
+            /// Accepted, and no snapshot claimed on it.
+            LiveUnclaimed,
             TaskGone,
         }
         let just_under = PAST_GRACE - Duration::from_secs(1);
         let not_connected = Sweep::MarkOffline(OfflineReason::NotConnected);
         let cases = [
-            ("offline, none", SystemStatus::Offline, Connection::None, PAST_GRACE, Sweep::Leave),
-            ("offline, live", SystemStatus::Offline, Connection::Live, PAST_GRACE, Sweep::Leave),
-            ("online, live", SystemStatus::Online, Connection::Live, PAST_GRACE, Sweep::Leave),
-            ("unknown, live", SystemStatus::Unknown, Connection::Live, PAST_GRACE, Sweep::Leave),
-            ("online, none, in the grace", SystemStatus::Online, Connection::None, just_under, Sweep::Leave),
-            ("online, none, at the grace", SystemStatus::Online, Connection::None, PAST_GRACE, not_connected),
-            ("unknown, none, at the grace", SystemStatus::Unknown, Connection::None, PAST_GRACE, not_connected),
-            ("online, task gone, at the grace", SystemStatus::Online, Connection::TaskGone, PAST_GRACE, not_connected),
-            ("online, task gone, in the grace", SystemStatus::Online, Connection::TaskGone, just_under, Sweep::Leave),
-            ("online, none, long up", SystemStatus::Online, Connection::None, Duration::from_secs(86_400), not_connected),
+            (
+                "offline, none",
+                SystemStatus::Offline,
+                Connection::None,
+                PAST_GRACE,
+                Sweep::Leave,
+            ),
+            (
+                "offline, live",
+                SystemStatus::Offline,
+                Connection::Live,
+                PAST_GRACE,
+                Sweep::Leave,
+            ),
+            (
+                "online, live, claimed",
+                SystemStatus::Online,
+                Connection::Live,
+                PAST_GRACE,
+                Sweep::Leave,
+            ),
+            (
+                "online, live, never claimed, in the grace",
+                SystemStatus::Online,
+                Connection::LiveUnclaimed,
+                just_under,
+                Sweep::Leave,
+            ),
+            (
+                "online, live, never claimed, at the grace",
+                SystemStatus::Online,
+                Connection::LiveUnclaimed,
+                PAST_GRACE,
+                not_connected,
+            ),
+            (
+                "unknown, live, claimed",
+                SystemStatus::Unknown,
+                Connection::Live,
+                PAST_GRACE,
+                Sweep::Leave,
+            ),
+            (
+                "unknown, live, never claimed",
+                SystemStatus::Unknown,
+                Connection::LiveUnclaimed,
+                PAST_GRACE,
+                Sweep::Leave,
+            ),
+            (
+                "offline, live, never claimed",
+                SystemStatus::Offline,
+                Connection::LiveUnclaimed,
+                PAST_GRACE,
+                Sweep::Leave,
+            ),
+            (
+                "online, none, in the grace",
+                SystemStatus::Online,
+                Connection::None,
+                just_under,
+                Sweep::Leave,
+            ),
+            (
+                "online, none, at the grace",
+                SystemStatus::Online,
+                Connection::None,
+                PAST_GRACE,
+                not_connected,
+            ),
+            (
+                "unknown, none, at the grace",
+                SystemStatus::Unknown,
+                Connection::None,
+                PAST_GRACE,
+                not_connected,
+            ),
+            (
+                "online, task gone, at the grace",
+                SystemStatus::Online,
+                Connection::TaskGone,
+                PAST_GRACE,
+                not_connected,
+            ),
+            (
+                "online, task gone, in the grace",
+                SystemStatus::Online,
+                Connection::TaskGone,
+                just_under,
+                Sweep::Leave,
+            ),
+            (
+                "online, none, long up",
+                SystemStatus::Online,
+                Connection::None,
+                Duration::from_secs(86_400),
+                not_connected,
+            ),
         ];
         let sys = id("sys-1");
         for (name, status, connection, up_for, expected) in cases {
             let mut presence = PushPresence::default();
             let lease = match connection {
                 Connection::None => None,
-                Connection::Live => Some(presence.accept(&sys)),
+                Connection::Live => {
+                    let lease = presence.accept(&sys);
+                    presence.claim(&sys, &lease);
+                    Some(lease)
+                }
+                Connection::LiveUnclaimed => Some(presence.accept(&sys)),
                 Connection::TaskGone => {
                     drop(presence.accept(&sys));
                     None
@@ -303,27 +524,28 @@ mod tests {
         }
     }
 
-    /// RFC 0016 §4: the sweep removes an entry whose task is gone, so the connection that ends
-    /// later, if any, is no longer current.
+    /// RFC 0016 §4: the sweep removes an entry whose task is gone, and keeps a live one, so
+    /// the presence map holds no more than the running connections.
     #[test]
     fn the_sweep_forgets_an_entry_whose_task_is_gone() {
         let sys = id("sys-1");
-        // (case, whether the sweep runs before the end, the end's outcome)
+        // (case, whether the task is gone, whether the sweep runs, entries after)
         let cases = [
-            ("no sweep: the entry stays", false, Ending::Current),
-            ("a sweep: the entry is gone", true, Ending::NotCurrent),
+            ("task gone, no sweep: the entry stays", true, false, 1),
+            ("task gone, a sweep: the entry is gone", true, true, 0),
+            ("task live, a sweep: the entry stays", false, true, 1),
         ];
-        for (name, swept, expected) in cases {
+        for (name, gone, swept, entries) in cases {
             let mut presence = PushPresence::default();
             let lease = presence.accept(&sys);
-            let number = lease.number();
-            drop(lease);
+            let kept = (!gone).then_some(lease);
 
             if swept {
                 presence.sweep(sys.as_str(), &SystemStatus::Offline, Duration::ZERO);
             }
 
-            assert_eq!(presence.end(&sys, number), expected, "case {name}");
+            assert_eq!(presence.entries(), entries, "case {name}");
+            drop(kept);
         }
     }
 
