@@ -111,6 +111,19 @@ Runs on every monitored Linux host. Responsibilities:
   the round receiver across connections; once the scrape loop has ended it gives the channel
   up for the agent's lifetime, logging that once, and never re-sends the ended loop's last
   round.
+- Optionally mails sealed reports to a hub instead (`mail/`, RFC 0017), when `MAIL_TO` is set
+  (with `PUSH_TO` too, startup is refused with 78). `mail/config.rs` parses the `MAIL_*`
+  variables before the runtime. `mail/client.rs` looks every 2 s: it offers the published
+  snapshot to the pure `MailBatch` (`mail/batch.rs`: one sample per `MAIL_SAMPLE_INTERVAL`, at
+  most 60, and every alert incident active since the last report, at most 64), and at each
+  `MAIL_INTERVAL`, or at once when an incident becomes active (`IncidentPace`: at most one a
+  minute), closes it into a `MailReport` (`mail/report.rs`, named MessagePack), seals it with
+  XChaCha20-Poly1305 under `MAIL_KEY` with a random nonce (`mail/seal.rs`), armours it in a
+  `text/plain` body, and queues it in the pure `Outbox` (`mail/outbox.rs`: at most 288, the
+  oldest dropped first). Sending uses lettre's Tokio SMTP transport: STARTTLS required by
+  default, certificates always verified, plain SMTP only to a loopback relay; a 4xx or an
+  unreachable relay is retried with a backoff from 30 s up to the interval, a 5xx drops the
+  report. The outbox is in memory: a restart loses what it held.
 - Reads which Spring Boot applications to monitor from `SPRING_BOOT_APPS` and its companion
   variables (`applications/config.rs`, RFC 0009), and where to serve from
   `SYSTEM_AGENT_LISTEN` (`listen.rs::ListenAddress`, RFC 0015: a literal IP and port, default
@@ -169,7 +182,7 @@ Aggregates data from many `system-agent` instances. Responsibilities:
   each push system with no live current connection, or reading online while its current
   connection never claimed, once the hub has run 120 s (`PushPresence::sweep`). A row whose
   id breaks `SystemId` gets `invalid system id`.
-- Two ingestion modes, both able to run simultaneously per fleet:
+- Three ingestion modes, all able to run simultaneously per fleet:
   - **HTTP poll** (`collector/`): every 30 s the hub reads the registry (on the blocking
     pool; there is no systems cache, and a tick whose read fails polls the systems of the last
     read that succeeded) and calls each enabled polled system's (`registry::polled_systems`:
@@ -192,6 +205,19 @@ Aggregates data from many `system-agent` instances. Responsibilities:
     Spring Boot applications. Agents auto-register on first successful push
     handshake — no prior entry in `systems` is required. Every binary message spends the
     connection's decode budget before it is decoded (RFC 0007 §3).
+  - **Mail** (`mail_intake/`, RFC 0017): when `HUB_MAIL_DIR` and `HUB_MAIL_KEY` are both set
+    (one alone, a key that isn't 32 bytes of base64, or a directory without `new/` and `cur/`
+    refuses startup), every 10 s, on the blocking pool, the hub takes at most 256 messages from
+    the Maildir's `new/`, oldest name first (`scan.rs`), and deletes each once handled,
+    accepted or refused; a file over 1 MiB is deleted unread. For each (`ingest.rs`): the first
+    armour block in the decoded text parts (`mail-parser` undoes a relay's transfer encoding;
+    no header is trusted), the sealed report opened under the id's key (`seal.rs`), the report
+    parsed within its bounds (`report.rs`), its freshness (`receipt.rs`: at most 5 minutes
+    ahead, at most 7 days old), then one transaction (`db/mail.rs::store_mail_report`). The
+    newest report of a system also keeps its newest sample as live metrics, fills the registry
+    (`registry_fill.rs`, shared with push) and stores its scrape round. An overdue sweep
+    (`overdue.rs`) runs every 60 s. `system-hub mail-key <system id>` (`command.rs`) prints a
+    system's mail key and touches no database.
 - Stores every snapshot, pushed or polled, through one **snapshot rule** (`snapshot.rs`,
   RFC 0007 §1): at most 1024 disks, valid mount points, finite values; what it leaves out is
   counted and logged, at `warn` at most hourly per system (`left_out_log`). `snapshot_intake.rs`
@@ -248,6 +274,7 @@ Aggregates data from many `system-agent` instances. Responsibilities:
 |---|---|---|---|
 | HTTP Poll | Hub → Agent | REST + JSON | Agent reachable from hub; hub controls cadence |
 | Push | Agent → Hub | WebSocket + MessagePack | Agent behind NAT/firewall from hub's side; lower latency, smaller payload (~50-70% smaller than equivalent JSON) |
+| Mail | Agent → SMTP relay → Maildir → Hub | SMTP + sealed MessagePack | Agent can reach neither the hub nor the internet, only its network's relay; minutes of latency |
 
 A push connection carries two kinds of binary frame: snapshot frames, and application frames
 (one scrape round each). Every binary message first spends a token of the connection's decode
@@ -308,6 +335,16 @@ mixed-version fleet must keep working):
   `system-hub/src/application_wire.rs`, and tied by the golden bytes
   `testdata/application-frame-v1.msgpack`, which both crates' tests read. A frame and a
   snapshot never decode as each other (5 elements against 21).
+- *Mail report*: Telemetry Publishing → Ingestion, through untrusted relays (RFC 0017). The
+  sealed bytes are `"SAMR" | 1 | id_len | system id | nonce (24) | ciphertext`, the header
+  before the nonce being the AEAD's associated data, under the system's mail key
+  (HKDF-SHA256 of the hub's master key, salt `system-agent mail key v1`, info the system id).
+  The plaintext is a `mail-report.v1` MessagePack **map** (`to_vec_named`), so a later agent may
+  add keys a v1 hub ignores; the reason, an alert's metric and severity are strings (an
+  unknown reason reads `Other`). Declared independently in `src/mail/report.rs` and
+  `system-hub/src/mail_intake/report.rs`, tied by `testdata/mail-report-v1.msgpack` and
+  `testdata/mail-report-v1.sealed`. It travels base64 between armour lines in a `text/plain`
+  body.
 - *Poll responses*: the agent's `/api/system`, `/api/alerts` and `/api/applications` JSON →
   Ingestion (`collector/`), none of them through a redirect. `/api/system` is read up to
   4 MiB, and its snapshot and memory capacity go through the same rules as a push frame's.
@@ -370,7 +407,15 @@ mixed-version fleet must keep working):
 | **retention** | how long the hub keeps metric points per system per metric: a `metric_retention` row, else 24 h. A negative (hand-set) row counts as none, and so does a snapshot metric's row that isn't an integer | `metric_retention` table, `snapshot_retention`, `APPLICATION_RETENTION_SECS` |
 | **poll** | the hub fetching a system's snapshot, alerts and scrape round over HTTP, every 30 s, following no redirect | `collector/` |
 | **push** | an agent streaming snapshots and scrape rounds to the hub over WebSocket + MessagePack | `push/` (both crates) |
-| **push system** | a system registered by a push handshake (`url` = `push://`), never polled. **Polled system**: any other | `SystemSource`, `PUSH_URL`, `polled_systems` |
+| **push system** | a system registered by a push handshake (`url` = `push://`), never polled. **Polled system**: one that is neither a push nor a mail system | `SystemSource`, `PUSH_URL`, `polled_systems` |
+| **mail system** | a system registered by its first accepted mail report (`url` = `mail://`): never polled, and a push handshake for its id is refused (`transport mismatch`). Marked offline when **overdue**: more than 3 mail intervals and 15 minutes since its newest report | `SystemSource::Mail`, `MAIL_URL`, `mail_status`, `MailPresence` |
+| **mail report** | what one mail message carries: its report id (agent run + a sequence from 1), its creation time, the mail interval, its reason (scheduled, incident), its samples (1 to 60, a push snapshot frame's values without processes, the system info on the newest only), every alert incident active since the previous report, and the latest scrape round | `MailReport` (both crates), `MailedSnapshot`, `MailedAlert`, `ReportId`, `ReportReason` |
+| **mail interval** / **sample interval** | the time between scheduled reports (60 s to a day, default 300 s), and between the samples a report keeps (10 s up to the mail interval, at most 60 a report, default 60 s) | `MailInterval`, `SampleInterval` |
+| **incident report** | a report mailed at once because an alert incident became active, at most one a minute | `ReportReason::Incident`, `IncidentPace` |
+| **sealed report** / **armour** | a report encrypted and authenticated under its system's mail key, with its header as associated data; its base64 between `-----BEGIN/END SYSTEM-AGENT REPORT-----` lines | `seal`, `open`, `armour`, `dearmour` |
+| **mail key** / **mail master key** | the hub's 32-byte secret (`HUB_MAIL_KEY`), and one system's key derived from it and its system id, which the agent holds (`MAIL_KEY`) | `MailMasterKey`, `MailKey` |
+| **mail receipt** / **receipt window** | the record of one accepted report, keyed by system and report id, which refuses its duplicates and replays; kept 7 days (each system's newest current receipt always), and retired, not deleted, when the system is deleted | `MailReceipt`, `mail_receipts`, `RECEIPT_WINDOW_SECS` |
+| **backfill report** | a report older than its system's newest accepted one: it adds history and alert records, never status, last seen, live metrics or the shown round | `Recency::Backfill` |
 | **push system id** (agent) | the id the agent presents in the handshake, resolved once per process, before the runtime | `AgentId`, `resolve_push_id`, `IdSource` |
 | **connection number** | the in-memory number identifying one accepted push connection; never persisted | `ConnectionNumber`, `ConnectionLease` |
 | **current connection** | of a push system's open connections, the one whose snapshot frame claimed last, or, before any, the first one accepted while none was current. Only its end marks the system offline | `PushPresence`, `Ending` |
@@ -461,6 +506,16 @@ mixed-version fleet must keep working):
     on a connection and at `debug` after that, and counted.
   - A snapshot is stored in one transaction, on the blocking pool. When the system's row is
     gone, nothing is written and the connection ends.
+- **Agent → Hub (mail)** (RFC 0017): every relay on the way is untrusted and may read,
+  delay, reorder, duplicate, drop or rewrite messages, so the report is sealed end to end and
+  the hub trusts no header. Each system has its own key, so a host's key speaks only for its
+  own id (unlike the shared push token). `open` parses the id before deriving a key, and every
+  refusal is counted by reason and logged at most hourly, never with content, an
+  unauthenticated id or a key. Mail reports never write into a pushed or polled system's row,
+  and push never into a mail system's. The relay link is STARTTLS by default with verified
+  certificates; plain SMTP only to a loopback relay, never with credentials. `MAIL_KEY`,
+  `MAIL_RELAY_PASSWORD` and `HUB_MAIL_KEY` are never logged; their types implement no `Debug`.
+  The Subject line (the system id and report id) crosses relays in clear.
 - **Hub → Agent (poll)**: hub sends the per-system token stored in `db/mod.rs` (as
   configured via `POST/PUT /api/systems`) as the agent's expected auth token, in
   `X-API-Key`. No poll follows a redirect: reqwest strips only standard credential headers
@@ -509,6 +564,7 @@ startup (`db/mod.rs`; metric history in `db/history.rs`).
 | `systems` | Registered agents: id, name, URL, token, status, OS info, poll interval |
 | `metrics` | Time-series rows: system_id, metric name (`cpu`, `memory`, `swap`, `load1`, `load5`, `disk:{mount}`, and per application `app:{name}:{gauge}` and `app:{name}:up`), value, timestamp |
 | `alerts` | Alert history, one record per alert incident, with acknowledge support |
+| `mail_receipts` | One row per accepted mail report: system id, run, seq (the primary key), created_at, interval_secs, received_at, and `retired` (set when the system is deleted). No foreign key: deleting a system retires its receipts, which keep refusing replays of its reports |
 | `metric_retention` | Per-system, per-metric retention window (default 24h). A snapshot metric is pruned in each transaction that stores a point of it, at most 16 rows per point, oldest first; `app:*` metrics by `retention.rs` every 10 minutes, in batches of at most 5,000 rows, each under its own hold of the mutex |
 
 Snapshot points carry the agent's clock on push (the frame's `timestamp`) and the hub's clock
@@ -561,6 +617,13 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   passes them; the pong test shrinks both sockets' kernel buffers so that the write-buffer
   cap is what the returned pongs show. The snapshot rule, the token bucket and the display
   rules are pure and tested by tables, without a server.
+- **Mail goldens** (`testdata/`): `mail-report-v1.msgpack`, written by
+  `generate_mail_report_v1.py` (hand-rolled, independent of rmp-serde), which the agent's
+  encoding must equal and the hub must parse; and `mail-report-v1.sealed`, the agent's sealing
+  of it for `web-01` under the key derived from a master key of 32 bytes of 1 (an HKDF vector
+  computed with Python's `hmac`), which the hub must open. The agent's SMTP client is tested
+  against a scripted relay on an ephemeral port; the hub's Maildir reader over temp
+  directories.
 - **Contract golden files** (`testdata/` at the repo root): `application-frame-v1.msgpack`,
   written by `generate_application_frame_v1.py`, a MessagePack encoder independent of
   rmp-serde. The agent's test asserts its encoding of a fixed round equals the bytes; the
@@ -662,6 +725,13 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
 
 Tracked here so they aren't rediscovered from scratch; promote any of these to an RFC
 (`rfcs/`) before acting on them.
+
+- Mail (RFC 0017): the agent's outbox lives in memory, so a restart loses the reports it held.
+  There is no per-system revocation of a mail key: changing `HUB_MAIL_KEY` re-keys every mailed
+  system. Mail registrations are unbounded, as push's are (RFC 0008). A report that fails to
+  store is deleted with its samples, not retried. A backfill report's scrape round is dropped,
+  since `store_round` stamps `app:*` points at hub time. A disabled mail system's reports still
+  mark it online, and the overdue sweep skips it, so its status means only "last known".
 
 - In a container, disks list bind mounts whose sizes are the host filesystem's.
 - The alert readings are rebuilt from the snapshot DTO's percentages (`collectors/mod.rs::

@@ -11,14 +11,15 @@ A two-component monitoring stack for Linux servers. **System Agent** runs on eve
 
 ![Architecture: one System Hub polls some System Agents over HTTP and receives WebSocket pushes from others; inside each agent one background collector publishes the snapshot every route, stream, alert rule and push reads](docs/images/architecture.svg)
 
-**Two connection modes** between agent and hub:
+**Three connection modes** between agent and hub:
 
 | Mode | Direction | Protocol | Use case |
 |---|---|---|---|
 | **HTTP Poll** | Hub → Agent | REST + JSON | Agent behind firewall, hub can reach it |
 | **Push** | Agent → Hub | WebSocket + MessagePack | Agent can connect out, lower latency, binary efficient |
+| **Mail** | Agent → relay → Hub's mailbox | SMTP + sealed MessagePack | Agent can reach neither the hub nor the internet, only its network's SMTP relay (see [Mail transport](#mail-transport-smtp)) |
 
-Agents auto-register on the hub on first connection (push mode) or when manually added via the dashboard (poll mode).
+Agents auto-register on the hub on first connection (push mode), on their first accepted report (mail mode), or when manually added via the dashboard (poll mode).
 
 ---
 
@@ -211,6 +212,15 @@ For push-mode agents, they appear automatically — no manual registration neede
 | `PUSH_TOKEN` | *(none)* | Shared secret for hub authentication |
 | `SYSTEM_AGENT_ID_FILE` | *(none)* | Absolute path of a file that keeps the push system id. When the file exists its content is the id; when it's missing, the id resolved at that start is written there, so it survives container re-creations. A relative path, or a file that isn't UTF-8 or holds an invalid id, refuses startup (exit 78); a file that can't be read or written refuses it with exit 1. Unset or empty: nothing is written. The image has `/var/lib/system-agent`, owned by the agent's user, for a volume (see below) |
 | `PUSH_INTERVAL` | `2` | Seconds between push ticks (min 2). A tick sends the latest snapshot only if the hub hasn't had it yet; a stale snapshot closes the connection, and the agent reconnects once a fresh one is read |
+| `MAIL_TO` | *(none)* | The hub's mailbox address: turns the mail transport on (RFC 0017). Can't be combined with `PUSH_TO` (exit 78) |
+| `MAIL_RELAY` | *(none)* | `host:port` of the SMTP relay; required with `MAIL_TO` |
+| `MAIL_TLS` | `starttls` | `starttls` (required: the session fails without it), `tls` (implicit, port 465), or `none`, accepted only for a loopback relay. Certificates are always verified |
+| `MAIL_RELAY_CA` | system roots | PEM file to verify the relay's certificate with (an internal CA) |
+| `MAIL_RELAY_USERNAME` / `MAIL_RELAY_PASSWORD` | *(none)* | SMTP AUTH, both or neither, over TLS only. Never logged |
+| `MAIL_FROM` | `system-agent@<host name>` | Sender address |
+| `MAIL_KEY` | *(none)* | This system's mail key, base64, from `system-hub mail-key <system id>`; required with `MAIL_TO`. Never logged |
+| `MAIL_INTERVAL` | `300` | Seconds between scheduled reports, 60 to 86400 |
+| `MAIL_SAMPLE_INTERVAL` | `60` | Seconds between the samples a report carries, 10 up to `MAIL_INTERVAL`, at most 60 per report |
 | `SPRING_BOOT_APPS` | *(none)* | Spring Boot applications to monitor, as comma-separated `name=actuator-base-url` pairs (at most 16), e.g. `orders=http://127.0.0.1:8081/actuator`. A name is 1–64 of `A-Z a-z 0-9 _ . -`. The URL is http(s), with no credentials, query or fragment |
 | `SPRING_BOOT_APP_<NAME>_USERNAME` / `_PASSWORD` | *(none)* | HTTP Basic credentials for one application; both or neither. `<NAME>` is the name upper-cased, with `-` and `.` as `_`. A username can't contain `:`, and neither value a control character (HTTP Basic can't carry them). Never logged. Over plain `http://` to a non-loopback address, the agent logs a startup warning |
 | `SPRING_BOOT_SCRAPE_INTERVAL` | `15` | Seconds between scrape rounds, 10 to 3600 |
@@ -241,6 +251,8 @@ See [Spring Boot applications](#spring-boot-applications) for what each applicat
 | Variable | Default | Description |
 |---|---|---|
 | `HUB_LISTEN` | `0.0.0.0:9091` | Address and port the hub serves its API, push endpoint and dashboard on, in the same form as the agent's `SYSTEM_AGENT_LISTEN` (IPv4/IPv6 and port-0 notes included). Parsed before anything else: an invalid or non-UTF-8 value makes the hub refuse to start, naming the variable, never the value, before any file is created. Agents' `PUSH_TO` must use its port |
+| `HUB_MAIL_DIR` | *(none)* | Maildir (with `new/` and `cur/`) the hub reads mail reports from (RFC 0017). Set with `HUB_MAIL_KEY` or not at all; a directory that isn't a Maildir refuses startup |
+| `HUB_MAIL_KEY` | *(none)* | Mail master key: 32 bytes, base64 (`head -c 32 /dev/urandom \| base64`). Each system's key is derived from it by `system-hub mail-key <system id>`. Never logged |
 | `HUB_PUSH_TOKEN` | *(none)* | Shared secret agents must provide on push connect. Read once at startup; unset or empty disables push auth (the hub logs a warning); a value that isn't valid UTF-8 makes the hub refuse to start |
 | `HUB_STATIC_DIR` | `static` | Directory the dashboard is served from. Unset or empty means `static` under the working directory, unchecked. A set value must be a directory the hub can search (read permission alone is not enough), or the hub refuses to start. The container image sets `/usr/share/system-hub/static` |
 
@@ -323,6 +335,7 @@ When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` m
 | `invalid system_id` | the token is valid (or not required) but `system_id` is empty, longer than 255 bytes, or `.` / `..` |
 | `handshake timeout` | no first message arrived within 10 s of the upgrade |
 | `registry unavailable` | the hub couldn't check or register the system id (a database error, or a registration that panicked). A known id's row is never replaced |
+| `transport mismatch` | the system id belongs to a mail system (RFC 0017): delete it on the hub before moving the agent to push |
 
 The agent retries after 5 s, as for any `auth_error`.
 
@@ -466,6 +479,44 @@ curl -X POST http://hub:9091/api/systems \
   -H 'Content-Type: application/json' \
   -d '{"name":"web-01","url":"http://10.0.1.5:9090","token":"agent-secret","poll_interval_secs":10}'
 ```
+
+### Mail transport (SMTP)
+
+For hosts that can reach neither the hub nor the internet, only their network's SMTP relay
+(RFC 0017). The agent mails one sealed report every `MAIL_INTERVAL` (and one at once when an
+alert incident starts, at most one a minute); the hub reads the reports that reach its mailbox
+from a Maildir, which an MTA you already run delivers into (postfix local delivery, or
+fetchmail/getmail from an IMAP or POP3 mailbox). The hub opens no new port.
+
+```sh
+# Hub: a master key, and a Maildir an MTA delivers into
+export HUB_MAIL_KEY=$(head -c 32 /dev/urandom | base64)
+HUB_MAIL_DIR=/var/mail/system-hub ./system-hub
+
+# For each mailed system: derive its key from its system id (the agent logs it at startup)
+HUB_MAIL_KEY=… ./system-hub mail-key web-01
+
+# Agent, inside the isolated network
+MAIL_TO=system-hub@example.org MAIL_RELAY=smtp.internal:25 MAIL_KEY=<derived key> ./system-agent
+```
+
+- **Sealed end to end.** Each report is MessagePack encrypted and authenticated with
+  XChaCha20-Poly1305 under the system's own key (HKDF-SHA256 of the master key and the system
+  id), so relays can't read or alter it, and a host's key can only speak for that host. The
+  hub trusts no mail header.
+- **What a report carries:** a sample every `MAIL_SAMPLE_INTERVAL` (CPU, memory, swap, load,
+  uptime, disks; no processes), every alert incident active since the previous report, and
+  the latest scrape round.
+- **On the hub:** every message in `new/` is deleted once handled, accepted or refused (at
+  most 256 per 10 s scan, 1 MiB each). Duplicates and replays are refused by their report id;
+  reports older than 7 days, or more than 5 minutes ahead of the hub's clock, are refused. A
+  report delivered late adds its history but doesn't change the system's status. A mail system
+  is marked offline (`mail overdue`) once 3 intervals and 15 minutes pass without a report.
+- **Latency:** minutes, not seconds; this mode is for systems that otherwise wouldn't be seen.
+- **Moving an agent between push and mail:** stop the old transport on the agent, let the
+  mailbox drain, delete the system on the hub, then start the agent with the new transport.
+- **Rolling back the hub** to a version without mail: disable the mail systems first, or the
+  older hub polls their `mail://` URL; re-enable them after upgrading again.
 
 ### Spring Boot applications
 
