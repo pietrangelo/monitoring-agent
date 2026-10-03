@@ -1,6 +1,8 @@
 # RFC 0016: The Current Push Connection, and the Agent's Id Computed Once
 
 - Status: Implemented
+- Amended by RFC 0008 (Draft, ships with the redb release): §2 and §4 gain generation-fenced
+  currency and a sweep grace counted from registration; this RFC's text describes the SQLite hub.
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-29 (revised the same day for two `rfc-adversary` passes; a third pass's findings are open; see Review)
 - Affects: `system-hub` (a push connection's end, a disconnection sweep, the poller), and

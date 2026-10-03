@@ -136,17 +136,20 @@ adapter only feeds it.
    `Register` writes the new `systems/<key>` record, the incremented `meta/hub/push_systems`
    and the incremented `meta/hub/generation`, committed together (`Registered { generation
    }`); `RegistryFull`, or an id registered meanwhile (`AlreadyRegistered`, `Reserved`), writes
-   nothing. **An `f` that writes nothing forces no commit**, but it is answered **after the
-   commit that holds the transaction it read**, as a `Batched` one is (0010 §6), because `f`
-   reads earlier `f`s' uncommitted writes: an `AlreadyRegistered` read from another handshake's
-   uncommitted `Register` must not be accepted if that commit then fails. It is answered at once
-   only when the open transaction held no write when it ran.
+   nothing. **An `f` that writes nothing forces no commit.** When it is answered depends on
+   what it answers (0010 §6, `Answer::AfterCommit` or `Answer::AtOnce`): an **accepting**
+   outcome, `AlreadyRegistered` decided here, may rest on another handshake's uncommitted
+   `Register`, so it is answered after the commit that holds the transaction it read; a
+   **refusal** (`RegistryFull`, `Reserved`) is answered at once, since one decided on state that
+   then fails to commit costs only the agent's 5 s retry. So refusals never park a blocking-pool
+   thread for a commit interval, and a flood of new-id handshakes over the limit can't exhaust
+   the pool.
 
 - **The limit is exact.** redb has one writer, and 0010 runs every transaction on one thread, so
   two handshakes racing for the last slot are serialised inside step 2, and the second sees the
   incremented count. An id racing itself gets `AlreadyRegistered`, answered only once the
-  registration it read has committed; if that commit fails (`ENOSPC`, 0010 §6), both answers are
-  `registry unavailable`. A mail scan or a delete
+  registration it read has committed; if that commit fails, the store fails stop (0010 §6) and
+  both answers are `registry unavailable`. A mail scan or a delete
   committing between step 1 and step 2 is seen by step 2.
 - **Cost.** A fleet reconnecting after a hub restart costs one MVCC read per handshake. Only new
   ids reach the writer, and only `Register` commits: durable transactions that arrive while a
@@ -158,19 +161,28 @@ adapter only feeds it.
   never across a store call. RFC 0016 held it across registration because the SQLite mutex
   serialised every store anyway; on redb a registration waits for a commit, and holding the
   presence lock through it would stall every connection's frame claims. RFC 0010 §9's lock order
-  is amended to match. Accept takes currency when no live current connection exists, and
+  is amended to match: **the presence lock comes before the Registry's read lock**; `claim`, the
+  end and the sweep read the Registry's current generation while holding the presence lock, so
+  the check and the act are one step; the commit hook takes the Registry's write lock and never
+  the presence lock. Accept takes currency when no live current connection exists, and
   otherwise a snapshot claim moves it (RFC 0016 §2).
 - **Presence carries the generation** (a change to RFC 0016's implemented presence, in this
   release). A delete and re-registration between the read and accept, or later, must fence
   everything the stale connection does, not only its appends: `ConnectionLease` and the
-  presence entry carry the generation the connection was accepted for; `claim` and the end
-  (`end_connection`) act only when that generation is the Registry's current one for the id;
-  the offline write passes it to `LiveStatus`, which ignores another generation (0010 §10); and
-  the live-metrics entry stores the generation it was filled for, so eviction by a stale end
-  compares it and evicts nothing. A connection whose append answered `SystemGone` ends with no
-  side effect.
+  presence entry carry the generation the connection was accepted for; the pure
+  `PushPresence::claim` and `end` take the Registry's `current: Option<Generation>` for the id
+  and act only when it equals the connection's; the offline write passes the generation to
+  `LiveStatus`, which ignores another (0010 §10). **The live-metrics entry stores the generation
+  it was filled for**: the fill inserts only while the Registry's current generation equals the
+  frame's, read under the live-metrics write lock, and eviction compares it, so a fill racing a
+  delete can't leave an orphan and a stale end evicts nothing. The delete evicts after its
+  commit hook. **An end always removes its own presence entry** when its connection number
+  matches, whatever the generation; only its side effects (the offline write, the eviction) are
+  generation-gated, so a deleted id leaves no dead entry. A connection whose append answered
+  `SystemGone` ends with no side effect beyond that.
 - **The disconnection sweep's grace** (RFC 0016 §4, 120 s from the store's open) counts, for a
-  system registered after open, from its registration, which the commit hook records in memory.
+  system registered after open, from its registration, which the commit hook records in the
+  Registry's `System` (an in-memory `registered_at: Instant`, gone with the system on delete).
   So a new push system can't be marked offline in the moment between its registration's commit
   and its accept.
 - RFC 0011's delete transaction decrements `meta/hub/push_systems` when it deletes a push system.
@@ -213,7 +225,9 @@ Logging (A09):
   per handshake, with the id (`push/mod.rs`), which a store outage under a retrying fleet would
   turn into hundreds of lines a second. `RegistryFailure { Database(rusqlite::Error), Panicked
   }` becomes `RegistryFailure { Store(StoreError), Panicked }`, `Panicked` from a `JoinError`
-  at runtime shutdown;
+  (a panic in the registration unit's own code, or runtime shutdown, §3). `on_blocking_pool`'s
+  per-call `error!` with the id is routed, for registration, through the same hourly id-free
+  line;
 - `RegistryFull` and `registry unavailable` refusals never log the id. RFC 0012 §3's hourly
   `transport mismatch` line, per id, is the one per-id refusal line, and it is rate-limited;
 - each refusal is counted in `/api/storage` (`push_registry: {limit, count, refused_full,
@@ -319,7 +333,13 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     `1,000`, `18446744073709551616` and non-UTF-8, each with its outcome;
   - `admits` below the limit, at it, and above it;
   - `decide_push_registration` as a table over `Held { Push | Poll | Mail }` and `Absent` ×
-    {room, exactly full}, each with its `Registration`.
+    {room, exactly full}, each with its `Registration`;
+  - `PushPresence::claim` and `end` as tables over {current generation equal, stale, id absent}
+    × {connection number current, not current};
+  - the sweep's grace as a table over {registered before open, after open} × {119 s, 120 s}.
+- **Call-site follow-through** (released with authority author, quoted in the change summary):
+  the `presence.rs`, `push/sweep.rs` and `push/ingest.rs` tests in `HEAD` whose calls gain the
+  generation argument keep every expectation.
 - **Registration** (a temporary store, with a **writer gate**: a test seam in `StoreOptions`
   that holds the writer before it runs the next submitted transaction until the test releases
   it, so two transactions are ordered deterministically):
@@ -345,9 +365,16 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - push to push: connection A (generation 1) still open while the id is deleted and B
     registers generation 2 and claims; A's last frame claims nothing, and A's end neither marks
     B offline nor evicts B's live metrics;
+  - **A ends idle while B (generation 2) is accepted but hasn't claimed**, so A's number is
+    still current: A's end removes its entry and marks nothing offline and evicts nothing;
+  - a delete between a frame's append and its live-metrics fill leaves no live-metrics entry;
+  - a deleted id with an open connection leaves no presence entry after that connection ends;
+  - a refusal (`RegistryFull`, `Reserved` from step 2) is answered while a `Batched` write is
+    pending, before the next commit; an `AlreadyRegistered` from step 2 waits for it;
   - two handshakes for one new id behind the gate with an injected commit failure: neither is
     accepted, both answer `registry unavailable`;
-  - a sweep pass between a new id's registration commit and its accept doesn't mark it offline;
+  - a sweep pass with `up_for` past `RECONNECT_GRACE`, between a new id's registration commit
+    and its accept, doesn't mark it offline;
   - a handshake holds no presence lock across a store call (a test that blocks the writer gate
     while another connection's frame claim completes);
   - deleting a push system decrements the counter; a counter written wrong through a test seam
@@ -376,6 +403,8 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   derives, uncounted by the push limit").
 - § Components (`system-hub`): the presence lock is no longer held across registration; leases,
   presence entries and live-metrics entries carry the generation.
+- `rfcs/0016-current-push-connection.md` (Implemented) gains a header note: "§2 and §4 amended by
+  RFC 0008 (generation-fenced currency, sweep grace from registration)".
 - § Domain model, glossary: **push handshake**'s refusals become rejection, timeout, registry
   unavailable, registry full and transport mismatch; **current connection** fenced by
   generation.
@@ -483,8 +512,23 @@ own id's reports).
 Came closest and survived: a flood of fresh-id handshakes with the token unset through the
 shared writer channel (two point reads per `f`, no commit, bounded channel back-pressure).
 
-**Still open**: nothing CONFIRMED. The generation in presence changes RFC 0016's implemented
-design, so a third pass reviews it before the RFC is accepted.
+`rfc-adversary`, third pass (the second pass's resolutions). Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| waiting for the commit on every write-free outcome parked a blocking thread per refused handshake: a new-id flood could exhaust the pool | CONFIRMED | only an accepting outcome waits; refusals are answered at once (§3; 0010 §6) |
+| the live-metrics fill wasn't generation-checked: a fill racing a delete left an orphan a later mail system inherited | CONFIRMED | the fill checks the current generation under the live-metrics lock; the delete evicts after its hook (§3) |
+| the generation check and act weren't atomic; a registration-time map in presence could deadlock with the hook | CONFIRMED / PLAUSIBLE | presence before Registry; checks under the presence lock; the hook never takes it; `registered_at` in the Registry's `System` (§3; 0010 §9) |
+| 0010 §10 and RFC 0016 still state the old grace and currency rules | CONFIRMED | 0010 §10 amended; a header note in 0016 (Impact) |
+| test rows could pass without the behaviour; follow-through releases unnamed | PLAUSIBLE | `up_for` past grace; the idle-end row; pure tables; releases named (Testing plan) |
+| `on_blocking_pool` still logged the id per panic; §3 and §4 disagreed on `Panicked` | CONFIRMED (low) | routed through the hourly id-free line; §4 matches §3 |
+| an end gated by generation left dead presence entries | PLAUSIBLE (low) | an end always removes its own entry; only side effects are gated (§3) |
+
+Came closest and survived: generation-gating the end (today's connection-number check and
+`LiveStatus`'s generation filter already cover every case but the unclaimed-B window, now a row).
+
+**Still open**: nothing CONFIRMED. Finding 1 changed when outcomes are answered, so one more pass
+reviews it before the RFC is accepted.
 
 **Split into RFC 0016 (2026-09-29).** §5 and §7 moved to RFC 0016, with the findings above
 that concerned them (the stale connection, the offline backstop, the agent's id). RFC 0016 also

@@ -384,11 +384,7 @@ system clock, `receipt::recency`, `mail_status`, which 0010 §10 moves onto `rec
 ```rust
 /// Persistence struct: a leading version byte, then postcard.
 struct MailReceipt { generation: Generation, created_at: u64, interval_secs: u32, received_at: u64 }
-struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, interval_secs: u32,
-                    clock_lead: ClockLead }
-/// RFC 0010 §2's rebase: the largest `created_at − received_at` (≥ 0) seen within the receipt
-/// window, with the `received_at` of that maximum so it can leave the window.
-struct ClockLead { secs: u32, seen_at: u64 }
+struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, interval_secs: u32 }
 ```
 
 - **Current and retired.** A receipt is *current* while its generation is the system's, and
@@ -410,8 +406,10 @@ struct ClockLead { secs: u32, seen_at: u64 }
      can prune between it and this transaction; refusing here on the same clock the prune uses
      means a pruned receipt's replay can never pass as new;
   then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
-  insert the receipt; stage the snapshots' points (`CatalogTxn::append`, 0010 §9, rebased per
-  0010 §2); the alert records (§5); and for a `Newest` report, `mail_newest/<key>`.
+  insert the receipt; the alert records (§5); and for a `Newest` report, `mail_newest/<key>`
+  and, **if it is the system's newest `Newest` report of the scan** (by `created_at`), its
+  newest snapshot's points, staged at hub now (`CatalogTxn::append`, 0010 §2 *Mail points*), so
+  two reports of one system in a scan never stamp the same second.
   A skipped report writes and stages nothing. **After the commit**, the live metrics, the info
   fill and the round (`append_round`) run once per system, for its newest `Newest` report of the
   scan by `created_at`, so an older report later in the scan never replaces what is shown. Every message of the scan is deleted after the
@@ -425,10 +423,12 @@ struct ClockLead { secs: u32, seen_at: u64 }
   stale, never new. Retired ******** are pruned by the window alone.
 - **The overdue sweep** reads `mail_newest` through `read_catalog` (MVCC: it never waits for
   the writer) on the blocking pool, and calls 0017's `mail_status` on the receipt's
-  `received_at` (0010 §10); 0010 §10 writes the `LiveStatus`, **only while `mail_newest` still
-  names the receipt the sweep read** (a compare-and-set, as 0017's `mark_mail_overdue` does
-  today, keyed on the receipt rather than on `last_contact`, which application rounds also
-  move): a report committed after the read keeps the system online. `MailNewest` therefore carries
+  `received_at` (0010 §10). The mark is a write-free transaction that re-reads `mail_newest`
+  inside `f` and reports an overdue mark only while it still names the receipt the sweep read;
+  the commit hook applies it to `LiveStatus` in commit order with the scans (0010 §10). So a
+  report committed after the read keeps the system online, as 0017's single-statement
+  `mark_mail_overdue` guarantees today (a compare-and-set keyed on the receipt, not on
+  `last_contact`, which application rounds also move). `MailNewest` therefore carries
   `received_at` too. A mail record with no `mail_newest` entry is overdue, as 0017 §7 says.
 - **No sealed credential.** RFC 0017 offered this RFC's sealed tokens as an alternative to its
   derived mail keys. Not taken: a derived key stores nothing per system and is already bound to
@@ -765,6 +765,13 @@ above; RFC 0012's fourth and fifth passes listed what this RFC must carry for th
 Came closest and survived: a message that fails every scan, and a delete sharing a group commit
 with a scan (store errors after a write stop the hub, and messages are deleted only after the
 commit, so committed reports return as duplicates).
+
+**Simplification (owner's decision, 2026-10-03).** After RFC 0010's third pass, a mail report
+stores only its newest snapshot's points, at hub time (0010 §2 *Mail points*). Here: `MailNewest`
+loses the clock lead; points are staged only for a system's newest `Newest` report of a scan; the
+overdue mark is a transaction applied by the commit hook (0010 §10). A second pass on this
+amendment ran before the simplification and its report never reached the session; the next pass
+covers both.
 
 **Still open**: whether one timer per polled system scales to 10,000 polled systems (it is one
 tokio timer each, which is cheap, but the performance test checks it).

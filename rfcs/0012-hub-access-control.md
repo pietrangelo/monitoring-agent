@@ -139,8 +139,10 @@ global policy, every override and each pending shortening), and `GET /api/storag
   **After a restart, `since` is the system's recovered last contact, for every source**: 0010
   §10 marks polled systems `Offline { since: last_contact }` at open, and the release requires
   the first marking after open by the push sweep (RFC 0016's grace) and by the mail overdue
-  sweep (RFC 0017 §7) to do the same (the open time when the system has never been heard from),
-  not `since: now`. Otherwise every hub restart would reset a push or mail system's offline age.
+  sweep (RFC 0017 §7) to use when the system went silent, not `since: now`: its last contact
+  for a push system, and the moment it became overdue (`received_at` + 3 intervals + 15
+  minutes) for a mail system, as RFC 0010 §10's `offline_since` states (the open time when the
+  system has never been heard from). Otherwise every hub restart would reset a push or mail system's offline age.
   **That last contact is on hub time for every source.** Push and poll already are (0010 §10,
   0016 §8). A mail system's *last seen* is its newest report's agent-stamped `created_at` (0017
   §7), which can lag the hub by up to the 7-day receipt window; used as `since`, a reporting
