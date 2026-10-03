@@ -20,6 +20,7 @@ mod auth;
 mod collectors;
 mod environment;
 mod listen;
+mod mail;
 mod models;
 mod push;
 mod routes;
