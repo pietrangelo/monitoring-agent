@@ -29,7 +29,7 @@ pub fn now_iso() -> String {
     unix_to_iso8601(unix_now())
 }
 
-fn unix_to_iso8601(secs: u64) -> String {
+pub fn unix_to_iso8601(secs: u64) -> String {
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;

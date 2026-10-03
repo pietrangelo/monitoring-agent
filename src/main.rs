@@ -20,6 +20,7 @@ mod auth;
 mod collectors;
 mod environment;
 mod listen;
+mod mail;
 mod models;
 mod push;
 mod routes;
@@ -34,6 +35,7 @@ use collectors::SnapshotReceiver;
 use collectors::sampler::SysinfoSource;
 use environment::cgroup::MonitoredCgroup;
 use listen::ListenAddress;
+use push::identity::{self, IdFilePath};
 use snapshot::SnapshotSeq;
 use std::fmt;
 use std::net::SocketAddr;
@@ -49,6 +51,10 @@ enum StartupError {
     Config(applications::config::ApplicationsConfigError),
     Listen(listen::ListenAddressError),
     PushId(push::identity::AgentIdError),
+    Mail(mail::config::MailConfigError),
+    /// Both `PUSH_TO` and `MAIL_TO`: the hub would store each sample twice (RFC 0017 §5).
+    PushAndMail,
+    MailRelayCa(std::io::Error),
     Runtime(std::io::Error),
     Scraper(applications::scraper::ScraperError),
     Collector(tokio::task::JoinError),
@@ -61,8 +67,10 @@ impl StartupError {
     /// configuration and for nothing else, 1 for any other failure.
     fn exit_code(&self) -> u8 {
         match self {
-            Self::Config(_) | Self::Listen(_) => 78,
+            Self::Config(_) | Self::Listen(_) | Self::Mail(_) | Self::PushAndMail => 78,
+            Self::PushId(err) if err.is_refused_value() => 78,
             Self::PushId(_)
+            | Self::MailRelayCa(_)
             | Self::Runtime(_)
             | Self::Scraper(_)
             | Self::Collector(_)
@@ -78,6 +86,16 @@ impl fmt::Display for StartupError {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
             Self::Listen(err) => write!(f, "{err}; refusing to start"),
             Self::PushId(err) => write!(f, "{err}; refusing to start"),
+            Self::Mail(err) => write!(f, "{err}; refusing to start"),
+            Self::PushAndMail => f.write_str(
+                "PUSH_TO and MAIL_TO are both set; an agent uses one transport; refusing to start",
+            ),
+            Self::MailRelayCa(err) => {
+                write!(
+                    f,
+                    "MAIL_RELAY_CA couldn't be read: {err}; refusing to start"
+                )
+            }
             Self::Runtime(err) => write!(f, "Failed to start the async runtime: {err}"),
             Self::Scraper(err) => write!(f, "Failed to start scraping applications: {err}"),
             Self::Collector(err) => write!(f, "Failed to read the system: {err}"),
@@ -105,12 +123,99 @@ fn start() -> Result<(), StartupError> {
         ApplicationsConfig::parse(|key| std::env::var(key)).map_err(StartupError::Config)?;
     let listen = ListenAddress::from_env(std::env::var(ListenAddress::VARIABLE))
         .map_err(StartupError::Listen)?;
+    let uplink = uplink()?;
     announce(&applications);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    runtime.block_on(run(applications, listen))
+    runtime.block_on(run(applications, listen, uplink))
+}
+
+/// How the agent reaches a hub, if at all: push or mail, never both (RFC 0017 §5).
+enum Uplink {
+    None,
+    Push(PushTarget),
+    Mail(Box<mail::client::MailTarget>),
+}
+
+/// `PUSH_TO` and the `MAIL_*` variables read once, and the system id resolved once, before
+/// the runtime exists, so its file reads and writes block nothing (RFC 0016 §6).
+fn uplink() -> Result<Uplink, StartupError> {
+    let push_to = std::env::var("PUSH_TO").ok();
+    let mail =
+        mail::config::MailConfig::parse(|key| std::env::var(key)).map_err(StartupError::Mail)?;
+    match (push_to, mail) {
+        (None, mail::config::MailConfig::Off) => Ok(Uplink::None),
+        (Some(_), mail::config::MailConfig::On(_)) => Err(StartupError::PushAndMail),
+        (Some(hub_url), mail::config::MailConfig::Off) => Ok(Uplink::Push(PushTarget {
+            hub_url,
+            system_id: resolve_system_id()?,
+        })),
+        (None, mail::config::MailConfig::On(settings)) => {
+            mail_target(*settings, resolve_system_id()?)
+                .map(|target| Uplink::Mail(Box::new(target)))
+        }
+    }
+}
+
+/// The system id, from `SYSTEM_AGENT_ID_FILE` or the sources after it.
+fn resolve_system_id() -> Result<identity::AgentId, StartupError> {
+    let id_file = IdFilePath::from_env(std::env::var_os(identity::ID_FILE_VARIABLE))
+        .map_err(StartupError::PushId)?;
+    let resolved = identity::resolve_push_id(id_file.as_ref(), &identity::IdSources::system())
+        .map_err(StartupError::PushId)?;
+    announce_system_id(resolved.resolution);
+    Ok(resolved.id)
+}
+
+/// The mail client's target: the relay's CA read, and the sender, `MAIL_FROM` or
+/// `system-agent@<host name>`.
+fn mail_target(
+    settings: mail::config::MailSettings,
+    system_id: identity::AgentId,
+) -> Result<mail::client::MailTarget, StartupError> {
+    let relay_ca = settings
+        .relay_ca
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()
+        .map_err(StartupError::MailRelayCa)?;
+    let from = settings.from.clone().unwrap_or_else(default_sender);
+    tracing::info!("Mail system id: {:?}", system_id.as_str());
+    Ok(mail::client::MailTarget {
+        settings,
+        system_id,
+        relay_ca,
+        from,
+    })
+}
+
+/// `system-agent@<host name>`, or `system-agent@localhost` when the host name isn't a domain.
+fn default_sender() -> lettre::Address {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    lettre::Address::new("system-agent", host.trim())
+        .or_else(|_| lettre::Address::new("system-agent", "localhost"))
+        .unwrap_or_else(|_| unreachable!("system-agent@localhost is an address"))
+}
+
+/// The hub to push to, and the id to present.
+struct PushTarget {
+    hub_url: String,
+    system_id: identity::AgentId,
+}
+
+/// Logs where the push system id came from, and warns when it lives for this process only.
+fn announce_system_id(resolution: identity::Resolution) {
+    use identity::{IdSource, Resolution};
+    tracing::info!("System id resolved: {resolution:?}");
+    if resolution == Resolution::Resolved(IdSource::Random) {
+        tracing::warn!(
+            "The system id is a random UUID that lives for this process only; set {} to keep \
+             it",
+            identity::ID_FILE_VARIABLE
+        );
+    }
 }
 
 /// Logs what the applications configuration asks for, and warns about credentials that would
@@ -156,7 +261,11 @@ async fn execution_environment() -> Result<environment::ExecutionEnvironment, St
     Ok(found)
 }
 
-async fn run(applications: ApplicationsConfig, listen: ListenAddress) -> Result<(), StartupError> {
+async fn run(
+    applications: ApplicationsConfig,
+    listen: ListenAddress,
+    uplink: Uplink,
+) -> Result<(), StartupError> {
     let environment = execution_environment().await?;
     let cgroup = environment.monitored_cgroup().cloned();
     // The startup snapshot is read before anything can ask for one, so none ever waits.
@@ -195,7 +304,11 @@ async fn run(applications: ApplicationsConfig, listen: ListenAddress) -> Result<
             }
         }
     });
-    spawn_push_client(snapshots, app_state.rounds.clone());
+    match uplink {
+        Uplink::None => {}
+        Uplink::Push(push) => spawn_push_client(push, snapshots, app_state.rounds.clone()),
+        Uplink::Mail(target) => mail::client::spawn_mail_client(app_state.clone(), *target),
+    }
 
     serve(router(app_state), listen).await
 }
@@ -223,36 +336,27 @@ fn start_applications(
     Ok(app_state)
 }
 
-/// Starts the push client if `PUSH_TO` names a hub. It reconnects for the agent's lifetime,
-/// sending the scrape loop's rounds too when applications are on.
+/// Starts the push client. It reconnects for the agent's lifetime with the one id resolved at
+/// startup, sending the scrape loop's rounds too when applications are on.
 fn spawn_push_client(
+    PushTarget { hub_url, system_id }: PushTarget,
     snapshots: SnapshotReceiver,
     rounds: Option<applications::scrape_loop::RoundReceiver>,
 ) {
-    let Ok(hub_url) = std::env::var("PUSH_TO") else {
-        return;
-    };
     let token = std::env::var("PUSH_TOKEN").unwrap_or_default();
     let interval: u64 = std::env::var("PUSH_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     tokio::spawn(async move {
-        // Resolved once, off the runtime: it reads files and may shell out to `hostname`.
-        let system_id = match tokio::task::spawn_blocking(push::get_persistent_id).await {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::error!("Couldn't resolve the push system id: {err}; not pushing");
-                return;
-            }
-        };
         let mut feed = push::PushFeed {
             snapshots: push::SnapshotCursor::new(snapshots),
             rounds,
         };
         loop {
             let pushed =
-                push::run_push_client(&hub_url, &token, &system_id, interval, &mut feed).await;
+                push::run_push_client(&hub_url, &token, system_id.as_str(), interval, &mut feed)
+                    .await;
             match pushed {
                 Ok(()) => {}
                 Err(push::PushError::CollectorEnded) => {
@@ -327,6 +431,13 @@ mod tests {
                 StartupError::Listen(listen::ListenAddressError::Invalid),
                 78,
             ),
+            (
+                "a refused mail configuration",
+                StartupError::Mail(mail::config::MailConfigError::BadTls),
+                78,
+            ),
+            ("both push and mail", StartupError::PushAndMail, 78),
+            ("an unreadable relay CA", StartupError::MailRelayCa(io()), 1),
             (
                 "a relative id file",
                 StartupError::PushId(AgentIdError::NotAbsolute),

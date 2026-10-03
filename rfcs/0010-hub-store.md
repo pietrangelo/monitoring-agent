@@ -623,7 +623,9 @@ pub enum StoreError { Closed, Failed, Io(IoKind) }
   `live_applications`, an admission lock) is ever held across a store call; the commit hook
   takes the Registry's write lock on the writer thread, inside no store lock; a head shard lock
   is a leaf. RFC 0009's admission lock is taken around an `append` call, and no store lock is
-  held while taking it.
+  held while taking it. RFC 0016's presence lock comes first: it may be held while taking
+  `live_status` or calling the store (a connection's end writes `Offline` under it), and is
+  never taken while holding any of them.
 
 **`/api/storage`** is owned by this RFC. It answers `StoreStats` as JSON: allocated bytes per
 tier and in total, the file size and reclaimable bytes, the cap and its source, the volume size
@@ -657,16 +659,17 @@ tier names, and is an open read like the rest of the hub API.
       liveness: Liveness,
       last_contact: Option<u64>,       // hub time of the last successful frame or poll
       last_error: Option<String>,      // ≤ 256 bytes
-      connection: Option<u64>,         // RFC 0016's connection number, push systems only
   }
   pub enum Liveness { Online, Offline { since: u64 }, Unknown }
   ```
 
   - `Liveness` is one enum, so "online with an offline time" can't be represented.
+  - Which push connection is current is **not** flushed: it means nothing across processes.
+    It stays in RFC 0016's in-memory `PushPresence`, with each entry's liveness (its lease).
   - **Set only by contact and by transitions.** A successful frame or poll sets `Online` and
     `last_contact`. A failed poll, the end of the current push connection (RFC 0016 §2), and
-    RFC 0016's disconnection sweep (a push system with no current connection, once the store
-    has been open 120 s) set `Offline { since: now }` unless already offline. `last_contact`
+    RFC 0016's disconnection sweep (whatever RFC 0016 §4's sweep table marks, counting the
+    120 s from the store's open; a new push id starts `Unknown`, RFC 0016 §2) set `Offline { since: now }` unless already offline. `last_contact`
     is a display value, not a liveness rule: a connection that pushes every 300 s is online. Shutdown
     touches nothing.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.

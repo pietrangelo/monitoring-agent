@@ -21,10 +21,12 @@ mod collector;
 mod db;
 mod hourly_warning;
 mod listen;
+mod mail_intake;
 mod models;
 mod presence;
 mod push;
 mod registry;
+mod registry_fill;
 mod retention;
 mod round_intake;
 mod routes;
@@ -48,6 +50,8 @@ enum StartupError {
     Config(push::PushAuthError),
     Listen(listen::ListenAddressError),
     StaticDir(StaticDirError),
+    Mail(mail_intake::config::MailIntakeConfigError),
+    Maildir(std::io::Error),
     Database(rusqlite::Error),
     FirstSummary(routes::sse::SummaryFailure),
     Bind(SocketAddr, std::io::Error),
@@ -60,6 +64,12 @@ impl std::fmt::Display for StartupError {
             Self::Config(err) => write!(f, "{err}; refusing to start"),
             Self::Listen(err) => write!(f, "{err}; refusing to start"),
             Self::StaticDir(err) => write!(f, "{err}; refusing to start"),
+            Self::Mail(err) => write!(f, "{err}; refusing to start"),
+            Self::Maildir(err) => write!(
+                f,
+                "{} isn't a Maildir the hub can read ({err}); refusing to start",
+                mail_intake::config::DIR_VARIABLE
+            ),
             Self::Database(err) => write!(f, "Failed to open database system-hub.db: {err}"),
             Self::FirstSummary(failure) => write!(f, "{failure}; refusing to start"),
             Self::Bind(addr, err) => write!(f, "Failed to bind {addr}: {err}"),
@@ -71,12 +81,55 @@ impl std::fmt::Display for StartupError {
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
+    use mail_intake::command::{self, Command};
+    match command::parse_args(std::env::args_os().skip(1)) {
+        Ok(Command::Serve) => {}
+        Ok(Command::MailKey(system_id)) => return print_mail_key(&system_id),
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::from(err.exit_code());
+        }
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("{err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `system-hub mail-key <system id>`: prints the system's mail key on stdout and touches no
+/// database (RFC 0017 §3).
+fn print_mail_key(system_id: &models::SystemId) -> ExitCode {
+    use std::io::Write;
+    let key = std::env::var(mail_intake::config::KEY_VARIABLE);
+    match mail_intake::command::mail_key(system_id, key) {
+        Ok(key) => match writeln!(std::io::stdout(), "{key}") {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        },
+        Err(err) => {
+            tracing::error!("{err}");
+            ExitCode::from(err.exit_code())
+        }
+    }
+}
+
+/// Turns every `Online` push system `Unknown` before anything reads the registry (RFC 0016
+/// §4): the previous process wrote that status, and no connection's end ran since. A failure
+/// is logged, and the hub serves anyway.
+async fn reset_push_status(db: &Arc<db::Database>) {
+    let db = Arc::clone(db);
+    let reset = tokio::task::spawn_blocking(move || {
+        use models::SystemStatus::{Online, Unknown};
+        db.reset_status(registry::PUSH_URL, &Online, &Unknown)
+    })
+    .await;
+    match reset {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => tracing::warn!("Couldn't reset push systems' status at startup: {err}"),
+        Err(err) => tracing::warn!("Resetting push systems' status at startup failed: {err}"),
     }
 }
 
@@ -90,9 +143,19 @@ async fn run() -> Result<(), StartupError> {
         .check()
         .await
         .map_err(StartupError::StaticDir)?;
+    let mail = mail_intake::config::MailIntakeConfig::from_env(
+        std::env::var_os(mail_intake::config::DIR_VARIABLE),
+        std::env::var(mail_intake::config::KEY_VARIABLE),
+    )
+    .map_err(StartupError::Mail)?;
+    if let mail_intake::config::MailIntakeConfig::On { maildir, .. } = &mail {
+        mail_intake::check_maildir(maildir).map_err(StartupError::Maildir)?;
+    }
 
     let db = Arc::new(db::Database::new("system-hub.db").map_err(StartupError::Database)?);
     tracing::info!("📁 Database initialized: system-hub.db");
+
+    reset_push_status(&db).await;
 
     // The first summary reads the database, so the state is built on the blocking pool.
     let app_state = tokio::task::spawn_blocking(move || state::AppState::new(db))
@@ -104,6 +167,8 @@ async fn run() -> Result<(), StartupError> {
     collector::start_collectors(app_state.clone());
     retention::start(app_state.clone());
     routes::sse::start_publisher(app_state.clone());
+    push::start_disconnection_sweep(app_state.clone(), std::time::Instant::now());
+    mail_intake::start(app_state.clone(), mail);
 
     let app = app(app_state, push_auth, &static_dir);
 

@@ -628,6 +628,26 @@ fn is_leap(y: i64) -> bool {
 pub mod fixtures {
     use super::*;
 
+    /// An active CPU warning, as the alert endpoints report one.
+    pub fn active_alert() -> ActiveAlert {
+        ActiveAlert {
+            id: "run-1".into(),
+            rule: AlertRule {
+                metric: AlertMetric::Cpu,
+                operator: AlertOperator::Gt,
+                threshold: 90.0,
+                severity: AlertSeverity::Warning,
+                duration_secs: 0,
+                cooldown_secs: 0,
+                mount_point: None,
+                enabled: true,
+            },
+            current_value: 95.0,
+            fired_at: "2023-11-14T22:18:20Z".into(),
+            message: "CPU high".into(),
+        }
+    }
+
     /// A measured percentage.
     pub fn measured(percent: f32) -> Reading<Percent> {
         Reading::Measured(Percent::saturating(percent).expect("a percentage, not NaN"))

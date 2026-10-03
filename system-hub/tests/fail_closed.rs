@@ -691,3 +691,116 @@ async fn wait_for(client: &reqwest::Client, url: &str, hub: &mut tokio::process:
     }
     panic!("the hub did not answer {url} within 10 s");
 }
+
+/// RFC 0016 §4: `main` resets push systems' status before it serves. A push system the
+/// previous process left `online` reads `unknown` from the first request on.
+#[tokio::test]
+async fn a_push_system_left_online_reads_unknown_once_the_hub_serves_again() {
+    let dir = tempfile::tempdir().unwrap();
+    // A first run creates the schema, then stops.
+    let mut first = hub_listening_at(dir.path(), "127.0.0.1:0");
+    bound_address(&mut first)
+        .await
+        .expect("the first run serves");
+    first.kill().await.unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("system-hub.db")).unwrap();
+    db.execute(
+        "INSERT INTO systems (id, name, url, token, status, last_seen, poll_interval_secs, enabled)
+         VALUES ('sys-left', 'sys-left', 'push://', '', 'online', '1h', 10, 1)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut hub = hub_listening_at(dir.path(), "127.0.0.1:0");
+    let addr = bound_address(&mut hub).await.expect("the hub serves again");
+    let body = wait_for(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/api/systems/sys-left"),
+        &mut hub,
+    )
+    .await;
+
+    let system: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(system["status"], "unknown", "{body}");
+    assert_eq!(system["last_seen"], "1h", "last seen kept: {body}");
+}
+
+/// RFC 0017 §6: half a mail configuration refuses startup before the database is created,
+/// naming the variables, never a value.
+#[tokio::test]
+async fn half_a_mail_configuration_refuses_startup_before_touching_the_database() {
+    let maildir = tempfile::tempdir().unwrap();
+    let cases: [(&str, Vec<(&str, &OsStr)>); 3] = [
+        (
+            "a dir without a key",
+            vec![("HUB_MAIL_DIR", maildir.path().as_os_str())],
+        ),
+        (
+            "a key without a dir",
+            vec![("HUB_MAIL_KEY", OsStr::new("bGVhay1tYXJrZXI="))],
+        ),
+        (
+            "a dir that isn't a Maildir",
+            vec![
+                ("HUB_MAIL_DIR", maildir.path().as_os_str()),
+                (
+                    "HUB_MAIL_KEY",
+                    OsStr::new("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="),
+                ),
+            ],
+        ),
+    ];
+    for (name, vars) in cases {
+        let dir = tempfile::tempdir().unwrap();
+
+        let run = run_hub_with(dir.path(), &vars).await;
+
+        assert!(
+            run.exited && !run.success,
+            "{name}: refused: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("HUB_MAIL_"),
+            "{name}: names the variable: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("bGVhay1tYXJrZXI"),
+            "{name}: never the key"
+        );
+        assert!(
+            !dir.path().join("system-hub.db").exists(),
+            "{name}: no database created"
+        );
+    }
+}
+
+/// RFC 0017 §3: `system-hub mail-key <id>` prints the id's key, derived from `HUB_MAIL_KEY`,
+/// and creates no database.
+#[tokio::test]
+async fn the_mail_key_command_prints_the_derived_key_and_touches_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_system-hub"))
+        .args(["mail-key", "web-01"])
+        .current_dir(dir.path())
+        .env(
+            "HUB_MAIL_KEY",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        )
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "K3+RuHlQ1b7woYSIjUBPpdWhGwNhkfOkRjXt3LT2ufM="
+    );
+    assert!(
+        !dir.path().join("system-hub.db").exists(),
+        "no database created"
+    );
+}

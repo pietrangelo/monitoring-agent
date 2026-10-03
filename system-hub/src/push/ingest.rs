@@ -20,11 +20,11 @@
 
 use std::time::Instant;
 
-use crate::db::SnapshotStored;
+use crate::db::{KnownUrl, Registration, SnapshotStored};
 use crate::models::{SystemId, SystemInfo, SystemStatus};
-use crate::registry::{
-    LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh, needs_system_info,
-};
+use crate::presence::{ConnectionLease, Ending, LeaseHandle};
+use crate::registry::{LastSeen, MemoryCapacity, UptimeDisplay};
+use crate::registry_fill::{ReportedInfo, fill_registry};
 use crate::snapshot::{
     LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime, SnapshotTimeOutOfRange,
 };
@@ -93,19 +93,7 @@ pub(super) struct SnapshotFrame {
     reported: ReportedSnapshot,
     time: SnapshotTime,
     last_seen: LastSeen,
-    info: PushedInfo,
-}
-
-/// What a snapshot frame reports of its system, for the registry fill.
-#[derive(Debug)]
-struct PushedInfo {
-    hostname: String,
-    os_name: String,
-    kernel: String,
-    cpu_model: String,
-    cpu_cores: usize,
-    /// `None` when the frame's capacity breaks `MemoryCapacity::reported`'s bounds.
-    memory: Option<MemoryCapacity>,
+    info: ReportedInfo,
 }
 
 impl TryFrom<PushPayload> for SnapshotFrame {
@@ -145,7 +133,7 @@ impl TryFrom<PushPayload> for SnapshotFrame {
         };
         let memory =
             MemoryCapacity::reported(Some(&memory_total_display), Some(memory_total_bytes));
-        let info = PushedInfo {
+        let info = ReportedInfo {
             hostname,
             os_name,
             kernel,
@@ -173,15 +161,45 @@ impl From<DiskItem> for ReportedDisk {
     }
 }
 
+/// Registers the id when it is new, then accepts the connection when the id is a push
+/// system's, under the presence lock (RFC 0016 §2). A polled system's id gets no lease: its
+/// connection claims nothing and its end writes nothing.
+pub(super) fn register_and_accept(
+    app: &AppState,
+    system_id: &SystemId,
+) -> Result<Admitted, rusqlite::Error> {
+    let mut presence = app.presence();
+    Ok(match register_if_new(app, system_id)? {
+        Registration::Inserted | Registration::Known(KnownUrl::Same) => {
+            Admitted::Push(presence.accept(system_id))
+        }
+        Registration::Known(KnownUrl::Other) => Admitted::Polled,
+        Registration::Known(KnownUrl::Mail) => Admitted::MailSystem,
+    })
+}
+
+/// How a registered id may push (RFC 0016 §2, RFC 0017 §6).
+pub(super) enum Admitted {
+    /// A push system's: its connection holds the lease.
+    Push(ConnectionLease),
+    /// A polled system's: accepted, with no lease.
+    Polled,
+    /// A mail system's: refused, so no push connection feeds a mail row.
+    MailSystem,
+}
+
 /// Registers a system the hub hasn't seen before, under its default name. A known id is
 /// never written, and a database that can't check or insert returns its error (RFC 0007 §4).
-pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) -> Result<(), rusqlite::Error> {
+pub(super) fn register_if_new(
+    app: &AppState,
+    system_id: &SystemId,
+) -> Result<Registration, rusqlite::Error> {
     app.db.insert_system_if_absent(&SystemInfo {
         id: system_id.as_str().to_string(),
         name: system_id.default_name(),
-        url: "push://".to_string(),
+        url: crate::registry::PUSH_URL.to_string(),
         token: String::new(),
-        status: SystemStatus::Online,
+        status: SystemStatus::Unknown,
         last_seen: String::new(),
         last_error: None,
         os: None,
@@ -201,7 +219,12 @@ pub(super) fn ingest_frame(
     app: &AppState,
     system_id: &SystemId,
     frame: SnapshotFrame,
+    lease: Option<LeaseHandle>,
 ) -> Result<SnapshotStored<LeftOutLog>, rusqlite::Error> {
+    if let Some(lease) = &lease {
+        // Claimed just before the store, outside the presence lock (RFC 0016 §2).
+        app.presence().claim(system_id, lease);
+    }
     let SnapshotFrame {
         reported,
         time,
@@ -217,54 +240,30 @@ pub(super) fn ingest_frame(
     let now = Instant::now();
     let stored = snapshot_intake::store_snapshot(app, system_id, reported, time, last_seen, now)?;
     if let SnapshotStored::Stored(_) = stored {
-        update_registry(app, system_id, &info);
+        fill_registry(app, system_id, &info, "Push");
     }
     Ok(stored)
 }
 
-/// Fills in system info while its hostname or OS is missing, refreshes its memory capacity,
-/// and replaces a default name with the frame's hostname. The status went into the store.
-fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
-    let id = system_id.as_str();
-    let sys = match app.db.get_system(id) {
-        Ok(Some(sys)) => sys,
-        Ok(None) => return,
-        Err(err) => {
-            // A row no read can map (RFC 0007 §4): its snapshot is stored, its fill skipped.
-            tracing::debug!("Push from {id:?}: skipping the registry fill: {err}");
-            return;
-        }
+/// Ends a push connection (RFC 0016 §2): only the current connection's end marks its system
+/// offline and removes its live metrics (RFC 0007 §4), under the presence lock, in one unit
+/// of blocking work. A connection without a lease (a polled system's id) writes nothing.
+pub(super) fn end_connection(app: &AppState, system_id: &SystemId, lease: Option<ConnectionLease>) {
+    let Some(lease) = lease else {
+        return;
     };
-    if needs_system_info(&sys)
-        && let Err(err) = app.db.update_system_info(
-            id,
-            Some(&info.os_name),
-            Some(&info.hostname),
-            Some(&info.kernel),
-            Some(&info.cpu_model),
-            Some(info.cpu_cores),
-        )
-    {
-        tracing::warn!("Push from {id:?}: couldn't record the system info: {err}");
-    }
-    if let Some(capacity) =
-        memory_capacity_refresh(MemoryCapacity::stored(&sys).as_ref(), info.memory.clone())
-        && let Err(err) = app.db.update_memory_capacity(id, &capacity)
-    {
-        tracing::warn!("Push from {id:?}: couldn't refresh the memory capacity: {err}");
-    }
-    if system_id.is_default_name(&sys.name)
-        && let Err(err) =
-            app.db
-                .update_system_config(id, Some(&info.hostname), None, None, None, None)
-    {
-        tracing::warn!("Push from {id:?}: couldn't rename the system to its hostname: {err}");
+    let mut presence = app.presence();
+    match presence.end(system_id, lease) {
+        Ending::Current => mark_disconnected(app, system_id),
+        Ending::NotCurrent => tracing::info!(
+            "Push connection of {:?} ended; another connection is current",
+            system_id.as_str()
+        ),
     }
 }
 
-/// Ends a push connection's hold on its system (RFC 0007 §4): marks it offline, then removes
-/// its live metrics. One unit of blocking work, so no wait separates the two.
-pub(super) fn end_connection(app: &AppState, system_id: &SystemId) {
+/// Marks a system offline, then removes its live metrics.
+fn mark_disconnected(app: &AppState, system_id: &SystemId) {
     let id = system_id.as_str();
     let offline =
         app.db
@@ -570,15 +569,19 @@ pub(super) mod tests {
         let cases = [("a registered system", true), ("a deleted system", false)];
         for (case, registered) in cases {
             let (app, _dir) = app();
+            let mut leases = Vec::new();
             for system in ["sys-ended", "sys-other"] {
-                register_if_new(&app, &id(system)).unwrap();
+                leases.push(match register_and_accept(&app, &id(system)).unwrap() {
+                    Admitted::Push(lease) => Some(lease),
+                    Admitted::Polled | Admitted::MailSystem => None,
+                });
                 plant_live_metrics(&app, system);
             }
             if !registered {
                 app.db.delete_system("sys-ended").unwrap();
             }
 
-            end_connection(&app, &id("sys-ended"));
+            end_connection(&app, &id("sys-ended"), leases.remove(0));
 
             let status = |system| {
                 let row = app.db.get_system(system).unwrap();
@@ -589,7 +592,7 @@ pub(super) mod tests {
             assert_eq!(status("sys-ended"), expected, "case: {case}");
             assert_eq!(
                 status("sys-other"),
-                Some((SystemStatus::Online, None)),
+                Some((SystemStatus::Unknown, None)),
                 "case: {case}: another system stays online"
             );
             let live = app.live_metrics.read().unwrap();

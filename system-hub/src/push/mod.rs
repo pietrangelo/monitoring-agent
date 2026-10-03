@@ -37,10 +37,15 @@ use crate::round_intake::{self, Arrival};
 mod config;
 mod connection;
 mod ingest;
+mod sweep;
+use crate::presence::ConnectionLease;
 use crate::state::AppState;
 pub use config::{PushAuth, PushAuthError, PushConfig};
 use connection::{ConnectionState, OutOfBudget, warn_first};
-use ingest::{PushPayload, SnapshotFrame, end_connection, ingest_frame, register_if_new};
+use ingest::{
+    Admitted, PushPayload, SnapshotFrame, end_connection, ingest_frame, register_and_accept,
+};
+pub use sweep::start_disconnection_sweep;
 
 /// The push handshake's first message. No `Debug`: `token` holds the presented secret.
 #[derive(Deserialize)]
@@ -95,6 +100,9 @@ fn authenticate(frame: &str, push_auth: &PushAuth) -> Result<SystemId, Handshake
 struct PushContext {
     app: Arc<AppState>,
     config: PushConfig,
+    /// When each mail system's id was last refused at `warn` (RFC 0017 §6): a shipped agent
+    /// retries every 5 s. At most one entry per mail system.
+    mismatch_warned: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 /// The push router with the production deadlines and limits.
@@ -111,7 +119,11 @@ pub fn router(state: Arc<AppState>, auth: PushAuth) -> Router {
 fn router_with_config(app: Arc<AppState>, config: PushConfig) -> Router {
     Router::new()
         .route("/api/push", get(push_handler))
-        .with_state(PushContext { app, config })
+        .with_state(PushContext {
+            app,
+            config,
+            mismatch_warned: Arc::default(),
+        })
 }
 
 async fn push_handler(ws: WebSocketUpgrade, State(ctx): State<PushContext>) -> impl IntoResponse {
@@ -128,6 +140,8 @@ enum Refusal {
     Rejected(HandshakeRejection),
     /// No first message within the handshake deadline.
     Timeout,
+    /// The id is a mail system's (RFC 0017 §6).
+    TransportMismatch { id: SystemId },
     /// The authenticated id couldn't be checked or registered (RFC 0007 §4). The agent
     /// retries any `auth_error` after 5 s, so a failing registry is never retried at once.
     RegistryUnavailable {
@@ -150,6 +164,7 @@ impl Refusal {
         match self {
             Self::Rejected(rejection) => rejection.message(),
             Self::Timeout => "handshake timeout",
+            Self::TransportMismatch { .. } => "transport mismatch",
             Self::RegistryUnavailable { .. } => "registry unavailable",
         }
     }
@@ -159,6 +174,9 @@ impl Refusal {
     fn log(&self) {
         match self {
             Self::Rejected(_) | Self::Timeout => tracing::warn!("Push handshake refused: {self:?}"),
+            Self::TransportMismatch { id } => {
+                tracing::debug!("Push handshake for mail system {:?} refused", id.as_str())
+            }
             Self::RegistryUnavailable {
                 id,
                 failure: RegistryFailure::Database(err),
@@ -173,8 +191,13 @@ impl Refusal {
 
 /// How a handshake ended, so `handle_push` has one exit per case.
 enum Handshake {
-    /// Registered; `answer` says whether `auth_ok` was delivered.
-    Authenticated { id: SystemId, answer: Answer },
+    /// Registered; `answer` says whether `auth_ok` was delivered. `lease` is the connection's
+    /// hold on a push system's presence, and `None` for a polled system's id.
+    Authenticated {
+        id: SystemId,
+        answer: Answer,
+        lease: Option<ConnectionLease>,
+    },
     /// Answered with an `auth_error`; nothing was registered.
     Refused(Refusal),
     /// The socket ended, errored, sent an oversize message, or sent a first message that
@@ -189,15 +212,15 @@ enum Answer {
 
 async fn handle_push(mut socket: WebSocket, ctx: PushContext) {
     tracing::info!("Push client connected");
-    let (system_id, answer) = match handshake(&mut socket, &ctx).await {
-        Handshake::Authenticated { id, answer } => (id, answer),
+    let (system_id, answer, lease) = match handshake(&mut socket, &ctx).await {
+        Handshake::Authenticated { id, answer, lease } => (id, answer, lease),
         Handshake::Refused(refusal) => return refusal.log(),
         Handshake::Closed => return,
     };
     tracing::info!("Push client authenticated: {:?}", system_id.as_str());
 
     match answer {
-        Answer::Delivered => receive_frames(&mut socket, &ctx, &system_id).await,
+        Answer::Delivered => receive_frames(&mut socket, &ctx, &system_id, lease.as_ref()).await,
         // The client never learned it was accepted; its connection ends here.
         Answer::Failed => tracing::warn!(
             "Push handshake answer to {:?} could not be sent; ending the connection",
@@ -205,7 +228,8 @@ async fn handle_push(mut socket: WebSocket, ctx: PushContext) {
         ),
     }
 
-    let _ = on_blocking_pool(&ctx.app, &system_id, end_connection).await;
+    let end = move |app: &AppState, id: &SystemId| end_connection(app, id, lease);
+    let _ = on_blocking_pool(&ctx.app, &system_id, end).await;
     tracing::info!("Push client disconnected: {:?}", system_id.as_str());
 }
 
@@ -248,23 +272,53 @@ async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
         Ok(system_id) => system_id,
         Err(rejection) => return refuse(socket, Refusal::Rejected(rejection)).await,
     };
-    if let Err(failure) = register(ctx, &system_id).await {
-        let refusal = Refusal::RegistryUnavailable {
-            id: system_id,
-            failure,
-        };
-        return refuse(socket, refusal).await;
-    }
+    let lease = match register(ctx, &system_id).await {
+        Ok(Admitted::Push(lease)) => Some(lease),
+        Ok(Admitted::Polled) => None,
+        Ok(Admitted::MailSystem) => {
+            warn_mismatch_hourly(ctx, &system_id);
+            return refuse(socket, Refusal::TransportMismatch { id: system_id }).await;
+        }
+        Err(failure) => {
+            let refusal = Refusal::RegistryUnavailable {
+                id: system_id,
+                failure,
+            };
+            return refuse(socket, refusal).await;
+        }
+    };
     let answer = send_answer(socket, r#"{"type":"auth_ok"}"#.to_string()).await;
     Handshake::Authenticated {
         id: system_id,
         answer,
+        lease,
     }
 }
 
-/// Registers the authenticated id off the async runtime.
-async fn register(ctx: &PushContext, system_id: &SystemId) -> Result<(), RegistryFailure> {
-    on_blocking_pool(&ctx.app, system_id, register_if_new)
+/// Registers the authenticated id, and accepts its connection, off the async runtime.
+/// Warns about a mail system's id presented for push at most hourly per system.
+fn warn_mismatch_hourly(ctx: &PushContext, system_id: &SystemId) {
+    use crate::hourly_warning::{HourlyWarning, hourly_warning};
+    let now = Instant::now();
+    let mut warned = ctx
+        .mismatch_warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last = warned.get(system_id.as_str()).copied();
+    match hourly_warning(last, now) {
+        HourlyWarning::Warn => {
+            tracing::warn!(
+                "A push handshake presented mail system {:?}'s id; refused (transport mismatch)",
+                system_id.as_str()
+            );
+            warned.insert(system_id.as_str().to_owned(), now);
+        }
+        HourlyWarning::Quiet => {}
+    }
+}
+
+async fn register(ctx: &PushContext, system_id: &SystemId) -> Result<Admitted, RegistryFailure> {
+    on_blocking_pool(&ctx.app, system_id, register_and_accept)
         .await
         .map_err(|_| RegistryFailure::Panicked)?
         .map_err(RegistryFailure::Database)
@@ -288,9 +342,14 @@ async fn send_answer(socket: &mut WebSocket, answer: String) -> Answer {
 /// Ingests push frames in arrival order until the connection ends, goes idle past its
 /// deadline, sends an oversize message, or ingestion fails. tungstenite answers pings on its
 /// own, so the hub never awaits a send here.
-async fn receive_frames(socket: &mut WebSocket, ctx: &PushContext, system_id: &SystemId) {
+async fn receive_frames(
+    socket: &mut WebSocket,
+    ctx: &PushContext,
+    system_id: &SystemId,
+    lease: Option<&ConnectionLease>,
+) {
     let mut connection = ConnectionState::new(Instant::now(), ctx.config.decode_refill);
-    receive_until_end(socket, ctx, system_id, &mut connection).await;
+    receive_until_end(socket, ctx, system_id, &mut connection, lease).await;
     connection.log_counts(system_id);
 }
 
@@ -299,11 +358,12 @@ async fn receive_until_end(
     ctx: &PushContext,
     system_id: &SystemId,
     connection: &mut ConnectionState,
+    lease: Option<&ConnectionLease>,
 ) {
     loop {
         match recv_within(socket, ctx.config.idle_timeout).await {
             Received::Message(Message::Binary(data)) => {
-                if let Err(stop) = ingest(ctx, system_id, &data, connection).await {
+                if let Err(stop) = ingest(ctx, system_id, &data, connection, lease).await {
                     tracing::info!(
                         "Ending the push connection of {:?}: {stop:?}",
                         system_id.as_str()
@@ -353,14 +413,21 @@ async fn ingest(
     system_id: &SystemId,
     data: &[u8],
     connection: &mut ConnectionState,
+    lease: Option<&ConnectionLease>,
 ) -> Result<(), IngestStop> {
     if let Err(OutOfBudget) = connection.spend_decode_budget(Instant::now()) {
         return Ok(());
     }
     if let Ok(payload) = rmp_serde::from_slice::<PushPayload>(data) {
-        return ingest_snapshot(ctx, system_id, payload, connection).await;
+        return ingest_snapshot(ctx, system_id, payload, connection, lease).await;
     }
     let Some(frame) = application_wire::decode(data) else {
+        let message = format!(
+            "Dropped a binary message from {:?} that is neither a snapshot nor an application \
+             frame",
+            system_id.as_str()
+        );
+        warn_first(connection.undecodable_frames.note(), &message);
         return Ok(());
     };
     match ScrapeRound::try_from(frame) {
@@ -383,6 +450,7 @@ async fn ingest_snapshot(
     system_id: &SystemId,
     payload: PushPayload,
     connection: &mut ConnectionState,
+    lease: Option<&ConnectionLease>,
 ) -> Result<(), IngestStop> {
     let id = system_id.as_str();
     let frame = match SnapshotFrame::try_from(payload) {
@@ -393,7 +461,8 @@ async fn ingest_snapshot(
             return Ok(());
         }
     };
-    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, frame);
+    let handle = lease.map(ConnectionLease::handle);
+    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, frame, handle);
     let stored = on_blocking_pool(&ctx.app, system_id, work)
         .await
         .map_err(|_| IngestStop::WorkFailed)?;
@@ -635,7 +704,8 @@ mod tests {
         let sys = state.db.get_system("test-sys-789").unwrap().unwrap();
         assert_eq!(sys.name, "test-sys");
         assert_eq!(sys.url, "push://");
-        assert_eq!(sys.status, SystemStatus::Online);
+        // RFC 0016 §2: online only once a snapshot is stored.
+        assert_eq!(sys.status, SystemStatus::Unknown);
         assert!(sys.enabled);
         assert_eq!(sys.poll_interval_secs, 10);
         assert_eq!(sys.token, "", "the presented push token is not stored");
@@ -2500,6 +2570,247 @@ mod tests {
             wait_until_hub_caught_up(&mut ws).await;
             assert_eq!(up_points(&state, "sys-burst").len(), 2, "both rounds");
             assert_eq!(points(&state, "sys-burst", "cpu"), 1, "the snapshot");
+        }
+    }
+
+    // ── RFC 0016: the current connection ─────────────────────────────────────────────────
+
+    /// Closes `ws` from the agent's side, and waits until the hub drops the socket (EOF),
+    /// which it does only after its `end_connection` ran.
+    async fn close_and_wait_for_the_hubs_end(ws: &mut AgentSocket, case: &str) {
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Close(None)).await.unwrap();
+        let closed = messages_until_closed(ws, Duration::from_secs(5)).await;
+        assert!(closed.is_some(), "{case}: the hub ended the connection");
+    }
+
+    async fn send_snapshot(ws: &mut AgentSocket, hostname: &str) {
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Binary(frame_bytes(hostname)))
+            .await
+            .unwrap();
+        wait_until_hub_caught_up(ws).await;
+    }
+
+    fn status_of(state: &AppState, id: &str) -> (SystemStatus, Option<String>) {
+        let sys = state.db.get_system(id).unwrap().unwrap();
+        (sys.status, sys.last_error)
+    }
+
+    fn has_live_metrics(state: &AppState, id: &str) -> bool {
+        state.live_metrics.read().unwrap().contains_key(id)
+    }
+
+    /// RFC 0016 §2: an agent that reconnected, and whose new connection delivered a snapshot,
+    /// isn't marked offline, nor emptied of live metrics, when its old connection ends.
+    #[tokio::test]
+    async fn an_old_connection_ending_after_a_reconnect_leaves_the_system_online() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut old = connect_authenticated(addr, "sys-re").await;
+        send_snapshot(&mut old, "host").await;
+        let mut new = connect_authenticated(addr, "sys-re").await;
+        send_snapshot(&mut new, "host").await;
+
+        close_and_wait_for_the_hubs_end(&mut old, "the old connection").await;
+
+        assert_eq!(status_of(&state, "sys-re").0, SystemStatus::Online);
+        assert!(has_live_metrics(&state, "sys-re"), "live metrics kept");
+    }
+
+    /// RFC 0016 §2: a connection that only pings can't mask an outage. The agent's connection
+    /// ends: offline, evicted (characterisation: today's hub does the same); the pinging one
+    /// ends: still offline.
+    #[tokio::test]
+    async fn a_connection_that_only_pings_cannot_mask_an_outage() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut agent = connect_authenticated(addr, "sys-ping").await;
+        send_snapshot(&mut agent, "host").await;
+        let mut pinger = connect_authenticated(addr, "sys-ping").await;
+        wait_until_hub_caught_up(&mut pinger).await;
+
+        close_and_wait_for_the_hubs_end(&mut agent, "the agent's connection").await;
+
+        let offline = (SystemStatus::Offline, Some("push disconnected".to_string()));
+        assert_eq!(status_of(&state, "sys-ping"), offline, "the agent's end");
+        assert!(!has_live_metrics(&state, "sys-ping"), "evicted");
+
+        close_and_wait_for_the_hubs_end(&mut pinger, "the pinging connection").await;
+
+        assert_eq!(status_of(&state, "sys-ping"), offline, "the pinger's end");
+    }
+
+    /// RFC 0016 §2: the old connection timing out on its idle deadline, after a reconnect that
+    /// delivered a snapshot, leaves the system online.
+    #[tokio::test]
+    async fn an_old_connection_timing_out_after_a_reconnect_leaves_the_system_online() {
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| c.idle_timeout = Duration::from_millis(1000));
+        let addr = serve_push_with(state.clone(), config).await;
+        let mut old = connect_authenticated(addr, "sys-idle").await;
+        send_snapshot(&mut old, "host").await;
+        let mut new = connect_authenticated(addr, "sys-idle").await;
+        send_snapshot(&mut new, "host").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_until_hub_caught_up(&mut new).await;
+
+        let closed = messages_until_closed(&mut old, Duration::from_secs(3)).await;
+
+        assert!(closed.is_some(), "the old connection timed out");
+        assert_eq!(status_of(&state, "sys-idle").0, SystemStatus::Online);
+        assert!(has_live_metrics(&state, "sys-idle"), "live metrics kept");
+    }
+
+    /// RFC 0016 §2, newest exits first, over two sockets (characterisation: today's hub marks
+    /// every end offline too): the newest end marks offline, the older one's snapshot marks
+    /// online again, and its own end marks offline.
+    #[tokio::test]
+    async fn when_the_newest_connection_exits_first_the_older_one_takes_over() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut older = connect_authenticated(addr, "sys-two").await;
+        send_snapshot(&mut older, "host").await;
+        let mut newer = connect_authenticated(addr, "sys-two").await;
+        send_snapshot(&mut newer, "host").await;
+
+        close_and_wait_for_the_hubs_end(&mut newer, "the newer connection").await;
+        assert_eq!(
+            status_of(&state, "sys-two").0,
+            SystemStatus::Offline,
+            "newer ends"
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        send_snapshot(&mut older, "host").await;
+        assert_eq!(
+            status_of(&state, "sys-two").0,
+            SystemStatus::Online,
+            "older claims"
+        );
+        close_and_wait_for_the_hubs_end(&mut older, "the older connection").await;
+        assert_eq!(
+            status_of(&state, "sys-two").0,
+            SystemStatus::Offline,
+            "older ends"
+        );
+    }
+
+    /// RFC 0016 §2 (A01): a push connection presenting a polled system's id holds no lease,
+    /// so its end never marks the polled system offline.
+    #[tokio::test]
+    async fn a_push_connection_for_a_polled_id_never_marks_it_offline() {
+        let (state, _dir) = temp_state();
+        let mut polled = register_row("sys-polled");
+        polled.url = "http://10.0.0.1:9090".to_string();
+        polled.status = SystemStatus::Online;
+        state.db.insert_system(&polled).unwrap();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-polled").await;
+
+        close_and_wait_for_the_hubs_end(&mut ws, "the connection").await;
+
+        assert_eq!(
+            status_of(&state, "sys-polled"),
+            (SystemStatus::Online, None),
+            "the polled system is untouched"
+        );
+    }
+
+    fn register_row(id: &str) -> crate::models::SystemInfo {
+        crate::models::SystemInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            url: "push://".to_string(),
+            token: String::new(),
+            status: SystemStatus::Unknown,
+            last_seen: String::new(),
+            last_error: None,
+            os: None,
+            hostname: None,
+            kernel: None,
+            cpu_model: None,
+            cpu_cores: None,
+            total_memory_display: None,
+            total_memory_bytes: None,
+            poll_interval_secs: 10,
+            enabled: true,
+        }
+    }
+
+    /// RFC 0016 §4: after a restart, a push system whose agent sends only frames the hub can't
+    /// decode never reads online: while its connection is still open, its status is exactly
+    /// the reset's `Unknown`.
+    #[tokio::test]
+    async fn after_the_reset_undecodable_frames_leave_the_system_unknown() {
+        use futures_util::SinkExt;
+        let (state, _dir) = temp_state();
+        let mut planted = register_row("sys-new-agent");
+        planted.status = SystemStatus::Online;
+        state.db.insert_system(&planted).unwrap();
+        state
+            .db
+            .reset_status("push://", &SystemStatus::Online, &SystemStatus::Unknown)
+            .unwrap();
+        let addr = serve_push(state.clone(), "").await;
+        let mut ws = connect_authenticated(addr, "sys-new-agent").await;
+
+        for _ in 0..2 {
+            ws.send(WsMessage::Binary(vec![0xc1, 0x00, 0x01]))
+                .await
+                .unwrap();
+        }
+        wait_until_hub_caught_up(&mut ws).await;
+
+        assert_eq!(status_of(&state, "sys-new-agent").0, SystemStatus::Unknown);
+    }
+
+    /// RFC 0016 §4: a binary message that decodes as neither a snapshot nor an application
+    /// frame is counted on its connection.
+    #[tokio::test]
+    async fn an_undecodable_message_is_counted() {
+        let (state, _dir) = temp_state();
+        let ctx = PushContext {
+            app: state,
+            config: PushConfig::production(PushAuth::Open),
+            mismatch_warned: Arc::default(),
+        };
+        let id = SystemId::try_from("sys-junk".to_string()).unwrap();
+        let mut connection = ConnectionState::new(Instant::now(), Duration::ZERO);
+
+        for _ in 0..2 {
+            let ingested = ingest(&ctx, &id, &[0xc1, 0x00], &mut connection, None).await;
+            assert!(ingested.is_ok(), "the connection stays open");
+        }
+
+        assert_eq!(connection.undecodable_frames.count(), 2);
+    }
+
+    /// RFC 0017 §6: a push handshake for a mail system's id is refused, after the token
+    /// check, so a push connection never feeds a mail row.
+    #[tokio::test]
+    async fn a_push_handshake_for_a_mail_systems_id_is_a_transport_mismatch() {
+        let cases = [
+            ("the right token", "token", "transport mismatch"),
+            ("a wrong token", "wrong", "invalid token"),
+        ];
+        for (name, token, message) in cases {
+            let (state, _dir) = temp_state();
+            let mut mailed = register_row("sys-mailed");
+            mailed.url = "mail://".to_string();
+            state.db.insert_system(&mailed).unwrap();
+            let addr = serve_push(state.clone(), "token").await;
+
+            let (_ws, answer) = connect_and_auth(addr, "sys-mailed", token).await;
+
+            assert_eq!(
+                answer,
+                Some(serde_json::json!({"type": "auth_error", "message": message})),
+                "case {name}"
+            );
+            assert_eq!(
+                state.db.get_system("sys-mailed").unwrap().unwrap().url,
+                "mail://"
+            );
         }
     }
 }

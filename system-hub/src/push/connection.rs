@@ -33,6 +33,7 @@ pub(super) struct ConnectionState {
     pub(super) refused_application_frames: Tally,
     pub(super) refused_snapshot_frames: Tally,
     pub(super) store_errors: Tally,
+    pub(super) undecodable_frames: Tally,
 }
 
 impl ConnectionState {
@@ -44,6 +45,7 @@ impl ConnectionState {
             refused_application_frames: Tally::default(),
             refused_snapshot_frames: Tally::default(),
             store_errors: Tally::default(),
+            undecodable_frames: Tally::default(),
         }
     }
 
@@ -75,6 +77,7 @@ impl ConnectionState {
             ),
             (self.refused_snapshot_frames, "snapshot frame(s) refused"),
             (self.store_errors, "snapshot(s) that failed to store"),
+            (self.undecodable_frames, "undecodable binary message(s)"),
         ];
         for (Tally(count), what) in counts.into_iter().filter(|(tally, _)| tally.0 > 0) {
             tracing::info!(
@@ -90,6 +93,12 @@ impl ConnectionState {
 pub(super) struct Tally(u64);
 
 impl Tally {
+    /// How many so far.
+    #[cfg(test)]
+    pub(super) fn count(self) -> u64 {
+        self.0
+    }
+
     /// Counts one more, and says whether it is the connection's first.
     pub(super) fn note(&mut self) -> Occurrence {
         self.0 += 1;

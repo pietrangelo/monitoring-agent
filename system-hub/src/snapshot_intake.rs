@@ -62,7 +62,7 @@ pub fn store_snapshot(
 /// Moves a stored snapshot into the system's live metrics, carrying the warning time over from
 /// the entry it replaces. Returns how the left-out values are logged, and the replaced entry,
 /// for the caller to drop once both locks are released.
-fn keep_live_metrics(
+pub(crate) fn keep_live_metrics(
     app: &AppState,
     system_id: &SystemId,
     snapshot: Snapshot,

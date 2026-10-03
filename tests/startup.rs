@@ -122,6 +122,8 @@ fn connections(listener: &TcpListener) -> usize {
 /// the variable under test.
 fn common(push_to: &str) -> Vec<(&'static str, String)> {
     vec![
+        // A port the OS picks, so agents started by parallel tests never race for 9090.
+        ("SYSTEM_AGENT_LISTEN", "127.0.0.1:0".to_string()),
         ("PUSH_TO", push_to.to_string()),
         ("SPRING_BOOT_APP_ORDERS_USERNAME", "monitor".to_string()),
         (
@@ -625,4 +627,49 @@ fn health(address: std::net::SocketAddr) -> Result<String, String> {
     let mut answer = String::new();
     let _ = stream.read_to_string(&mut answer);
     Ok(answer)
+}
+
+/// RFC 0017 §5: a refused mail configuration, or both transports, refuses startup with 78
+/// before the runtime, naming the variable and never a value.
+#[test]
+fn a_refused_mail_configuration_refuses_startup_before_anything_starts() {
+    const KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    let push_to = format!("ws://{}", hub.local_addr().unwrap());
+    let mail = |key: &'static str| {
+        vec![
+            ("MAIL_TO", "hub@example.org"),
+            ("MAIL_RELAY", "127.0.0.1:25"),
+            ("MAIL_KEY", key),
+        ]
+    };
+    // (case, PUSH_TO, the mail variables, what the refusal names)
+    let cases = [
+        (
+            "both transports",
+            Some(push_to.as_str()),
+            mail(KEY),
+            "PUSH_TO and MAIL_TO",
+        ),
+        ("a malformed key", None, mail("leak-marker-key"), "MAIL_KEY"),
+    ];
+    for (name, push_to, vars, names) in cases {
+        let run = run_with(push_to, &vars, Some(STARTED));
+
+        assert_eq!(run.code, Some(EX_CONFIG), "case {name}: {}", run.output);
+        assert!(
+            run.output.contains(names),
+            "case {name}: names {names}: {}",
+            run.output
+        );
+        assert!(
+            !run.output.contains("leak-marker"),
+            "case {name}: never a value"
+        );
+        assert!(
+            !run.output.contains(FIRST_RUNTIME_LINE),
+            "case {name}: refused before the runtime: {}",
+            run.output
+        );
+    }
 }

@@ -1,6 +1,6 @@
 # RFC 0016: The Current Push Connection, and the Agent's Id Computed Once
 
-- Status: Draft
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-29 (revised the same day for two `rfc-adversary` passes; a third pass's findings are open; see Review)
 - Affects: `system-hub` (a push connection's end, a disconnection sweep, the poller), and
@@ -88,8 +88,9 @@ pub struct ConnectionLease(Arc<ConnectionNumber>);
 #[derive(Default)]
 pub struct PushPresence { /* next: u64, current: HashMap<String, Current> */ }
 
-/// A system's current connection: its number, and whether its task still runs.
-struct Current { number: ConnectionNumber, task: Weak<ConnectionNumber> }
+/// A system's current connection: its number, whether its task still runs, and whether a
+/// snapshot on it has claimed currency.
+struct Current { number: ConnectionNumber, task: Weak<ConnectionNumber>, claimed: bool }
 
 pub enum Ending {
     /// The ending connection was current: its entry is removed, and the caller marks the
@@ -105,8 +106,8 @@ impl PushPresence {
     pub fn accept(&mut self, system_id: &SystemId) -> ConnectionLease;
     /// A snapshot frame on `lease`'s connection: that connection becomes current.
     pub fn claim(&mut self, system_id: &SystemId, lease: &ConnectionLease);
-    /// `connection` ended.
-    pub fn end(&mut self, system_id: &SystemId, connection: ConnectionNumber) -> Ending;
+    /// `lease`'s connection ended. Takes the lease by value: nothing can claim with it after.
+    pub fn end(&mut self, system_id: &SystemId, lease: ConnectionLease) -> Ending;
     /// What the disconnection sweep does with one push system (§4).
     pub fn sweep(&mut self, system_id: &str, status: &SystemStatus, up_for: Duration) -> Sweep;
 }
@@ -116,21 +117,35 @@ impl PushPresence {
   It wraps on overflow (at a million connections a second, after 584,000 years).
 - **A live current connection** is an entry whose `Weak` still upgrades: its task hasn't
   returned or unwound. An entry whose task is gone counts as none.
+- **Only a push system has a current connection.** Registration (`register_if_new`) asks
+  SQLite whether the row's `url` is the push sentinel with its existence check, in the same
+  statement (`SELECT url = ?2 FROM systems WHERE id = ?1`, `?2` = `PUSH_URL`, read as an
+  integer), so a hand-stored `url` of any type still maps and never fails registration (RFC
+  0007 §4's rule), and returns
+  `Registration::New` or `Registration::Known(SystemSource)`. A new id is registered as a push
+  system with status **`Unknown`**, not `Online`: it reads online only once a snapshot is
+  stored, so a new host whose frames never decode never reads online. When the id belongs to a
+  **polled** system (`Known(Poll)`), the handshake is still accepted, as today, but `accept` is
+  not called: the connection holds no lease, its snapshots are stored but claim nothing, and its
+  end marks nothing offline and evicts nothing. So a push-token holder who presents a polled
+  system's id can still inject snapshots (A01, as today) but can no longer keep it offline.
 - **The handshake makes its connection current only when there is none.** Registration
-  (`register_if_new`) and `accept` run in the handshake's one unit of blocking work, under the
+  and `accept` run in the handshake's one unit of blocking work, under the
   presence lock, after the id is authenticated, and `accept` runs only once registration
   succeeded, so a refused handshake never leaves an entry behind. When the system already has
   a live current connection, the new one is accepted but not current: **between open
   connections, only a snapshot moves currency.** So a connection that never sends a snapshot
   can't take currency from one that does, and its end changes nothing.
 - **A snapshot frame claims currency.** Every snapshot frame that passed the edge
-  (`SnapshotFrame::try_from`) runs `claim` in its unit of blocking work, just before its store.
+  (`SnapshotFrame::try_from`) on a connection that holds a lease runs `claim` in its unit of
+  blocking work, just before its store, which also marks the entry `claimed`.
   So the current connection is the one whose snapshot claimed last, or, before any, the first
   one accepted while none was current. Application frames and pings don't claim: they write no
   status. A reconnecting agent claims with its first tick (immediate, then every 2 s by
   default), long before its old connection's 90 s idle deadline.
 - **Only the current connection's end marks offline.** `end_connection` takes the presence
-  lock and calls `end`. `Current`: it marks the system offline and evicts its live metrics, as
+  lock and calls `end` with the connection's lease, by value (a connection without a lease,
+  on a polled system, ends with no write). `Current`: it marks the system offline and evicts its live metrics, as
   RFC 0007 §4 does today, under that lock. `NotCurrent`: it does neither, and its
   `Push client disconnected` line says another connection is current. This covers every exit
   of `handle_push` after registration: an `auth_ok` that couldn't be sent, the socket's end,
@@ -185,7 +200,8 @@ poll builds a reqwest client for it.
 
 **At startup, a push system's status is unknown.** The hub has no graceful shutdown, so the
 `Online` a push row holds was written by the previous process, and says nothing about now.
-Before it serves (so before any handshake), `main` runs one statement on the blocking pool,
+Before it builds `AppState` (so before the first SSE summary is built, and before any
+handshake), `main` runs one statement on the blocking pool,
 `Database::reset_status(PUSH_URL, Online, Unknown)`: `UPDATE systems SET status = ?3 WHERE
 url = ?1 AND status = ?2`, all three bound, `last_seen` and `last_error` kept. A push system
 reads `online` again only when a snapshot from its agent is stored. A failed reset is logged at
@@ -210,7 +226,10 @@ blocking pool:
 | Stored status | Live current connection | Hub up for | Outcome |
 |---|---|---|---|
 | `Offline` | any | any | `Leave`: already offline |
-| `Online` or `Unknown` | yes | any | `Leave` |
+| `Online` | yes, and it has claimed | any | `Leave` |
+| `Online` | yes, but it never claimed | under 120 s | `Leave` |
+| `Online` | yes, but it never claimed | 120 s or more | `MarkOffline(NotConnected)`: an `Online` with no snapshot behind the current connection is stale (a dead entry replaced by a connection that only pings, or an end whose offline write failed) |
+| `Unknown` | yes | any | `Leave` |
 | `Online` or `Unknown` | none | under 120 s | `Leave`: its agent may still be reconnecting |
 | `Online` or `Unknown` | none | 120 s or more | `MarkOffline(NotConnected)`, or `MarkOffline(InvalidSystemId)` when the id breaks `SystemId` |
 
@@ -231,7 +250,8 @@ a failed poll leaves a polled system's.
   120 s to 150 s after it; today's first poll marked it offline at once, then flapped); rows
   `PUT` made push systems; and rows stored before RFC 0005 whose id breaks `SystemId`, which no
   handshake can make current.
-- **What it doesn't:** a live current connection that never gets a snapshot stored. An agent
+- **What it doesn't:** a live current connection that never gets a snapshot stored, while its
+  system reads `Unknown` (the row above marks an `Online` one offline). An agent
   pushing every 300 s is such a connection between its snapshots, and it is online. A
   connection whose snapshots never store (frames the hub can't decode, a failing database)
   keeps the status its last stored snapshot left: after a restart, `unknown`, never `online`.
@@ -383,7 +403,8 @@ online. Nothing here is persisted, so nothing needs migrating.
 - **Fleet Registry:** `SystemSource`, `PUSH_URL` and `polled_systems` (`registry.rs`);
   `PushPresence`, `ConnectionNumber`, `ConnectionLease`, `Ending`, `Sweep`, `OfflineReason`
   and `RECONNECT_GRACE` (new `presence.rs`, pure).
-- **Ingestion:** the handshake's unit registers and accepts; a snapshot frame's unit claims,
+- **Ingestion:** the handshake's unit registers (`Registration::{New, Known(SystemSource)}`,
+  a new id `Unknown`) and accepts only for a push system; a snapshot frame's unit claims,
   then stores; `end_connection` acts only on `Ending::Current`; the lease a connection's task
   holds; the startup reset and the disconnection sweep (`push/sweep.rs`);
   `Database::system_sources` and `Database::reset_status`; the undecodable-frame count; the
@@ -406,7 +427,8 @@ online. Nothing here is persisted, so nothing needs migrating.
   - **push system id** (agent): the id the agent presents in the handshake, resolved once per
     process.
 - **Published contracts:** none changes. The handshake's answers, the frames and the poll
-  responses are byte-identical.
+  responses are byte-identical. A new push id is registered `Unknown` instead of `Online`,
+  which the dashboard shows until its first snapshot is stored.
 
 ## Alternatives considered
 
@@ -472,8 +494,10 @@ online. Nothing here is persisted, so nothing needs migrating.
 
 ## Security implications
 
-- **A01 / API1 (push ids are self-asserted): narrowed, not closed.** Anyone who can push as
-  an id (the push token, or anyone while it's unset) can still send snapshots as it, which
+- **A01 / API1 (push ids are self-asserted): narrowed, not closed.** For a **polled**
+  system's id, a push connection holds no lease (§2): its snapshots are stored, as today, but
+  its end never marks the polled system offline. For a push system's id, anyone who can push
+  as it (the push token, or anyone while it's unset) can still send snapshots as it, which
   claim currency: their connection's end then marks the system offline until the agent's next
   snapshot, and two senders alternate its status, as they already alternate its metrics. A
   connection that sends no snapshot can no longer do anything: it isn't current while the
@@ -545,15 +569,29 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - newest exits first, over two sockets: A and B each deliver a snapshot (B last); B ends →
     `Offline`; A's snapshot → `Online`; A ends → `Offline` (characterisation);
   - one table over the handshake, observed through the sweep at `up_for` ≥ 120 s: registered
-    and open → the row stays `Online`; `registry unavailable` → no entry, so a planted
-    `Online` row with that id is swept;
+    and open → a new row is `Unknown` and stays so; `registry unavailable` → no entry, so a
+    planted `Online` row with that id is swept; a polled system's id → accepted, and its
+    close leaves the polled row `Online` (barrier: the hub drops the socket, read as EOF, as
+    `messages_until_closed` does; a Close frame can come before `end_connection`'s write);
+  - `db_with_unmappable_known_system` gains a row whose `url` is a BLOB: registration answers
+    `Known(Poll)`, never `registry unavailable`;
+  - `push_handshake_with_the_configured_token_is_accepted_and_registers_system` asserts the
+    new row is `Unknown` (today `Online`);
   - a lease dropped by a panicking task (a test seam that panics in the connection's task after
     its accept): the next sweep marks the system `Offline`, and the hub still serves;
   - the startup reset: `Online` push rows become `Unknown` with `last_seen` and `last_error`
     kept; `Offline` push rows and `Online` polled rows untouched;
   - **a restart with undecodable frames:** a planted `Online` push row, the reset, then a
-    connection for it that sends only binary messages the hub can't decode: after the hub has
-    counted them (its `info` line at the connection's close), the row is not `Online`;
+    connection for it that sends only binary messages the hub can't decode; while the
+    connection is still open, `wait_until_hub_caught_up`, then the row is exactly `Unknown`
+    (the reset's value: the close's offline write hasn't run). The count is checked
+    separately, through the connection's counts, not through a log line;
+  - `sweep` rows for `Online` with a live current connection that never claimed: `Leave` at
+    119 s, `MarkOffline(NotConnected)` at 120 s;
+  - **the binary** (`tests/`): plant an `online` `push://` row, start the hub, and after its
+    "listening" line `GET /api/systems/<id>` returns `unknown`, so `main` runs the reset
+    before serving. The sweep's start is not tested at the binary level: its 120 s grace
+    can't be injected into the binary;
   - the sweep, run once with an injected `up_for`: a disconnected `Online` and `Unknown` push
     row → `Offline` with `push disconnected`; a connected one untouched; a disabled push row
     swept; a row with id `..` → `invalid system id`; a polled row never touched; an `Offline`
@@ -600,7 +638,12 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   entries; the lock order (presence, database, live).
 - § Trust boundaries, Agent → Hub (push): only the current connection's end marks offline.
 - § Testing architecture: the barrier rule for tests that assert nothing happened; the
-  agent's new startup cases.
+  agent's new startup cases; the hub's binary reset test.
+- § Data flow and § Domain model (the push frame contract): "the hub silently drops frames
+  that fail to decode" becomes "drops, counts and logs (first at `warn`, the count at the
+  close)". `CLAUDE.md` says the same in its DDD section; that file is the owner's, so the
+  change is proposed to the owner, not made by this RFC. The glossary's *system status*:
+  "a new push id is registered `Unknown`", not online.
 - § Open architectural questions:
   - removed: push systems being polled and flapping; "any connection presenting an id evicts";
     the `hostname` shell-out; the 1,000 `push://` rows keeping every core busy (the per-poll
@@ -611,7 +654,8 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     then offline; `PUT` can still write the `push://` sentinel (RFC 0011); a live current
     connection whose snapshots never store keeps the status its last stored snapshot left;
     a task stuck in a unit of blocking work keeps its entry past its socket's death.
-- `README.md`: the `SYSTEM_AGENT_ID_FILE` row and its Compose lines; the startup paragraph's
+- `README.md`: push systems read `unknown` after every hub restart and at registration,
+  until their first snapshot is stored; the `SYSTEM_AGENT_ID_FILE` row and its Compose lines; the startup paragraph's
   list of variables parsed first and its exit codes; the handshake paragraph's id sources; the
   deadlines paragraph's offline marking (by the current connection, and the sweep).
 - RFC 0010 §10: `Unknown` at open is this RFC's startup reset; a push system goes offline only
@@ -676,11 +720,14 @@ Came closest among the rejected: the lease's premise that a panicking task drops
 checked against axum's `on_upgrade` (`tokio::spawn`) and tokio's harness (the future is dropped
 inside its panic guard).
 
-`rfc-adversary`, third pass, on the second revision (5fe04f6). **None of these is resolved yet,
-so the RFC stays `Draft`.** The red tests in 6842329 and 0fe18c2 were written against that
-revision and have to follow whatever these findings change:
+`rfc-adversary`, third pass, on the second revision (5fe04f6). All resolved in the third
+revision, each by the fix the pass proposed. The red tests in 6842329 and 0fe18c2 predate it;
+they are amended in the implementation, before any production code (`end` takes the lease,
+the "online, live" sweep case split into claimed → `Leave` and never claimed → `Leave` at
+119 s / `MarkOffline` at 120 s, the dropped-lease case observed through the sweep, the
+`Unknown` registration):
 
-| Finding | Verdict | Cheapest fix proposed (open) |
+| Finding | Verdict | Cheapest fix proposed (adopted) |
 |---|---|---|
 | a new id registers `Online` with no snapshot (`push/ingest.rs:184`), so the startup reset only covers rows that exist at startup, and a new host whose frames never decode reads online for good | CONFIRMED | `register_if_new` registers `Unknown`; flip the handshake-table row, the assertion in `push_handshake_with_the_configured_token_is_accepted_and_registers_system` and ARCHITECTURE's "registered online at its handshake" |
 | the undecodable-after-restart test's barrier (the `info` line at the close) comes before `end_connection`'s offline write, so it passes without the reset; the in-crate harness captures no logs | CONFIRMED | after the undecodable frames, `wait_until_hub_caught_up` while the connection is open, then assert exactly `Unknown`; check the count separately |
@@ -695,3 +742,26 @@ revision and have to follow whatever these findings change:
 Came closest among the rejected: the honest reconnect that hasn't claimed yet. `end` holds the
 presence lock across its offline write, and the agent's first tick is immediate, so the result
 is a short offline blip.
+
+`rfc-adversary`, fourth pass, on the third revision (d63a300): all nine fixes present, no new
+design flaw.
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the Review claimed the red tests already followed the amendments; one pins the opposite of the new "never claimed" row | CONFIRMED | the Review now says the tests are amended in the implementation, before production code, and lists how |
+| RFC 0010 §10 paraphrases the sweep and misses the "never claimed" row and the `Unknown` registration | CONFIRMED | 0010 §10 points to this RFC's §4 table and §2 registration instead of paraphrasing |
+| reading `url` as text in the existence check can fail on a hand-stored non-text value | PLAUSIBLE | SQLite compares (`url = ?2`, read as an integer); a BLOB-url row in the test database. Decided: adopted |
+| the polled-id test's barrier | PLAUSIBLE | stated as the socket's EOF. Decided: adopted |
+
+The only CONFIRMED findings were a stale claim and a paraphrase, fixed in wording; the RFC is
+`Accepted`.
+
+`rosette-auditor` on the implementation (no VIOLATED; five AT-RISK, each decided):
+
+| Finding | Decision |
+|---|---|
+| registration writes the literal `"push://"`, and `Registration::Known` carries a bool, not `Known(SystemSource)` | `register_if_new` writes `PUSH_URL`. The bool stays: `insert_system_if_absent` is the registry's, shared by every transport (RFC 0017 registers `mail://` through it), and only knows whether the stored url is the presented one; `register_and_accept` maps it to push or not with an exhaustive match |
+| a row whose `url` isn't text was skipped by the sweep's read and logged as a bad id | the read now decides the source at the edge (`url IS 'push://'`), so such a row reads `Poll` and is never skipped; only a non-text id is |
+| RFC adapter rows missing | added: the old connection timing out after a reconnect, and newest-exits-first over two sockets (both caught by the "every end marks offline" mutation, the second a characterisation). Deferred, with no test yet: the lease dropped by a panicking task (needs a panic seam in the connection task), the handshake table observed through the sweep, and the poller at 500 ms over a push row (`polled_systems` is covered as a pure unit) |
+| `PUSH_TOKEN` and `PUSH_INTERVAL` still read inside the push task | accepted for now: this RFC moved `PUSH_TO` and the id to `start`; moving the other two, and refusing a malformed interval with exit 78, changes behaviour and belongs with the next change to the push client's configuration |
+| `PushPresence::sweep` parses the id itself | accepted: the parse is pure and local to the one decision that needs it |

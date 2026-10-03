@@ -61,6 +61,8 @@ pub enum LastSeen {
     Uptime(UptimeDisplay),
     /// Poll: the poll's ISO time, built by the hub.
     PolledAt(String),
+    /// Mail: the newest report's creation time, written as ISO time (RFC 0017 §7).
+    ReportedAt(crate::snapshot::SnapshotTime),
     /// Push, with a display the rule refuses: the column keeps its value.
     Unchanged,
 }
@@ -201,6 +203,9 @@ pub fn needs_system_info(system: &SystemInfo) -> bool {
 /// The url push registration writes, which makes a system a push system (RFC 0016 §1).
 pub const PUSH_URL: &str = "push://";
 
+/// The url mail registration writes, which makes a system a mail system (RFC 0017 §1).
+pub const MAIL_URL: &str = "mail://";
+
 /// Where a system's snapshots come from (RFC 0016 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemSource {
@@ -208,18 +213,30 @@ pub enum SystemSource {
     Push,
     /// Any other url: polled.
     Poll,
+    /// Registered by a mail report (RFC 0017 §1): never polled, never pushed.
+    Mail,
 }
 
 impl SystemSource {
     /// `Push` for exactly `PUSH_URL`, `Poll` for any other url.
-    pub fn of(_url: &str) -> Self {
-        Self::Poll
+    pub fn of(url: &str) -> Self {
+        match url {
+            PUSH_URL => Self::Push,
+            MAIL_URL => Self::Mail,
+            _ => Self::Poll,
+        }
     }
 }
 
 /// The systems the poller polls: the enabled polled systems, in the registry's order.
 pub fn polled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInfo> {
-    systems.iter().filter(|system| system.enabled)
+    systems.iter().filter(|system| {
+        system.enabled
+            && match SystemSource::of(&system.url) {
+                SystemSource::Poll => true,
+                SystemSource::Push | SystemSource::Mail => false,
+            }
+    })
 }
 
 #[cfg(test)]
@@ -326,6 +343,7 @@ mod tests {
             ("http", "http://10.0.0.1:9090", SystemSource::Poll),
             ("https", "https://agent.example", SystemSource::Poll),
             ("empty", "", SystemSource::Poll),
+            ("the mail sentinel", "mail://", SystemSource::Mail),
         ];
         for (name, url, expected) in cases {
             assert_eq!(SystemSource::of(url), expected, "case {name}");

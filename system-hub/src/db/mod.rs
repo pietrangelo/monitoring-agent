@@ -21,7 +21,30 @@ use std::sync::Mutex;
 use crate::models::*;
 
 mod history;
+mod mail;
+mod sources;
 pub use history::{RoundStored, SnapshotStored};
+pub use mail::{MailPresenceRow, MailReceipt, MailStored, MailWrite};
+pub use sources::SourceRow;
+
+/// What a registration found (RFC 0016 §2, RFC 0017 §6): the id was absent and is now
+/// inserted, or it was known, with what its stored `url` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    Inserted,
+    Known(KnownUrl),
+}
+
+/// A known row's `url`, against the one a registration presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownUrl {
+    /// The one presented.
+    Same,
+    /// Another one, the mail sentinel: a mail system's.
+    Mail,
+    /// Another one: a polled or pushed system's, or a value that isn't text.
+    Other,
+}
 
 /// Whether the system's row exists, on a connection the caller already holds.
 fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::Error> {
@@ -31,6 +54,37 @@ fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::E
         |row| row.get(0),
     )
 }
+
+/// Whether `system_id` has a row, and if so whether its `url` is `url`. SQLite compares, so a
+/// stored `url` of any type maps (a blob is never equal to text), and no other column is read.
+fn known_url(
+    conn: &Connection,
+    system_id: &str,
+    url: &str,
+) -> Result<Option<KnownUrl>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT url IS ?2, url IS ?3 FROM systems WHERE id = ?1",
+        [system_id, url, crate::registry::MAIL_URL],
+        |row| {
+            Ok(match (row.get(0)?, row.get(1)?) {
+                (true, _) => KnownUrl::Same,
+                (false, true) => KnownUrl::Mail,
+                (false, false) => KnownUrl::Other,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Registers a system, never replacing a row.
+const INSERT_SYSTEM: &str = "INSERT INTO systems
+        (id, name, url, token, status, last_seen, last_error,
+         os, hostname, kernel, cpu_model, cpu_cores,
+         total_memory_display, total_memory_bytes,
+         poll_interval_secs, enabled)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+     ON CONFLICT(id) DO NOTHING";
 
 /// A system's columns, in the order the `systems` INSERTs name them.
 fn system_params(sys: &SystemInfo) -> impl rusqlite::Params + '_ {
@@ -126,6 +180,21 @@ impl Database {
                 PRIMARY KEY (system_id, metric),
                 FOREIGN KEY (system_id) REFERENCES systems(id) ON DELETE CASCADE
             );
+
+            -- RFC 0017: one row per accepted mail report. No foreign key: deleting a system
+            -- retires its receipts, which then refuse replays of its reports.
+            CREATE TABLE IF NOT EXISTS mail_receipts (
+                system_id     TEXT    NOT NULL,
+                run           TEXT    NOT NULL,
+                seq           INTEGER NOT NULL,
+                created_at    INTEGER NOT NULL,
+                interval_secs INTEGER NOT NULL,
+                received_at   INTEGER NOT NULL,
+                retired       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (system_id, run, seq)
+            );
+            CREATE INDEX IF NOT EXISTS mail_receipts_newest
+                ON mail_receipts (system_id, retired, created_at);
             ",
         )?;
         Ok(())
@@ -212,25 +281,34 @@ impl Database {
     }
 
     /// Registers `sys` unless a row with its id exists, under one hold of the mutex (RFC 0007
-    /// §4). A known id runs only the existence check, which reads no column, so neither a row
-    /// that doesn't map nor a database that refuses writes fails it. An absent id is inserted
+    /// §4). A known id runs only the existence check, which reads only whether the row's `url`
+    /// is `sys.url`, compared by SQLite (RFC 0016 §2), so neither a row that doesn't map nor a
+    /// database that refuses writes fails it. An absent id is inserted
     /// with `ON CONFLICT(id) DO NOTHING`, so no registration replaces a row.
-    pub fn insert_system_if_absent(&self, sys: &SystemInfo) -> Result<(), rusqlite::Error> {
+    pub fn insert_system_if_absent(
+        &self,
+        sys: &SystemInfo,
+    ) -> Result<Registration, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        if system_exists(&conn, &sys.id)? {
-            return Ok(());
+        if let Some(known) = known_url(&conn, &sys.id, &sys.url)? {
+            return Ok(Registration::Known(known));
         }
-        conn.execute(
-            "INSERT INTO systems
-                (id, name, url, token, status, last_seen, last_error,
-                 os, hostname, kernel, cpu_model, cpu_cores,
-                 total_memory_display, total_memory_bytes,
-                 poll_interval_secs, enabled)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
-             ON CONFLICT(id) DO NOTHING",
-            system_params(sys),
-        )?;
-        Ok(())
+        conn.execute(INSERT_SYSTEM, system_params(sys))?;
+        Ok(Registration::Inserted)
+    }
+
+    /// Stores `poll_interval_secs` as `value` for `id`, as an older hub could, making the row
+    /// one `list_systems` can't map.
+    #[cfg(test)]
+    pub fn set_poll_interval_for_test(&self, id: &str, value: i64) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE systems SET poll_interval_secs = ?2 WHERE id = ?1",
+                (id, value),
+            )
+            .unwrap();
     }
 
     /// Poisons the connection mutex: a thread panics while holding its guard.
@@ -343,36 +421,27 @@ impl Database {
         Ok(())
     }
 
+    /// Deletes a system and its history in one transaction, and retires its mail receipts,
+    /// which then refuse replays of its reports (RFC 0017 §6).
     pub fn delete_system(&self, id: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM metrics WHERE system_id = ?1", [id])?;
-        conn.execute("DELETE FROM alerts WHERE system_id = ?1", [id])?;
-        conn.execute("DELETE FROM metric_retention WHERE system_id = ?1", [id])?;
-        conn.execute("DELETE FROM systems WHERE id = ?1", [id])?;
-        Ok(())
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM metrics WHERE system_id = ?1", [id])?;
+        tx.execute("DELETE FROM alerts WHERE system_id = ?1", [id])?;
+        tx.execute("DELETE FROM metric_retention WHERE system_id = ?1", [id])?;
+        tx.execute(
+            "UPDATE mail_receipts SET retired = 1 WHERE system_id = ?1",
+            [id],
+        )?;
+        tx.execute("DELETE FROM systems WHERE id = ?1", [id])?;
+        tx.commit()
     }
 
     // ── Alerts ─────────────────────────────────────────
 
     pub fn insert_alert(&self, alert: &AlertRecord) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO alerts (id, system_id, system_name, severity, message,
-             current_value, fired_at, stored_at, acknowledged)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            rusqlite::params![
-                alert.id,
-                alert.system_id,
-                alert.system_name,
-                alert.severity,
-                alert.message,
-                alert.current_value,
-                alert.fired_at,
-                alert.stored_at,
-                alert.acknowledged,
-            ],
-        )?;
-        Ok(())
+        insert_alert_record(&conn, alert)
     }
 
     pub fn get_alerts(
@@ -444,6 +513,27 @@ impl Database {
             |row| row.get(0),
         )
     }
+}
+
+/// The alert-record rule: one record per incident, keeping the values first seen.
+fn insert_alert_record(conn: &Connection, alert: &AlertRecord) -> Result<(), rusqlite::Error> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO alerts (id, system_id, system_name, severity, message,
+         current_value, fired_at, stored_at, acknowledged)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+    )?
+    .execute(rusqlite::params![
+        alert.id,
+        alert.system_id,
+        alert.system_name,
+        alert.severity,
+        alert.message,
+        alert.current_value,
+        alert.fired_at,
+        alert.stored_at,
+        alert.acknowledged,
+    ])?;
+    Ok(())
 }
 
 fn parse_status(s: &str) -> SystemStatus {
@@ -968,6 +1058,61 @@ mod tests {
                 assert_eq!(outcome.is_ok(), succeeds, "case: {case}: {outcome:?}");
                 assert_eq!(raw_row(&db, id), expected_row, "case: {case}");
                 assert_eq!(raw_row(&db, "known"), known_row, "case: {case}: known row");
+            }
+        }
+
+        /// RFC 0016 §2: what a registration found, compared by SQLite so a stored `url` of any
+        /// type maps (RFC 0007 §4's rule), whatever the row's other columns hold.
+        #[test]
+        fn a_registration_says_whether_the_known_row_has_its_url() {
+            let cases = [
+                ("an absent id", "new", "push://", Registration::Inserted),
+                (
+                    "a known id, the same url",
+                    "known",
+                    "http://example.com",
+                    Registration::Known(KnownUrl::Same),
+                ),
+                (
+                    "a known id, another url",
+                    "known",
+                    "push://",
+                    Registration::Known(KnownUrl::Other),
+                ),
+                (
+                    "a known id stored with a blob url",
+                    "blob",
+                    "push://",
+                    Registration::Known(KnownUrl::Other),
+                ),
+                (
+                    "a known mail system",
+                    "mailed",
+                    "push://",
+                    Registration::Known(KnownUrl::Mail),
+                ),
+            ];
+            for (case, id, url, expected) in cases {
+                let (db, _dir) = db_with_unmappable_known_system();
+                let mut mailed = sample_system("mailed", "mailed");
+                mailed.url = "mail://".to_string();
+                db.insert_system(&mailed).unwrap();
+                let mut blob = sample_system("blob", "blob");
+                blob.url = "push://".to_string();
+                db.insert_system(&blob).unwrap();
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "UPDATE systems SET url = CAST('push://' AS BLOB) WHERE id = 'blob';",
+                    )
+                    .unwrap();
+                let mut sys = sample_system(id, id);
+                sys.url = url.to_string();
+
+                let outcome = db.insert_system_if_absent(&sys);
+
+                assert_eq!(outcome.ok(), Some(expected), "case: {case}");
             }
         }
 

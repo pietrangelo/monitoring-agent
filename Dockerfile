@@ -33,7 +33,8 @@ RUN useradd --system --create-home --home-dir /app agent
 WORKDIR /app
 COPY --from=builder /app/target/release/system-agent /usr/local/bin/system-agent
 COPY static ./static
-RUN chown -R agent:agent /app
+RUN chown -R agent:agent /app \
+    && install -d -o agent -g agent /var/lib/system-agent
 
 USER agent
 EXPOSE 9090

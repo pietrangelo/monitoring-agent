@@ -15,13 +15,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
 use tokio::sync::watch;
 
 use crate::applications::{HeldRound, RecentRounds, RoundDigester, SourcePace};
 use crate::db::Database;
+use crate::presence::PushPresence;
 use crate::routes::sse::Summary;
 use crate::snapshot::LiveMetrics;
 
@@ -49,6 +50,9 @@ pub struct AppState {
     pub live_applications: RwLock<HashMap<String, SystemApplications>>,
     /// The one digest key every ingestion path shares.
     pub digester: RoundDigester,
+    /// Which push connection is current for each push system (RFC 0016 §2). Lock order: this
+    /// first, then the database mutex, then the live state; taken only on the blocking pool.
+    pub presence: Mutex<PushPresence>,
     /// The latest summary (RFC 0007 §5): the publisher replaces it, and every SSE subscriber
     /// watches it.
     pub summary: watch::Sender<Summary>,
@@ -65,8 +69,15 @@ impl AppState {
             live_metrics,
             live_applications: RwLock::new(HashMap::new()),
             digester: RoundDigester::new(),
+            presence: Mutex::new(PushPresence::default()),
             summary,
         }))
+    }
+
+    /// The presence lock. A poisoned lock is recovered: `PushPresence` holds no invariant a
+    /// panic elsewhere could break.
+    pub fn presence(&self) -> MutexGuard<'_, PushPresence> {
+        self.presence.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Removes a system's live metrics (RFC 0007 §4) and hands the entry back, so the caller

@@ -43,8 +43,14 @@ pub enum AgentIdRule {
 impl TryFrom<&str> for AgentId {
     type Error = AgentIdRule;
 
-    fn try_from(_value: &str) -> Result<Self, Self::Error> {
-        Err(AgentIdRule::Empty)
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let id = value.trim_ascii();
+        match id {
+            "" => Err(AgentIdRule::Empty),
+            "." | ".." => Err(AgentIdRule::DotSegment),
+            _ if id.len() > MAX_AGENT_ID_BYTES => Err(AgentIdRule::TooLong),
+            _ => Ok(Self(id.to_owned())),
+        }
     }
 }
 
@@ -102,13 +108,37 @@ pub enum AgentIdError {
 impl AgentIdError {
     /// Whether this is a refused value (exit 78) rather than an I/O failure (exit 1).
     pub fn is_refused_value(&self) -> bool {
-        false
+        match self {
+            Self::NotAbsolute | Self::NotUtf8 | Self::Invalid(_) => true,
+            Self::Unreadable(_) | Self::Unwritable(_) | Self::NoHardLinks(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for AgentIdRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "an empty id",
+            Self::TooLong => "an id longer than 255 bytes",
+            Self::DotSegment => "`.` or `..`, which isn't an id",
+        })
     }
 }
 
 impl fmt::Display for AgentIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{ID_FILE_VARIABLE}")
+        write!(f, "{ID_FILE_VARIABLE} ")?;
+        match self {
+            Self::NotAbsolute => f.write_str("must be an absolute path"),
+            Self::NotUtf8 => f.write_str("names a file that isn't UTF-8"),
+            Self::Invalid(rule) => write!(f, "names a file that holds {rule}"),
+            Self::Unreadable(err) => write!(f, "names a file that couldn't be read: {err}"),
+            Self::Unwritable(err) => write!(f, "names a file that couldn't be written: {err}"),
+            Self::NoHardLinks(err) => write!(
+                f,
+                "names a file on a filesystem that may not support hard links: {err}"
+            ),
+        }
     }
 }
 
@@ -119,8 +149,19 @@ pub struct IdFilePath(PathBuf);
 impl IdFilePath {
     /// Unset or empty means no id file; any other value must be an absolute path. Paths may be
     /// any bytes, so the value is read with `var_os`.
-    pub fn from_env(_value: Option<OsString>) -> Result<Option<Self>, AgentIdError> {
-        Ok(None)
+    pub fn from_env(value: Option<OsString>) -> Result<Option<Self>, AgentIdError> {
+        match value {
+            None => Ok(None),
+            Some(value) if value.is_empty() => Ok(None),
+            Some(value) => {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    Ok(Some(Self(path)))
+                } else {
+                    Err(AgentIdError::NotAbsolute)
+                }
+            }
+        }
     }
 }
 
@@ -146,25 +187,136 @@ impl IdSources {
 /// Resolves the push system id: the id file when it exists, else the machine ids, the host
 /// name, then a random UUID. A missing id file is written with what the sources gave.
 pub fn resolve_push_id(
-    _id_file: Option<&IdFilePath>,
-    _sources: &IdSources,
+    id_file: Option<&IdFilePath>,
+    sources: &IdSources,
 ) -> Result<ResolvedId, AgentIdError> {
-    Ok(ResolvedId {
-        id: AgentId(String::new()),
-        resolution: Resolution::Resolved(IdSource::Random),
-    })
+    let Some(IdFilePath(path)) = id_file else {
+        let (id, source) = from_sources(sources);
+        return Ok(ResolvedId {
+            id,
+            resolution: Resolution::Resolved(source),
+        });
+    };
+    match read_id_file(path)? {
+        Some(id) => Ok(from_file(id)),
+        None => {
+            let (id, source) = from_sources(sources);
+            let written = ResolvedId {
+                id,
+                resolution: Resolution::Written(source),
+            };
+            persist_new_id(path, written)
+        }
+    }
+}
+
+fn from_file(id: AgentId) -> ResolvedId {
+    ResolvedId {
+        id,
+        resolution: Resolution::FromFile,
+    }
+}
+
+/// The id file's id, or `None` when there is no file at `path`.
+fn read_id_file(path: &Path) -> Result<Option<AgentId>, AgentIdError> {
+    match std::fs::read(path) {
+        Ok(bytes) => parse_id_file(bytes).map(Some),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(AgentIdError::Unreadable(err)),
+    }
+}
+
+fn parse_id_file(bytes: Vec<u8>) -> Result<AgentId, AgentIdError> {
+    let text = String::from_utf8(bytes).map_err(|_| AgentIdError::NotUtf8)?;
+    AgentId::try_from(text.as_str()).map_err(AgentIdError::Invalid)
+}
+
+/// The first usable source after the id file, else a new random UUID.
+fn from_sources(sources: &IdSources) -> (AgentId, IdSource) {
+    let utf8 = |path: &Path| {
+        let bytes = std::fs::read(path).ok()?;
+        AgentId::try_from(std::str::from_utf8(&bytes).ok()?).ok()
+    };
+    let lossy = |path: &Path| {
+        let bytes = std::fs::read(path).ok()?;
+        AgentId::try_from(String::from_utf8_lossy(&bytes).as_ref()).ok()
+    };
+    utf8(&sources.machine_id)
+        .map(|id| (id, IdSource::MachineId))
+        .or_else(|| utf8(&sources.dbus_machine_id).map(|id| (id, IdSource::DbusMachineId)))
+        .or_else(|| lossy(&sources.host_name).map(|id| (id, IdSource::HostName)))
+        .unwrap_or_else(|| (AgentId(uuid::Uuid::new_v4().to_string()), IdSource::Random))
 }
 
 /// Links a new id file into place at `path`, never replacing one: if another process created
 /// it first, its id is read instead, and that read is final.
-fn persist_new_id(_path: &Path, resolved: ResolvedId) -> Result<ResolvedId, AgentIdError> {
-    Ok(resolved)
+fn persist_new_id(path: &Path, resolved: ResolvedId) -> Result<ResolvedId, AgentIdError> {
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    let mut temp_name = OsString::from(".");
+    temp_name.push(path.file_name().unwrap_or_default());
+    temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temp = dir.join(temp_name);
+    let linked = write_temp(&temp, &resolved.id).and_then(|()| {
+        std::fs::hard_link(&temp, path).map_err(|err| match err.kind() {
+            io::ErrorKind::AlreadyExists => LinkError::Taken,
+            _ => LinkError::Failed(link_failure(err)),
+        })
+    });
+    let _ = std::fs::remove_file(&temp);
+    match linked {
+        Ok(()) => {
+            sync_dir(dir);
+            Ok(resolved)
+        }
+        Err(LinkError::Taken) => read_final(path).map(from_file),
+        Err(LinkError::Failed(err)) => Err(err),
+    }
+}
+
+/// Why the new id file isn't in place.
+enum LinkError {
+    /// Another process linked the file first.
+    Taken,
+    Failed(AgentIdError),
+}
+
+fn write_temp(temp: &Path, id: &AgentId) -> Result<(), LinkError> {
+    use std::io::Write;
+    let write = || {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp)?;
+        file.write_all(format!("{}\n", id.as_str()).as_bytes())?;
+        file.sync_all()
+    };
+    write().map_err(|err| LinkError::Failed(AgentIdError::Unwritable(err)))
+}
+
+/// The read after losing the link: any failure, a missing file included, is final.
+fn read_final(path: &Path) -> Result<AgentId, AgentIdError> {
+    std::fs::read(path)
+        .map_err(AgentIdError::Unreadable)
+        .and_then(parse_id_file)
+}
+
+/// Flushes the directory entry; a failure only risks losing the file in a crash, so it is a
+/// warning, not a refusal.
+fn sync_dir(dir: &Path) {
+    if let Err(err) = std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        tracing::warn!("{ID_FILE_VARIABLE}: the id file's directory couldn't be synced: {err}");
+    }
 }
 
 /// What a failed `hard_link` of the new id file means: a filesystem without hard links (`EPERM`,
 /// or an unsupported operation), else a failed write.
 fn link_failure(err: io::Error) -> AgentIdError {
-    AgentIdError::Unwritable(err)
+    const EPERM: i32 = 1;
+    if err.raw_os_error() == Some(EPERM) || err.kind() == io::ErrorKind::Unsupported {
+        AgentIdError::NoHardLinks(err)
+    } else {
+        AgentIdError::Unwritable(err)
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +377,9 @@ mod tests {
         /// What Docker's `-v /etc/machine-id:/etc/machine-id` makes on a host without the file.
         Directory,
     }
+
+    /// Puts something at the id path in a scratch directory, and returns that path.
+    type PlantAt = fn(&Scratch) -> PathBuf;
 
     /// Sources under `scratch`, each planted as asked.
     fn sources(scratch: &Scratch, machine_id: Plant, dbus: Plant, host: Plant) -> IdSources {
@@ -326,7 +481,8 @@ mod tests {
     #[test]
     fn the_id_file_variable_is_unset_empty_or_an_absolute_path() {
         let not_utf8 = OsString::from_vec(b"/var/lib/agent-\xff/id".to_vec());
-        let cases: [(&str, Option<OsString>, Result<Option<PathBuf>, ()>); 7] = [
+        type Expected = Result<Option<PathBuf>, ()>;
+        let cases: [(&str, Option<OsString>, Expected); 7] = [
             ("unset", None, Ok(None)),
             ("empty", Some(OsString::new()), Ok(None)),
             (
@@ -583,7 +739,10 @@ mod tests {
                 .collect();
 
             let stored = fs::read_to_string(&path);
-            assert!(stored.is_ok(), "round {round}: the file was written: {stored:?}");
+            assert!(
+                stored.is_ok(),
+                "round {round}: the file was written: {stored:?}"
+            );
             let winner = agent_id(stored.unwrap_or_default().trim());
             assert!(
                 results.iter().all(|resolved| resolved.id == winner),
@@ -608,7 +767,7 @@ mod tests {
     fn an_unusable_id_file_refuses_startup() {
         // (case, what to plant at the id path, the expected error, what its message says)
         type Check = fn(&AgentIdError) -> bool;
-        let cases: [(&str, fn(&Scratch) -> PathBuf, Check, &str); 7] = [
+        let cases: [(&str, PlantAt, Check, &str); 7] = [
             (
                 "a dot segment",
                 |s| s.write("id", b"..\n"),
@@ -770,7 +929,7 @@ mod tests {
     #[test]
     fn after_losing_the_link_the_read_is_final() {
         type Check = fn(&Result<ResolvedId, AgentIdError>) -> bool;
-        let cases: [(&str, fn(&Scratch) -> PathBuf, Check); 3] = [
+        let cases: [(&str, PlantAt, Check); 3] = [
             (
                 "a valid file",
                 |s| s.write("id", b"the-other-process\n"),
