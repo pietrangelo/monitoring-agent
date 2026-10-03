@@ -122,6 +122,8 @@ fn connections(listener: &TcpListener) -> usize {
 /// the variable under test.
 fn common(push_to: &str) -> Vec<(&'static str, String)> {
     vec![
+        // A port the OS picks, so agents started by parallel tests never race for 9090.
+        ("SYSTEM_AGENT_LISTEN", "127.0.0.1:0".to_string()),
         ("PUSH_TO", push_to.to_string()),
         ("SPRING_BOOT_APP_ORDERS_USERNAME", "monitor".to_string()),
         (
