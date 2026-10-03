@@ -61,6 +61,8 @@ pub enum LastSeen {
     Uptime(UptimeDisplay),
     /// Poll: the poll's ISO time, built by the hub.
     PolledAt(String),
+    /// Mail: the newest report's creation time, as ISO time (RFC 0017 §7).
+    ReportedAt(String),
     /// Push, with a display the rule refuses: the column keeps its value.
     Unchanged,
 }

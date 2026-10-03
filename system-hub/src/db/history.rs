@@ -278,19 +278,37 @@ fn store_points(
     snapshot: &Snapshot,
     time: SnapshotTime,
 ) -> Result<(), rusqlite::Error> {
+    store_unexpired_points(tx, system_id, snapshot, time, None).map(|_expired| ())
+}
+
+/// `store_points`, leaving out each point already past its series' retention at `now` (a
+/// mailed sample delivered late, RFC 0017 §6). Returns how many were left out.
+pub(super) fn store_unexpired_points(
+    tx: &Transaction,
+    system_id: &SystemId,
+    snapshot: &Snapshot,
+    time: SnapshotTime,
+    now: Option<SnapshotTime>,
+) -> Result<usize, rusqlite::Error> {
     let id = system_id.as_str();
     let mut insert = tx.prepare_cached(INSERT_POINT)?;
     let mut retention = tx.prepare_cached(SELECT_RETENTION)?;
     let mut prune = tx.prepare_cached(PRUNE_OLDEST)?;
+    let mut expired = 0;
     for (metric, value) in snapshot.metric_points() {
-        insert.execute(rusqlite::params![id, metric, value, time.seconds()])?;
         let stored = retention
             .query_row(rusqlite::params![id, metric], |row| {
                 Ok(integer(row.get_ref(0)?))
             })
             .optional()?
             .flatten();
-        let cutoff = time.cutoff(snapshot_retention(stored));
+        let retention_secs = snapshot_retention(stored);
+        if now.is_some_and(|now| time.seconds() < now.cutoff(retention_secs).seconds()) {
+            expired += 1;
+            continue;
+        }
+        insert.execute(rusqlite::params![id, metric, value, time.seconds()])?;
+        let cutoff = time.cutoff(retention_secs);
         prune.execute(rusqlite::params![
             id,
             metric,
@@ -298,7 +316,7 @@ fn store_points(
             PRUNE_PER_POINT
         ])?;
     }
-    Ok(())
+    Ok(expired)
 }
 
 /// A column's value when it holds an integer; any other type is none, so no stored value can
@@ -311,7 +329,7 @@ fn integer(value: ValueRef) -> Option<i64> {
 }
 
 /// Writes the status the registry decided, as it was decided.
-fn write_status(
+pub(super) fn write_status(
     tx: &Transaction,
     system_id: &SystemId,
     status: &StatusUpdate,
@@ -319,6 +337,7 @@ fn write_status(
     let last_seen = match status.last_seen() {
         LastSeen::Uptime(uptime) => Some(uptime.as_str()),
         LastSeen::PolledAt(polled_at) => Some(polled_at.as_str()),
+        LastSeen::ReportedAt(reported_at) => Some(reported_at.as_str()),
         LastSeen::Unchanged => None,
     };
     tx.prepare_cached(WRITE_STATUS)?.execute(rusqlite::params![

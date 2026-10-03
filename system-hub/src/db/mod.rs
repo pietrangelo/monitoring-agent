@@ -21,8 +21,10 @@ use std::sync::Mutex;
 use crate::models::*;
 
 mod history;
+mod mail;
 mod sources;
 pub use history::{RoundStored, SnapshotStored};
+pub use mail::{MailReceipt, MailStored, MailWrite};
 pub use sources::SourceRow;
 
 /// What a registration found (RFC 0016 §2): the id was absent and is now inserted, or it was
@@ -57,6 +59,15 @@ fn known_url(
     )
     .optional()
 }
+
+/// Registers a system, never replacing a row.
+const INSERT_SYSTEM: &str = "INSERT INTO systems
+        (id, name, url, token, status, last_seen, last_error,
+         os, hostname, kernel, cpu_model, cpu_cores,
+         total_memory_display, total_memory_bytes,
+         poll_interval_secs, enabled)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+     ON CONFLICT(id) DO NOTHING";
 
 /// A system's columns, in the order the `systems` INSERTs name them.
 fn system_params(sys: &SystemInfo) -> impl rusqlite::Params + '_ {
@@ -152,6 +163,21 @@ impl Database {
                 PRIMARY KEY (system_id, metric),
                 FOREIGN KEY (system_id) REFERENCES systems(id) ON DELETE CASCADE
             );
+
+            -- RFC 0017: one row per accepted mail report. No foreign key: deleting a system
+            -- retires its receipts, which then refuse replays of its reports.
+            CREATE TABLE IF NOT EXISTS mail_receipts (
+                system_id     TEXT    NOT NULL,
+                run           TEXT    NOT NULL,
+                seq           INTEGER NOT NULL,
+                created_at    INTEGER NOT NULL,
+                interval_secs INTEGER NOT NULL,
+                received_at   INTEGER NOT NULL,
+                retired       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (system_id, run, seq)
+            );
+            CREATE INDEX IF NOT EXISTS mail_receipts_newest
+                ON mail_receipts (system_id, retired, created_at);
             ",
         )?;
         Ok(())
@@ -250,16 +276,7 @@ impl Database {
         if let Some(same_url) = known_url(&conn, &sys.id, &sys.url)? {
             return Ok(Registration::Known { same_url });
         }
-        conn.execute(
-            "INSERT INTO systems
-                (id, name, url, token, status, last_seen, last_error,
-                 os, hostname, kernel, cpu_model, cpu_cores,
-                 total_memory_display, total_memory_bytes,
-                 poll_interval_secs, enabled)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
-             ON CONFLICT(id) DO NOTHING",
-            system_params(sys),
-        )?;
+        conn.execute(INSERT_SYSTEM, system_params(sys))?;
         Ok(Registration::Inserted)
     }
 
@@ -387,36 +404,27 @@ impl Database {
         Ok(())
     }
 
+    /// Deletes a system and its history in one transaction, and retires its mail receipts,
+    /// which then refuse replays of its reports (RFC 0017 §6).
     pub fn delete_system(&self, id: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM metrics WHERE system_id = ?1", [id])?;
-        conn.execute("DELETE FROM alerts WHERE system_id = ?1", [id])?;
-        conn.execute("DELETE FROM metric_retention WHERE system_id = ?1", [id])?;
-        conn.execute("DELETE FROM systems WHERE id = ?1", [id])?;
-        Ok(())
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM metrics WHERE system_id = ?1", [id])?;
+        tx.execute("DELETE FROM alerts WHERE system_id = ?1", [id])?;
+        tx.execute("DELETE FROM metric_retention WHERE system_id = ?1", [id])?;
+        tx.execute(
+            "UPDATE mail_receipts SET retired = 1 WHERE system_id = ?1",
+            [id],
+        )?;
+        tx.execute("DELETE FROM systems WHERE id = ?1", [id])?;
+        tx.commit()
     }
 
     // ── Alerts ─────────────────────────────────────────
 
     pub fn insert_alert(&self, alert: &AlertRecord) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO alerts (id, system_id, system_name, severity, message,
-             current_value, fired_at, stored_at, acknowledged)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            rusqlite::params![
-                alert.id,
-                alert.system_id,
-                alert.system_name,
-                alert.severity,
-                alert.message,
-                alert.current_value,
-                alert.fired_at,
-                alert.stored_at,
-                alert.acknowledged,
-            ],
-        )?;
-        Ok(())
+        insert_alert_record(&conn, alert)
     }
 
     pub fn get_alerts(
@@ -488,6 +496,27 @@ impl Database {
             |row| row.get(0),
         )
     }
+}
+
+/// The alert-record rule: one record per incident, keeping the values first seen.
+fn insert_alert_record(conn: &Connection, alert: &AlertRecord) -> Result<(), rusqlite::Error> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO alerts (id, system_id, system_name, severity, message,
+         current_value, fired_at, stored_at, acknowledged)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+    )?
+    .execute(rusqlite::params![
+        alert.id,
+        alert.system_id,
+        alert.system_name,
+        alert.severity,
+        alert.message,
+        alert.current_value,
+        alert.fired_at,
+        alert.stored_at,
+        alert.acknowledged,
+    ])?;
+    Ok(())
 }
 
 fn parse_status(s: &str) -> SystemStatus {
