@@ -141,6 +141,7 @@ pub struct MailedAlert {
     pub id: String,
     pub metric: AlertMetric,
     pub severity: AlertSeverity,
+    pub current_value: f32,
     /// At most `MAX_ALERT_MESSAGE_BYTES`, cut on a character boundary.
     pub message: String,
     pub fired_at: String,
@@ -152,6 +153,7 @@ impl From<&ActiveAlert> for MailedAlert {
             id: alert.id.clone(),
             metric: alert.rule.metric.clone(),
             severity: alert.rule.severity.clone(),
+            current_value: alert.current_value,
             message: cut_to(&alert.message, MAX_ALERT_MESSAGE_BYTES).to_owned(),
             fired_at: alert.fired_at.clone(),
         }
@@ -231,6 +233,7 @@ struct AlertDto<'a> {
     id: &'a str,
     metric: &'static str,
     severity: &'static str,
+    current_value: f32,
     message: &'a str,
     fired_at: &'a str,
 }
@@ -314,6 +317,7 @@ impl<'a> From<&'a MailedAlert> for AlertDto<'a> {
                 AlertSeverity::Warning => "warning",
                 AlertSeverity::Critical => "critical",
             },
+            current_value: alert.current_value,
             message: &alert.message,
             fired_at: &alert.fired_at,
         }
@@ -367,6 +371,7 @@ pub(crate) mod tests {
                 id: format!("{RUN}-1"),
                 metric: AlertMetric::Cpu,
                 severity: AlertSeverity::Warning,
+                current_value: 95.0,
                 message: "CPU high".into(),
                 fired_at: "2023-11-14T22:18:20Z".into(),
             }],

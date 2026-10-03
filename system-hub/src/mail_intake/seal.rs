@@ -349,4 +349,17 @@ pub(crate) mod tests {
             assert_eq!(dearmour(&text), expected, "case {name}");
         }
     }
+
+    /// RFC 0017 §3: the agent's sealed golden opens under a master key of 32 bytes of 1, as
+    /// system `web-01`, to the v1 report golden.
+    #[test]
+    fn the_agents_sealed_golden_opens_to_the_report_golden() {
+        const SEALED: &[u8] = include_bytes!("../../../testdata/mail-report-v1.sealed");
+        const REPORT: &[u8] = include_bytes!("../../../testdata/mail-report-v1.msgpack");
+
+        let (id, report) = open(SEALED, &master()).unwrap();
+
+        assert_eq!(id.as_str(), "web-01");
+        assert_eq!(report, REPORT);
+    }
 }

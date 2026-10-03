@@ -17,4 +17,5 @@
 //! The mail intake (RFC 0017): sealed reports that agents without internet access mail
 //! through their network's relay, read from a Maildir.
 
+pub mod report;
 pub mod seal;

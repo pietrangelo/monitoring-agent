@@ -58,6 +58,7 @@ report = mp(
         ("id", s(RUN + "-1")),
         ("metric", s("cpu")),
         ("severity", s("warning")),
+        ("current_value", f32(95.0)),
         ("message", s("CPU high")),
         ("fired_at", s("2023-11-14T22:18:20Z")),
     ))),
