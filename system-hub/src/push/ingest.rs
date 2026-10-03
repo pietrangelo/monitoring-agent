@@ -20,8 +20,9 @@
 
 use std::time::Instant;
 
-use crate::db::SnapshotStored;
+use crate::db::{Registration, SnapshotStored};
 use crate::models::{SystemId, SystemInfo, SystemStatus};
+use crate::presence::ConnectionLease;
 use crate::registry::{
     LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh, needs_system_info,
 };
@@ -173,9 +174,22 @@ impl From<DiskItem> for ReportedDisk {
     }
 }
 
+/// Registers the id when it is new, then accepts the connection when the id is a push
+/// system's, under the presence lock (RFC 0016 §2). A polled system's id gets no lease: its
+/// connection claims nothing and its end writes nothing.
+pub(super) fn register_and_accept(
+    app: &AppState,
+    system_id: &SystemId,
+) -> Result<Option<ConnectionLease>, rusqlite::Error> {
+    register_if_new(app, system_id).map(|_| None)
+}
+
 /// Registers a system the hub hasn't seen before, under its default name. A known id is
 /// never written, and a database that can't check or insert returns its error (RFC 0007 §4).
-pub(super) fn register_if_new(app: &AppState, system_id: &SystemId) -> Result<(), rusqlite::Error> {
+pub(super) fn register_if_new(
+    app: &AppState,
+    system_id: &SystemId,
+) -> Result<Registration, rusqlite::Error> {
     app.db.insert_system_if_absent(&SystemInfo {
         id: system_id.as_str().to_string(),
         name: system_id.default_name(),
@@ -201,6 +215,7 @@ pub(super) fn ingest_frame(
     app: &AppState,
     system_id: &SystemId,
     frame: SnapshotFrame,
+    _lease: Option<&ConnectionLease>,
 ) -> Result<SnapshotStored<LeftOutLog>, rusqlite::Error> {
     let SnapshotFrame {
         reported,
@@ -264,7 +279,11 @@ fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
 
 /// Ends a push connection's hold on its system (RFC 0007 §4): marks it offline, then removes
 /// its live metrics. One unit of blocking work, so no wait separates the two.
-pub(super) fn end_connection(app: &AppState, system_id: &SystemId) {
+pub(super) fn end_connection(
+    app: &AppState,
+    system_id: &SystemId,
+    _lease: Option<ConnectionLease>,
+) {
     let id = system_id.as_str();
     let offline =
         app.db
@@ -570,15 +589,16 @@ pub(super) mod tests {
         let cases = [("a registered system", true), ("a deleted system", false)];
         for (case, registered) in cases {
             let (app, _dir) = app();
+            let mut leases = Vec::new();
             for system in ["sys-ended", "sys-other"] {
-                register_if_new(&app, &id(system)).unwrap();
+                leases.push(register_and_accept(&app, &id(system)).unwrap());
                 plant_live_metrics(&app, system);
             }
             if !registered {
                 app.db.delete_system("sys-ended").unwrap();
             }
 
-            end_connection(&app, &id("sys-ended"));
+            end_connection(&app, &id("sys-ended"), leases.remove(0));
 
             let status = |system| {
                 let row = app.db.get_system(system).unwrap();
@@ -589,7 +609,7 @@ pub(super) mod tests {
             assert_eq!(status("sys-ended"), expected, "case: {case}");
             assert_eq!(
                 status("sys-other"),
-                Some((SystemStatus::Online, None)),
+                Some((SystemStatus::Unknown, None)),
                 "case: {case}: another system stays online"
             );
             let live = app.live_metrics.read().unwrap();

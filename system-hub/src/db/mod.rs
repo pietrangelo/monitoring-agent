@@ -21,7 +21,17 @@ use std::sync::Mutex;
 use crate::models::*;
 
 mod history;
+mod sources;
 pub use history::{RoundStored, SnapshotStored};
+pub use sources::{SourceRow, SourceRows};
+
+/// What a registration found (RFC 0016 §2): the id was absent and is now inserted, or it was
+/// known, and its stored `url` is, or isn't, the one the registration presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    Inserted,
+    Known { same_url: bool },
+}
 
 /// Whether the system's row exists, on a connection the caller already holds.
 fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::Error> {
@@ -30,6 +40,22 @@ fn system_exists(conn: &Connection, system_id: &str) -> Result<bool, rusqlite::E
         [system_id],
         |row| row.get(0),
     )
+}
+
+/// Whether `system_id` has a row, and if so whether its `url` is `url`. SQLite compares, so a
+/// stored `url` of any type maps (a blob is never equal to text), and no other column is read.
+fn known_url(
+    conn: &Connection,
+    system_id: &str,
+    url: &str,
+) -> Result<Option<bool>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT url IS ?2 FROM systems WHERE id = ?1",
+        [system_id, url],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// A system's columns, in the order the `systems` INSERTs name them.
@@ -212,13 +238,17 @@ impl Database {
     }
 
     /// Registers `sys` unless a row with its id exists, under one hold of the mutex (RFC 0007
-    /// §4). A known id runs only the existence check, which reads no column, so neither a row
-    /// that doesn't map nor a database that refuses writes fails it. An absent id is inserted
+    /// §4). A known id runs only the existence check, which reads only whether the row's `url`
+    /// is `sys.url`, compared by SQLite (RFC 0016 §2), so neither a row that doesn't map nor a
+    /// database that refuses writes fails it. An absent id is inserted
     /// with `ON CONFLICT(id) DO NOTHING`, so no registration replaces a row.
-    pub fn insert_system_if_absent(&self, sys: &SystemInfo) -> Result<(), rusqlite::Error> {
+    pub fn insert_system_if_absent(
+        &self,
+        sys: &SystemInfo,
+    ) -> Result<Registration, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        if system_exists(&conn, &sys.id)? {
-            return Ok(());
+        if let Some(same_url) = known_url(&conn, &sys.id, &sys.url)? {
+            return Ok(Registration::Known { same_url });
         }
         conn.execute(
             "INSERT INTO systems
@@ -230,7 +260,21 @@ impl Database {
              ON CONFLICT(id) DO NOTHING",
             system_params(sys),
         )?;
-        Ok(())
+        Ok(Registration::Inserted)
+    }
+
+    /// Stores `poll_interval_secs` as `value` for `id`, as an older hub could, making the row
+    /// one `list_systems` can't map.
+    #[cfg(test)]
+    pub fn set_poll_interval_for_test(&self, id: &str, value: i64) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE systems SET poll_interval_secs = ?2 WHERE id = ?1",
+                (id, value),
+            )
+            .unwrap();
     }
 
     /// Poisons the connection mutex: a thread panics while holding its guard.
@@ -968,6 +1012,52 @@ mod tests {
                 assert_eq!(outcome.is_ok(), succeeds, "case: {case}: {outcome:?}");
                 assert_eq!(raw_row(&db, id), expected_row, "case: {case}");
                 assert_eq!(raw_row(&db, "known"), known_row, "case: {case}: known row");
+            }
+        }
+
+        /// RFC 0016 §2: what a registration found, compared by SQLite so a stored `url` of any
+        /// type maps (RFC 0007 §4's rule), whatever the row's other columns hold.
+        #[test]
+        fn a_registration_says_whether_the_known_row_has_its_url() {
+            let cases = [
+                ("an absent id", "new", "push://", Registration::Inserted),
+                (
+                    "a known id, the same url",
+                    "known",
+                    "http://example.com",
+                    Registration::Known { same_url: true },
+                ),
+                (
+                    "a known id, another url",
+                    "known",
+                    "push://",
+                    Registration::Known { same_url: false },
+                ),
+                (
+                    "a known id stored with a blob url",
+                    "blob",
+                    "push://",
+                    Registration::Known { same_url: false },
+                ),
+            ];
+            for (case, id, url, expected) in cases {
+                let (db, _dir) = db_with_unmappable_known_system();
+                let mut blob = sample_system("blob", "blob");
+                blob.url = "push://".to_string();
+                db.insert_system(&blob).unwrap();
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "UPDATE systems SET url = CAST('push://' AS BLOB) WHERE id = 'blob';",
+                    )
+                    .unwrap();
+                let mut sys = sample_system(id, id);
+                sys.url = url.to_string();
+
+                let outcome = db.insert_system_if_absent(&sys);
+
+                assert_eq!(outcome.ok(), Some(expected), "case: {case}");
             }
         }
 

@@ -43,6 +43,22 @@ impl ConnectionLease {
     pub fn number(&self) -> ConnectionNumber {
         *self.0
     }
+
+    /// What a unit of blocking work carries to claim for this connection.
+    pub fn handle(&self) -> LeaseHandle {
+        LeaseHandle {
+            number: self.number(),
+            task: Arc::downgrade(&self.0),
+        }
+    }
+}
+
+/// A connection's number and a `Weak` of its lease: what a unit of blocking work carries, so
+/// the unit never holds the task's lease and the task's end stays visible.
+#[derive(Debug, Clone)]
+pub struct LeaseHandle {
+    number: ConnectionNumber,
+    task: Weak<ConnectionNumber>,
 }
 
 /// A system's current connection: its number, whether its task still runs, and whether a
@@ -122,17 +138,25 @@ impl PushPresence {
             .get(system_id.as_str())
             .is_some_and(Current::is_live);
         if !taken {
-            self.current
-                .insert(system_id.as_str().to_owned(), current(&lease, false));
+            let accepted = Current {
+                number,
+                task: Arc::downgrade(&lease.0),
+                claimed: false,
+            };
+            self.current.insert(system_id.as_str().to_owned(), accepted);
         }
         lease
     }
 
     /// A snapshot frame on `lease`'s connection: that connection becomes current, and has
     /// claimed.
-    pub fn claim(&mut self, system_id: &SystemId, lease: &ConnectionLease) {
-        self.current
-            .insert(system_id.as_str().to_owned(), current(lease, true));
+    pub fn claim(&mut self, system_id: &SystemId, lease: &LeaseHandle) {
+        let claimed = Current {
+            number: lease.number,
+            task: Weak::clone(&lease.task),
+            claimed: true,
+        };
+        self.current.insert(system_id.as_str().to_owned(), claimed);
     }
 
     /// `lease`'s connection ended. When it was current, its entry is removed. Takes the lease
@@ -189,14 +213,6 @@ enum Connection {
     None,
     Claimed,
     Unclaimed,
-}
-
-fn current(lease: &ConnectionLease, claimed: bool) -> Current {
-    Current {
-        number: lease.number(),
-        task: Arc::downgrade(&lease.0),
-        claimed,
-    }
 }
 
 #[cfg(test)]
@@ -331,7 +347,9 @@ mod tests {
             for (at, step) in steps.iter().enumerate() {
                 match *step {
                     Accept => leases.push(Some(presence.accept(&sys))),
-                    Claim(n) => presence.claim(&sys, leases[n].as_ref().expect("not ended")),
+                    Claim(n) => {
+                        presence.claim(&sys, &leases[n].as_ref().expect("not ended").handle())
+                    }
                     End(n, expected) => assert_eq!(
                         presence.end(&sys, leases[n].take().expect("ended once")),
                         expected,
@@ -489,7 +507,7 @@ mod tests {
                 Connection::None => None,
                 Connection::Live => {
                     let lease = presence.accept(&sys);
-                    presence.claim(&sys, &lease);
+                    presence.claim(&sys, &lease.handle());
                     Some(lease)
                 }
                 Connection::LiveUnclaimed => Some(presence.accept(&sys)),
