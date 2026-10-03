@@ -545,7 +545,7 @@ variable, never the value:
 | `HUB_CLOCK_REWIND` | the `last_issued` value `/api/storage` shows: rewinds a far-future clock at start (§2); one-shot | unset |
 
 The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's, `HUB_LISTEN`
-0012's, and `HUB_STATIC_DIR` the prerequisite's.
+0015's, and `HUB_STATIC_DIR` the prerequisite's.
 
 **Opening, in order**, in `main`, after configuration and before any other state:
 1. the data-directory checks below;

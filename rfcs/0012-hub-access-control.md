@@ -1,14 +1,29 @@
 # RFC 0012: Hub Access Control — Admin Token over Registry and Retention Writes, Reserved Push Ids
 
-- Status: Draft
+- Status: Accepted (2026-10-03, after the fifth `rfc-adversary` pass). Not implementable on its
+  own: it ships with 0008, 0010 and 0011, once they carry the amendments listed below.
 - Author: Claude (pairing with pietrangelomasalaMD)
-- Date: 2026-09-26 (updated the same day for the redb store; see Review)
+- Date: 2026-09-26 (updated the same day for the redb store; 2026-10-03 for the mail transport
+  of RFC 0017; see Review)
 - Affects: `system-hub` (routes, push handshake, `main`, dashboard, `xss.mjs`),
   `docker-compose.yml`, `.env.example`
 - Depends on: RFC 0010 (the store on redb: store-owned retention and pending shortenings, the
   retention clock, `LiveStatus`, `/api/storage`), RFC 0011 (`Source`, `transact`, tombstones),
   RFC 0008 (the handshake order). Ships in the same release as 0008, 0010 and 0011 (0010's
   header), never before them. RFC 0013 is Rejected (no migration).
+- Builds on two Implemented RFCs written after this one's earlier passes: RFC 0016 (the
+  agent's push id sources) and **RFC 0017 (the mail transport)**, which added a third kind of
+  system, the *mail system* (`SystemSource::Mail`, `url` = `mail://`), and already refuses a push
+  handshake for a mail system's id (`Refusal::TransportMismatch`, answered `transport
+  mismatch`). 0008, 0010 and 0011 predate 0017 and don't name mail systems yet: **this release
+  requires them to be amended first** so that 0008's registration transaction answers
+  `Reserved` for a non-push row (§3), the push and overdue sweeps mark `since` from the last
+  contact after a restart, on hub time for every source (§2), 0010 §5's override can say "follow
+  the global policy" per tier with at most one pending entry each (§2), and 0011's `Source` gains a `Mail` variant (with
+  0017's `mail_receipts` as a catalog table, retired on delete, a `mail://` column in 0011's
+  per-source API table, and `enabled` settable as 0017 §6 uses it) and 0010's `LiveStatus` carries
+  0017's overdue marking. This RFC states what it needs from those amendments (§2, §3); it
+  doesn't design them.
 - The new dashboard reaches Compose users through the static-files prerequisite (0010's header),
   shipped first as its own change.
 - This RFC adds the hub's first client authentication. `docs/ARCHITECTURE.md` says that is "an
@@ -32,7 +47,8 @@ And one hole comes from 0010's hub-time rule:
 4. **Push ids aren't reserved.** Anyone holding the shared push token (anyone at all when
    `HUB_PUSH_TOKEN` is unset) can push under a *polled* system's UUID. Under 0010's
    `NotAfterLast`, the first point of each second wins, so two alternating connections displace
-   the honest poll entirely.
+   the honest poll entirely. A *mail* system's id is already closed to push (RFC 0017 §6): a
+   polled system's is the one the registry still lets a push connection feed.
 
 **Owner decisions carried by this RFC:**
 
@@ -41,7 +57,7 @@ And one hole comes from 0010's hub-time rule:
 | Who sets retention | the global policy from configuration (`HUB_RETENTION`, 0010); per-system overrides through the API, gated by a new `HUB_ADMIN_TOKEN` |
 | Which writes need the admin token | **every registry write**: `POST`, `PUT` and `DELETE` on `/api/systems`, plus every retention write. Reads, SSE and alert acknowledgement stay open. With the token unset, these writes are refused. *Behaviour change for scripts.* |
 | "Delete offline" | **a server-side decision**: the hub deletes only systems offline for more than N minutes, and the dashboard lists their names before it sends the token. *Behaviour change.* |
-| Push ids of polled systems | **a push handshake whose id belongs to a polled system is refused** with `auth_error`. *Behaviour change.* |
+| Push ids of polled systems | **a push handshake whose id belongs to a polled system is refused** with `auth_error`. *Behaviour change.* (A mail system's id is refused already, RFC 0017.) |
 
 ## Proposed design
 
@@ -51,7 +67,7 @@ And one hole comes from 0010's hub-time rule:
 /// `HUB_ADMIN_TOKEN`: 32 to 1,024 visible ASCII characters (0x21..=0x7E). No `Debug`.
 pub struct AdminToken(String);
 pub enum AdminAuth { Disabled, Required(AdminToken) }
-pub enum AdminAuthError { NotUnicode, NotVisibleAscii, TooShort, TooLong, SameAsPushToken }
+pub enum AdminAuthError { NotUnicode, NotVisibleAscii, TooShort, TooLong, SameAsPushToken, MailKeyShaped }
 ```
 
 `HUB_ADMIN_TOKEN` is parsed in `main`, with `HUB_PUSH_TOKEN`, before the store opens (so an
@@ -65,9 +81,14 @@ invalid token refuses startup before any directory or file is created):
 | any other character: whitespace, non-ASCII | refuse startup (`NotVisibleAscii`): HTTP header values carry only visible ASCII reliably (`HeaderValue::to_str`, httparse trims whitespace, browsers send U+0080–U+00FF as Latin-1), so such a token could never be presented |
 | fewer than 32 characters | refuse startup (`TooShort`): there is no lockout, so the token's entropy is the control, and `openssl rand -hex 32` gives 64 characters |
 | more than 1,024 characters | refuse startup (`TooLong`) |
-| equal to `HUB_PUSH_TOKEN` | refuse startup (`SameAsPushToken`): every agent host holds the push token |
+| equal to `HUB_PUSH_TOKEN`, as set or with surrounding ASCII whitespace trimmed | refuse startup (`SameAsPushToken`): every agent host holds the push token, and `PushToken` keeps its value verbatim, so `" X "` and `X` would otherwise count as different secrets |
+| standard base64 of exactly 32 bytes, the shape of every RFC 0017 key | refuse startup (`MailKeyShaped`), whether or not the mail intake is on: the hub's `HUB_MAIL_KEY` derives every mail system's key and forges any mail report, and each mail agent host holds its own derived key (`system-hub mail-key` output, also 32 bytes in base64), which is the push token's reasoning. A shape rule catches the master key, every derived key and keys of systems not yet registered, with no per-system work and no comparison that whitespace or padding could sidestep. `openssl rand -hex 32` (64 hex characters, 48 bytes as base64) is unaffected; `openssl rand -base64 32` is refused, and the message says to use hex |
 
-Every refusal names the variable, never the value.
+Every refusal names the variable, never the value. `MailKeyShaped` decodes with the same
+engine `MailMasterKey::from_base64` uses (STANDARD) and looks only at the decoded length, so it
+compares no secret and needs no constant time; it doesn't read `HUB_MAIL_KEY` at all. The
+`mail-key` subcommand (RFC 0017) doesn't read `HUB_ADMIN_TOKEN`, so the rule binds only the
+server.
 
 - `push::config::PushToken` gains one crate-visible method, `pub(crate) fn is_same_secret(&self,
   other: &[u8]) -> bool`, constant-time like `accepts`; `main` uses it once.
@@ -105,7 +126,7 @@ Every refusal names the variable, never the value.
 | `POST /api/systems` | register a polled system (0011 §2), **now admin-only** |
 | `PUT /api/systems/:id` | edit a system (0011 §2), **now admin-only** |
 | `DELETE /api/systems/:id` | delete a system (0011 §3), **now admin-only** |
-| `POST /api/offline-systems/delete` | delete the systems in `{"ids":[…],"min_minutes":N}` (at most 50 ids) that are **still** offline candidates when the request runs; one transaction per request; answers `deleted`, `skipped` (no longer candidates) and nothing else |
+| `POST /api/offline-systems/delete` | delete the systems in `{"ids":[…],"min_minutes":N}` (at most 50 ids) that are **still** offline candidates when the request runs (re-checked against `LiveStatus` and its generation just before the store call); one transaction per request; answers `deleted`, `skipped` (no longer candidates) and nothing else |
 | `PUT /api/systems/:id/retention` | set a system's override: `{"raw":"24h","minute":"14d","hour":"400d"}`, each tier bounded as in 0010 §5 (omitted tiers follow the global policy) |
 | `DELETE /api/systems/:id/retention` | remove the override |
 
@@ -114,15 +135,45 @@ global policy, every override and each pending shortening), and `GET /api/storag
 
 - **Offline candidates.** `min_minutes` is a bounded newtype, 10 to 525,600 (a year), default 60;
   out of range is 400. A system is a candidate when its `LiveStatus` is
-  `Offline { since }` and **0010's retention clock** is at least `min_minutes` past `since`. The
+  `Offline { since }` and **0010's retention clock** is at least `min_minutes` past `since`.
+  **After a restart, `since` is the system's recovered last contact, for every source**: 0010
+  §10 marks polled systems `Offline { since: last_contact }` at open, and the release requires
+  the first marking after open by the push sweep (RFC 0016's grace) and by the mail overdue
+  sweep (RFC 0017 §7) to do the same (the open time when the system has never been heard from),
+  not `since: now`. Otherwise every hub restart would reset a push or mail system's offline age.
+  **That last contact is on hub time for every source.** Push and poll already are (0010 §10,
+  0016 §8). A mail system's *last seen* is its newest report's agent-stamped `created_at` (0017
+  §7), which can lag the hub by up to the 7-day receipt window; used as `since`, a reporting
+  mail system with a slow clock would be listed as offline for days after a restart and deleted.
+  So the 0010 amendment stores, for a mail system, the **hub time at which its newest report was
+  accepted** as `last_contact`; `created_at` stays for display and for 0017's overdue rule only.
+  The retention clock trails hub time after an outage, so with `since` on hub time the age shown
+  is a lower bound and a candidate can only appear late, never early.
+  With the mail intake off, no sweep marks mail systems and they stay `Unknown`, so they are
+  **never candidates while the intake is off**; they can still be deleted one at a time. The
   retention clock can't outrun real time by more than 2× nor pass the system clock, so a
   forward clock fault can't make every briefly offline system look offline for a year.
-  **Disabled poll systems are never candidates**: an operator who disabled a system to keep its
-  history doesn't lose it to a bulk delete. The list answers each candidate's id, name and
+  **Disabled systems are never candidates**, polled or mail: an operator who disabled a system to
+  keep its history doesn't lose it to a bulk delete. (A disabled mail system's status is only
+  "last known": 0017's overdue sweep skips it, so an `Offline` it held when disabled would
+  otherwise age into a candidate.) A **mail system** is a candidate once 0017's overdue sweep
+  has marked it `Offline { since }` and `min_minutes` have passed on the retention clock, like
+  any other; a push system as today. The list answers each candidate's id, name and
   `since`, which the dashboard shows.
 - **Routing.** The offline routes live under `/api/offline-systems`, so no static segment can
   shadow a system whose id is `offline` or `delete-offline` (which `SystemId` allows and a push
   client can choose).
+- **Sources are fixed by the transport, never by the API.** `POST` registers only a polled
+  system: a `url` that is a source sentinel (`push://`, `mail://`) answers 400, so `POST` can't
+  mint a row the poller skips or one that 0017's mail intake refuses to write into. `PUT` can't
+  change a system's source in either direction, for any pair of push, poll and mail (400): a
+  polled system can't be made a mail one (which would make its own reports `TransportMismatch`)
+  nor a mail or push system a polled one (which would turn its agent away under §3). Today's
+  `PUT` stores any `url`, sentinels included; 0011's `Source` and `SystemUrl` must carry `Mail`
+  for this rule to hold (header).
+- **Deleting a mail system** retires its receipts as 0017 §6 does, in the same transaction as the
+  delete; the admin token adds nothing else. Its agent, still running, registers it anew with
+  its next report, as a push agent does on reconnect.
 - **Ids.** Every `:id` route parses the path into `SystemId` and answers 400 otherwise. With no
   migration, every stored id is a valid `SystemId`, and the standing rule that `DELETE` takes the
   stored id as it is ends with this release.
@@ -144,8 +195,19 @@ global policy, every override and each pending shortening), and `GET /api/storag
   - a tier that gets longer applies at once, since it deletes nothing;
   - a tier that gets shorter becomes a `PendingShortening` effective **10 minutes of `Instant`
     time** later;
-  - **a tier set back to exactly its enforced value removes that tier's pending entry**: the
-    natural revert;
+  - each tier of an override is `TierSetting { Global, Fixed(Duration) }`, and its pending entry
+    an `Option<PendingShortening>` whose `next` is a `TierSetting` too: 0010 §5's
+    `pending: Vec<PendingShortening>` with `next: Duration` can't say "follow the global
+    policy", nor rule out two entries for one tier, so the 0010 amendment changes it (header).
+    A pending `Global` resolves to the global policy **when it takes effect**, so a restart with
+    a new `HUB_RETENTION` is followed; the override row is removed once every tier is `Global`
+    with nothing pending;
+  - a tier holds **at most one** pending entry, and **every change to a tier replaces or drops
+    it**: set back to exactly its enforced value, or lengthened past it, drops the entry (the
+    natural revert; enforced 24 h, pending 1 h, then `PUT 48h` applies 48 h at once and leaves
+    nothing pending); shortened again (to any value below the enforced one), the entry is
+    replaced and re-armed with the full 10 minutes from that change, so a later edit can only
+    lengthen the window;
   - `DELETE .../retention` and a `PUT` that omits a tier are compared the same way (dropping an
     override longer than the global policy is a shortening);
   - a mixed change does both, tier by tier;
@@ -170,19 +232,63 @@ the Registry:
 |---|---|
 | nothing | register as a push system (RFC 0008's transaction) |
 | a `Push` system | accept, as today |
-| a `Poll` system (0011's `Source::Poll`) | **refuse**: `auth_error` / `system id belongs to a polled system`, a new `HandshakeRejection` variant. The polled system's record and `LiveStatus` are not touched. |
+| a `Poll` system (0011's `Source::Poll`) | **refuse** with `auth_error` / `transport mismatch`. The polled system's record and `LiveStatus` are not touched. **New.** |
+| a `Mail` system (RFC 0017) | **refuse** with `auth_error` / `transport mismatch`, as today (0017 §6). Unchanged. |
 
-- The refusal is logged at `warn` at most **once per id per hour**, then counted, reusing §1's
-  limiter. A refused agent retries every 5 s, and an unauthenticated loop (with the push token
-  unset) can't flood the log.
-- `PUT` can't change a system's source (0011) and needs the admin token, so nobody can flip a
-  system between push and poll to get around the rule.
-- The check runs where RFC 0008 §4 puts it: after the token and the `SystemId` rule, before
-  registration.
+The rule is one sentence: **a push connection may feed only a push system**, or register a new
+one. Every id the registry holds under another source is a *reserved push id*.
+
+- **Where it is decided.** Not in `authenticate`, which stays a pure parse of the handshake
+  message with no registry (0017's reasoning, kept). It is decided by the registration unit, on
+  the blocking pool after the token check, in the **same transaction** that would register the
+  id (today `insert_system_if_absent` answers `Known(url)`, and `SystemSource::of(url)` decides;
+  under 0011, `Source` inside `transact`). So no check-then-insert can race a mail scan, a
+  `POST` or an admin `DELETE`. 0017's `Refusal::TransportMismatch { id }` widens to
+  `TransportMismatch { id, held: ReservedSource }`, with `enum ReservedSource { Poll, Mail }`
+  (no `Push` variant: a push row is never a mismatch, so the type can't say one is).
+- **One answer for both.** The agent-facing message stays `transport mismatch`, the string 0017
+  already ships, so the handshake gains no new `auth_error` row and every shipped agent treats
+  it as any `auth_error` (logs it, retries after 5 s). The previous drafts' new
+  `HandshakeRejection` variant and its message are dropped (Review).
+- **Logging.** The refusal is logged at `warn` at most **once per id per hour**, through 0017's
+  `warn_mismatch_hourly` (`hourly_warning`), now naming which source holds the id; the rest are
+  counted as `push_transport_mismatches` in 0010's `/api/storage`. A refused agent retries
+  every 5 s, and an unauthenticated loop (with the push token unset) can't flood the log. Only
+  held ids enter the per-id map. The map moves from the push router's private `PushContext`
+  to `AppState`, so the delete paths (`DELETE` and "delete offline") remove a deleted id's entry
+  (today `mismatch_warned` only grows). A refusal decided just before a delete can re-insert its
+  entry after the prune, since the warning runs after the registration transaction returns; that
+  leaves at most one stale entry per racing delete, accepted. The map is bounded by the registry
+  plus those, not by every id ever refused.
+- `PUT` can't change a system's source in any direction (§2) and needs the admin token, so
+  nobody can flip a system between push, poll and mail to get around the rule.
+- **RFC 0008 must say the same** (header): its §4 order today runs "the reserved-id rule (RFC
+  0012), then registration", and its §3 step 1 answers `AlreadyRegistered` for a present row
+  "whatever its source". Built that way, a mail scan registering an id between the pre-check
+  and the transaction would let the push connection write `LiveStatus` into a mail row, which
+  0017 closed. The release amends 0008 so step 1 answers `Reserved(ReservedSource)` for a
+  non-push row **inside the transaction**, its §4 table gains the `transport mismatch` row, and
+  the rule is no longer a separate step before registration. A refused id is never counted
+  against 0008's registry limit.
 - **A behaviour change.** A system registered by `POST` for polling can no longer also push under
   its UUID. Agents push under their machine id (or RFC 0016's other sources), never under a
   hub-minted UUID, so an honest fleet is unaffected. An operator moving a host from poll to push
-  deletes the polled entry (admin); the agent registers itself on its first push.
+  deletes the polled entry (admin); the agent registers itself on its first push. Moving a host
+  from mail to push works the same way (0017's Rollout): stop its mail, delete the mail entry,
+  then let the agent push.
+- **Not closed: squatting before the first report.** A push token holder can push under a mail
+  agent's id *before* the hub has seen that agent's first report; the id is then a push row, and
+  0017's intake refuses the mail reports (`TransportMismatch`, counted). The operator sees it and
+  deletes the squatting row (admin). Binding ids to per-system credentials is RFC 0011's sealed
+  tokens, not this RFC. API1 below says so.
+- **The same window after a delete.** Deleting a mail system (one at a time, or as an overdue
+  candidate of "delete offline") frees its id, which the open `GET /api/systems` and
+  `GET /api/offline-systems` listed. Until that agent's next report, a push token holder can
+  register the id as push and turn the reports away as above. No reservation is kept for a
+  deleted id: the agent's next report re-registers it only because nothing holds it, and a
+  tombstone that held its source would also need expiring. The README tells operators to set
+  `HUB_PUSH_TOKEN` (with it unset, *anyone* can squat) and, after deleting a mail system whose
+  agent still runs, to check that it comes back as a mail system.
 
 ### 4. The dashboard
 
@@ -200,8 +306,10 @@ the Registry:
   /api/offline-systems/delete` in **batches of at most 50 ids**, each re-validated by the server.
   It **stops at the first batch that fails** and reports what was deleted, what was skipped, and
   which batches weren't sent. One prompt covers the batches of one confirmation.
-- **Deleting a push system** warns that an online agent will register it again unless it is
-  stopped (0011 §3).
+- **Deleting a push or mail system** warns that its agent will register it again unless it is
+  stopped (0011 §3; for mail, with its next report, 0017 §6). The page tells them apart by the
+  `url` the API reports, compared exactly with `push://` and `mail://` (0011's per-source table);
+  a hostile hub can only pick which warning is shown, and `xss.mjs` serves both.
 - No retention UI in this RFC; retention is set with `curl`, and the README shows how.
 - **`xss.mjs` is extended**, because this opens new paths from the page to requests:
   - **an injected CSP catches every real network attempt**, whatever the API: the harness inserts
@@ -220,7 +328,9 @@ the Registry:
     `navigator.sendBeacon` and `WebSocket` are recorded too;
   - the hostile hub serves systems whose ids, names and URLs try to reach the modal (including an
     injected `<div id="admin-token-modal">`), and a hostile offline list whose names must render
-    **as text** in the confirmation;
+    **as text** in the confirmation; its systems include a push, a mail and a polled one, plus
+    near-miss URLs (`mail://x`, `MAIL://`, `push:// `) that must get the polled system's
+    delete confirmation, with no re-registration warning;
   - the test enters a marker token for each admin action and checks it was sent **only** as
     `Authorization` on that action's expected routes: never in a URL (`location.href` included),
     a body, `EventSource`, XHR, beacon, WebSocket, CSP report, `localStorage`, `sessionStorage`,
@@ -256,18 +366,25 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 
 - **New context: Hub Access** (hub): `AdminToken`, `AdminAuth`, the admin middleware, refusal
   counting and the audit log. Mirrors the agent's Agent Access.
-- **Ingestion**: the handshake gains the reserved-id rule and a `HandshakeRejection` variant.
+- **Ingestion**: the registration unit's reserved-id rule widens from mail to every non-push
+  source (`Refusal::TransportMismatch { id, held: ReservedSource }`); `authenticate` and
+  `HandshakeRejection` are unchanged. The mail intake is unchanged.
 - **Fleet Registry**: registry writes are admin-only; "delete offline" is a server-side rule over
-  `LiveStatus` and the retention clock.
+  `LiveStatus` and the retention clock, never touching a disabled system; `POST` and `PUT` can't
+  mint or change a source (push, poll, mail).
 - **Fleet History**: retention changes with per-tier pending shortenings against the enforced
   policy, stored with the override in the store.
-- **Glossary**: added admin token, admin route, offline candidate, reserved push id, listen
-  address; changed **push handshake** (a new rejection).
-- **Published contracts**: the handshake gains one `auth_error` message; `POST`, `PUT` and
+- **Glossary**: added admin token, admin route, offline candidate, reserved push id (an id the
+  registry holds under a poll or mail source); changed **push handshake** (`transport mismatch`
+  now also for a polled system's id) and **mail system** (deleted only with the admin token).
+  *Listen address* is RFC 0015's already.
+- **Published contracts**: the handshake's existing `transport mismatch` answer now also covers
+  polled ids (no new message); `POST`, `PUT` and
   `DELETE` on `/api/systems` need a token (breaking for scripts); two routes under
   `/api/offline-systems`; bodies capped; 422 for bodies that don't parse.
 - **Mixed-version fleet**: an old agent pushing under a polled id is refused, and retries every
-  5 s; other agents are unaffected.
+  5 s; mail agents are unaffected (the mail report format doesn't change); other agents are
+  unaffected.
 
 ## Alternatives considered
 
@@ -300,9 +417,13 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
   text; `xss.mjs` checks every way the token could leave the page, under an enforced CSP.
 - **A04 Insecure Design:** a 10-minute monotonic window for every shortening, compared against
   the enforced policy, stored with the override and re-armed at every open (it guards against
-  mistakes, not a stolen token); offline age on the guarded retention clock;
-  `deny_unknown_fields` on the retention and offline-delete bodies; no push token or poll token
-  reuse as the admin token.
+  mistakes, not a stolen token); offline age on the guarded retention clock; "delete offline"
+  re-checks each candidate just before its transaction, but `LiveStatus` is in memory and 0010
+  §9's lock order forbids holding it across a store call, so a system whose first contact in
+  `min_minutes` or more lands in those milliseconds is still deleted (it was listed by name and
+  confirmed; a push or mail agent registers it again, a polled one must be re-added);
+  `deny_unknown_fields` on the retention and offline-delete bodies; no push token, poll token or
+  mail master key reuse as the admin token; sources fixed by the transport, never by `POST`/`PUT`.
 - **A05 Security Misconfiguration:** unset means disabled (fail closed). A token that can't be
   presented, or is too short, refuses startup. `docker-compose.yml` passes `HUB_ADMIN_TOKEN:
   ${HUB_ADMIN_TOKEN:-}` with no development default, and `.env.example` shows `openssl rand -hex
@@ -315,15 +436,19 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
   policies; admin actions audited.
 - **A09 Logging & Monitoring Failures:** per-reason refusal counters; the audit log with the peer
   address (behind a reverse proxy always the proxy, which attributes nothing); reserved-id
-  refusals limited per id. Push handshake refusals are still logged without a peer address
+  refusals limited per id, naming the source that holds it. Push handshake refusals are still logged without a peer address
   (open question).
 - **A10 SSRF:** registering a URL now needs the admin token, which narrows who can use the
   standing SSRF surface. The host isn't validated (standing).
 
 **OWASP API Security Top 10 (2023)**
 
-- **API1:** reserved push ids close the displacement of polled systems. Push systems sharing a
-  self-asserted id remain the standing risk.
+- **API1:** reserved push ids close the displacement of polled systems; mail systems were closed
+  by 0017. Push systems sharing a self-asserted id remain the standing risk, and so does a push
+  token holder registering a mail agent's id before its first report (§3), which turns that
+  agent's reports away until the operator deletes the squatting row; deleting a mail system,
+  including through "delete offline", reopens that window for its id (§3). Neither is widened
+  beyond what deletion already allowed before this RFC.
 - **API2:** a new credential, handled as above.
 - **API3:** the retention and offline-delete bodies `deny_unknown_fields`; `POST`/`PUT` keep
   ignoring unknown fields, and their DTOs list only settable fields.
@@ -335,9 +460,12 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 - **API7:** see A10.
 - **API8:** see A05.
 - **API9:** the six admin routes, the three open read routes (`GET /api/offline-systems`,
-  `GET /api/retention`, `GET /api/storage`), `HUB_ADMIN_TOKEN` (`HUB_LISTEN` is already in it, RFC 0015), the new `auth_error`
-  row in the README's push-protocol table, and the breaking changes go into the README.
-- **API10:** N/A.
+  `GET /api/retention`, `GET /api/storage`), `HUB_ADMIN_TOKEN` (`HUB_LISTEN` is already in it, RFC 0015), the README's push-protocol
+  row for `transport mismatch` (now also a polled system's id) and the README's push paragraph
+  that says a polled system's id is accepted (replaced), `/api/storage`'s two new fields
+  (`admin_refusals`, `push_transport_mismatches`), and the breaking changes go into the README.
+- **API10:** the push handshake and the mail intake consume agent input; the reserved-id rule
+  reads only the registry, after the token check, and the mail report format is unchanged.
 
 ## Testing plan
 
@@ -380,8 +508,42 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
   `/api/systems` with an unknown field (accepted, ignored); an 8 KiB + 1 body (413).
 - **Reserved push ids**, on a real server: push under a `Poll` id with a wrong token (`invalid
   token`: the token is checked first); with the right token (refused, not registered, the polled
-  system untouched, logged once per hour); under a `Push` id (accepted); under a new id
-  (registered).
+  system untouched, answered `transport mismatch`, logged once per hour naming `Poll`); under a
+  `Mail` id (still refused as 0017's tests pin, now logging `Mail`); under a `Push` id
+  (accepted); under a new id (registered). The `Poll` refusal is decided in the registration
+  transaction: a mail report and a push handshake for the same new id racing on a real server
+  end with exactly one row, of one source, and the loser refused (`transport mismatch` for the
+  push, `TransportMismatch` for the mail); an admin `DELETE` racing a push re-registration ends
+  with either no row or one push row, never a half-deleted one. The refusal count reaches
+  `/api/storage`; deleting a refused id removes its hourly-warning entry. `ReservedSource` is matched exhaustively, with no `Push` arm.
+- **Sources fixed**: `POST` with `url` `push://` or `mail://` (400, nothing stored); `PUT` from
+  each source to each other one, as a table of the six pairs (400, the row unchanged); `GET`
+  then `PUT` back of a mail system (accepted as no-ops).
+- **Mail systems under admin**: `DELETE` of a mail system without the token (401, receipts not
+  retired), with it (deleted, receipts retired in the same transaction); an overdue mail system
+  is an offline candidate after `min_minutes`; a mail system disabled while `Offline` never is.
+- **`MailKeyShaped`**, as a table: the base64 of 32 bytes (refused, naming the variable and not
+  the value), a `system-hub mail-key` output (refused), 64 hex characters (accepted), base64 of
+  31 and 33 bytes (accepted), with `HUB_MAIL_KEY` unset and set (the same outcomes); a value
+  `MailMasterKey::from_base64` accepts is always refused, so a change of decoding engine on one
+  side fails the test.
+  **`SameAsPushToken`**: equal to the push token, and equal to a push token set with surrounding
+  spaces (both refused).
+- **Offline age across a restart**: a push system and a mail system last heard from 3 days ago
+  are candidates for `min_minutes=1440` once the sweeps run after a restart, with `since` their
+  last contact; mail systems with the intake off are not candidates; a mail agent whose clock
+  is 2 days slow, reporting every 15 minutes, is **not** a candidate for `min_minutes=60` after a
+  restart (its `since` is the hub time of its newest report's intake).
+- **Pending shortening replaced**: enforced 24 h, `PUT raw=1h`, then `PUT raw=48h`: 48 h at once
+  and no shortening after 10 minutes; `PUT 1h` then `PUT 2h`: one pending entry, for 2 h, due 10
+  minutes after the second `PUT`.
+- **Released contract** (owner's decision, `tdd_guard.py release --authority user`, quoted in the
+  change summary): `push/mod.rs::a_push_connection_for_a_polled_id_never_marks_it_offline`, which
+  pins today's acceptance of a polled id, is replaced by the refusal rows above. It is the only
+  test that changes its expectation. `Admitted::Polled` goes, so the match arm `Admitted::Polled |
+  Admitted::MailSystem => None` in `push/ingest.rs::ending_a_connection_marks_its_system_offline_and_evicts_its_live_metrics`
+  changes too: that test pins RFC 0007 §4 and keeps every expectation, so it is released with
+  `--authority author` as the call-site follow-through of the removed variant.
 - **`xss.mjs`**: the extension of §4, including the CSP canary, `Headers` normalisation, the
   absent-or-string body rule, names rendered as text, `location.href` and IndexedDB scans, the
   identity-based exemption against an injected same-id node, one modal at a time, and the three
@@ -390,8 +552,12 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
 ## Impact on `docs/ARCHITECTURE.md`
 
 - **Trust boundaries**: *Client → Hub* gains admin routes, the audit log and the CORS note;
-  *Agent → Hub (push)* gains reserved ids; *Hub API → hub dashboard* gains the per-action token.
-- **Domain model**: the Hub Access context and the glossary.
+  *Agent → Hub (push)* gains reserved ids for polled systems beside 0017's mail ones; *Agent →
+  Hub (mail)* notes that deleting a mail system needs the admin token; *Hub API → hub dashboard* gains the per-action token.
+- **Components** (`system-hub`): the presence paragraph that says "a polled system's id gets
+  none" (no lease) changes to "is refused"; `Admitted::Polled` is gone.
+- **Domain model**: the Hub Access context, and the glossary (reserved push id; push handshake
+  and mail system amended).
 - **Testing architecture**: `xss.mjs`'s injected CSP with its canary, wider stubs and token checks;
   the hub's real-binary tests on `127.0.0.1:0` are RFC 0015's already.
 - **Open questions**: closes "No hub-side client authentication" for writes, API1 for polled
@@ -405,11 +571,16 @@ a cross-origin preflight for an admin request fails; and the token isn't ambient
   With it unset they answer 403, including the dashboard's add and delete buttons. The README
   flags it and shows how to generate a token. With no migration (0010), re-registering polled
   systems after the upgrade needs this token.
-- **Behaviour change for agents** pushing under a polled system's id: refused.
+- **Behaviour change for agents** pushing under a polled system's id: refused with `transport
+  mismatch`. Mail agents: no change; deleting a mail system needs the admin token, and the
+  dashboard warns that its agent re-registers it.
 - `docker-compose.yml` and `.env.example` gain `HUB_ADMIN_TOKEN` (no default value), and the
   compose file's header comment, which says tokens default to development placeholders, is
-  corrected: the admin token has none.
-- Ships in the same release as 0008, 0010 and 0011, after the static-files prerequisite.
+  corrected: the admin token has none. `.env.example` says to generate the admin token with
+  `openssl rand -hex 32`, that it must differ from `HUB_PUSH_TOKEN`, and that a base64 32-byte
+  value (the shape of every mail key) is refused.
+- Ships in the same release as 0008, 0010 and 0011, after the static-files prerequisite, and
+  after 0008, 0010 and 0011 are amended as the header lists.
 
 ## Review
 
@@ -521,5 +692,54 @@ Rejected). Every CONFIRMED finding of the earlier passes, and what it is now:
 | inventory: edit UI, peer-address item, compose comment, A09 (second) | **resolved**; the peer-address item stays open (third pass) |
 | legacy push systems imported as polled (second, PLAUSIBLE) | **moot**: no import, so no legacy polled system with a non-UUID id |
 
-**Still open**: nothing CONFIRMED. The next `rfc-adversary` pass reviews this rewrite before the
-RFC is accepted.
+**Mail amendment (2026-10-03).** RFC 0017 (Implemented) added mail systems after the passes
+above. What this RFC changed for them, before the fourth pass:
+
+| Change | Where |
+|---|---|
+| the release requires 0010 and 0011 amended for `Source::Mail`, `mail_receipts` and the overdue marking | header, Rollout |
+| the admin token can't have a mail key's shape (`MailKeyShaped`, replacing the first wording's `SameAsMailKey`, fourth pass) | §1 |
+| disabled systems of any source are never offline candidates; overdue mail systems are | §2 |
+| `POST` can't take a sentinel URL; `PUT` can't change a source in any direction, mail included | §2 |
+| deleting a mail system retires its receipts, behind the token | §2, §4 |
+| the reserved-id rule moves out of `HandshakeRejection` into the registration unit, as 0017's `TransportMismatch`, widened to `{ id, held: ReservedSource }`; one answer, `transport mismatch`, and no new `auth_error` message | §3, Domain impact |
+| squatting a mail agent's id before its first report stays open | §3, API1 |
+| `xss.mjs` serves push, mail, polled and near-miss URLs for the delete warning | §4 |
+
+`rfc-adversary`, fourth pass (the redb rewrite and the mail amendment). Every finding was acted
+on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| RFC 0008 runs the reserved-id rule before its transaction and answers `AlreadyRegistered` "whatever its source": a mail scan between the two lets a push connection write into a mail row | CONFIRMED | 0008 joins the RFCs the release amends: `Reserved(ReservedSource)` inside the transaction, a `transport mismatch` row in its §4 (header, §3) |
+| `SameAsMailKey` compared the text, but the hub trims the key before decoding: a secret file's trailing newline sidesteps it | CONFIRMED | replaced by a shape rule, `MailKeyShaped`: any standard base64 of 32 bytes is refused; `SameAsPushToken` also compares the trimmed push token (§1) |
+| push and mail offline ages restart at every hub start; mail systems never candidates with the intake off | CONFIRMED | the first marking after open uses the recovered last contact for every source (a requirement on 0010/0016/0017's sweeps); mail systems with the intake off are stated not to be candidates; the shown age is a lower bound (§2) |
+| a test under contract is inverted and unnamed; README and ARCHITECTURE describe the old acceptance | CONFIRMED | the test named as a release with authority user; `Admitted::Polled` named; README push paragraph and ARCHITECTURE § Components added (Testing plan, API9, Impact) |
+| the `POST`-vs-push race test can't be built (`POST` mints the id) | CONFIRMED | replaced by mail-vs-push and `DELETE`-vs-re-registration races (Testing plan) |
+| the mismatch map is never pruned and the count doesn't exist | CONFIRMED (low) | pruned on delete; `push_transport_mismatches` in `/api/storage`; test rows (§3) |
+| citations: 0017 §5 for the push refusal; 0010 attributes `HUB_LISTEN` to 0012 | CONFIRMED (wording) | fixed here and in 0010 §8 |
+| a lengthened tier may leave its pending shortening armed | PLAUSIBLE | one pending entry per tier; every change replaces or drops it; a re-shortening re-arms the full window; test rows (§2) |
+| the offline re-check isn't atomic with the delete | PLAUSIBLE | accepted and stated in A04: re-checked just before the store call; the residual window is milliseconds after ≥ `min_minutes` offline (§2, A04) |
+| per-system mail keys aren't checked against the admin token | PLAUSIBLE | covered by `MailKeyShaped` (§1) |
+| deleting a mail system reopens the squatting window for its id | PLAUSIBLE | documented with the README advice (set `HUB_PUSH_TOKEN`, check the system returns as mail); no source reservation (§3, API1) |
+
+Came closest and survived in the fourth pass: a clock or outage fault making polled systems
+instant candidates, and CORS `Any` with `Authorization`.
+
+`rfc-adversary`, fifth pass (the fourth pass's resolutions only). Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| a mail system's last contact is the agent's `created_at`: after a restart a reporting mail system with a slow clock is a candidate for days | CONFIRMED | mail `last_contact` stored as the hub time of the newest report's intake (a 0010 amendment); `created_at` only for display and the overdue rule; a slow-clock test row (§2, header) |
+| the released-contract row named a line inside an unrelated test, and "go with it" read as deleting it | CONFIRMED | the test named; only its match arm changes, released with authority author; the user-authority release is the polled-id test alone (Testing plan) |
+| 0010 §5's `Vec<PendingShortening>` with `next: Duration` can't hold "one per tier" nor "follow global" | CONFIRMED | `TierSetting { Global, Fixed }`, one `Option` per tier, resolved when it takes effect; a 0010 amendment (§2, header) |
+| Rollout omitted 0008; `.env.example` described the old comparison; API9 missed the `/api/storage` fields | CONFIRMED (wording) | fixed (Rollout, API9) |
+| the mismatch map can't be reached from the delete handlers, and a racing refusal re-inserts after the prune | PLAUSIBLE | the map moves to `AppState`; the race accepted, bounded by deletes (§3) |
+
+Came closest and survived in the fifth pass: `MailKeyShaped` against padding, alphabet and
+whitespace variants (both sides decode padded `STANDARD` after trimming); a test pins that the
+rule uses the same engine as `MailMasterKey::from_base64`, so a change of engine fails it.
+
+**Still open**: nothing CONFIRMED. The fifth pass's resolutions adopt the fixes it proposed and
+add no design of their own, so no sixth pass was run. The amendments this RFC requires of 0008,
+0010 and 0011 (header) get their own `rfc-adversary` passes when those RFCs are amended.
