@@ -18,6 +18,7 @@
 //! for agents that can reach neither the hub nor the internet.
 
 pub mod batch;
+pub mod client;
 pub mod config;
 pub mod outbox;
 pub mod report;

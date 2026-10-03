@@ -99,6 +99,7 @@ impl<M> Outbox<M> {
         std::mem::take(&mut self.dropped)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.len()
     }

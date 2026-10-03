@@ -32,7 +32,7 @@ use super::seal::{MailKey, MailKeyError};
 /// Whether the agent mails reports, and how.
 pub enum MailConfig {
     Off,
-    On(MailSettings),
+    On(Box<MailSettings>),
 }
 
 /// Everything the mail client needs. No `Debug`: it holds the key and the relay password.
@@ -132,7 +132,7 @@ impl MailConfig {
         let credentials = credentials(read("MAIL_RELAY_USERNAME")?, read("MAIL_RELAY_PASSWORD")?)?;
         check_plain(tls, &relay, credentials.is_some())?;
         let interval = interval(read("MAIL_INTERVAL")?)?;
-        Ok(Self::On(MailSettings {
+        Ok(Self::On(Box::new(MailSettings {
             to: address("MAIL_TO", &to)?,
             from: read("MAIL_FROM")?
                 .map(|from| address("MAIL_FROM", &from))
@@ -144,7 +144,7 @@ impl MailConfig {
             key: MailKey::from_base64(&required("MAIL_KEY")?).map_err(MailConfigError::Key)?,
             interval,
             sample_interval: sample_interval(read("MAIL_SAMPLE_INTERVAL")?, interval)?,
-        }))
+        })))
     }
 }
 
@@ -269,11 +269,12 @@ mod tests {
     #[test]
     fn the_mail_variables_are_parsed_or_refused() {
         use MailConfigError::*;
-        let cases: Vec<(
-            &str,
+        type Case = (
+            &'static str,
             HashMap<&'static str, String>,
             Result<(), MailConfigError>,
-        )> = vec![
+        );
+        let cases: Vec<Case> = vec![
             ("the defaults", base(), Ok(())),
             (
                 "no MAIL_TO: off, whatever else",
@@ -407,7 +408,7 @@ mod tests {
     #[test]
     fn the_defaults_are_starttls_five_minutes_and_a_sample_a_minute() {
         let settings = match parse(&base()) {
-            Ok(MailConfig::On(settings)) => Some(settings),
+            Ok(MailConfig::On(settings)) => Some(*settings),
             Ok(MailConfig::Off) | Err(_) => None,
         };
         assert!(settings.is_some(), "mail is on");
