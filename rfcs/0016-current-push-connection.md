@@ -1,6 +1,6 @@
 # RFC 0016: The Current Push Connection, and the Agent's Id Computed Once
 
-- Status: Draft
+- Status: Accepted
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-29 (revised the same day for two `rfc-adversary` passes; a third pass's findings are open; see Review)
 - Affects: `system-hub` (a push connection's end, a disconnection sweep, the poller), and
@@ -117,8 +117,11 @@ impl PushPresence {
   It wraps on overflow (at a million connections a second, after 584,000 years).
 - **A live current connection** is an entry whose `Weak` still upgrades: its task hasn't
   returned or unwound. An entry whose task is gone counts as none.
-- **Only a push system has a current connection.** Registration (`register_if_new`) reads the
-  row's `url` with its existence check, in the same statement, and returns
+- **Only a push system has a current connection.** Registration (`register_if_new`) asks
+  SQLite whether the row's `url` is the push sentinel with its existence check, in the same
+  statement (`SELECT url = ?2 FROM systems WHERE id = ?1`, `?2` = `PUSH_URL`, read as an
+  integer), so a hand-stored `url` of any type still maps and never fails registration (RFC
+  0007 §4's rule), and returns
   `Registration::New` or `Registration::Known(SystemSource)`. A new id is registered as a push
   system with status **`Unknown`**, not `Online`: it reads online only once a snapshot is
   stored, so a new host whose frames never decode never reads online. When the id belongs to a
@@ -568,7 +571,10 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - one table over the handshake, observed through the sweep at `up_for` ≥ 120 s: registered
     and open → a new row is `Unknown` and stays so; `registry unavailable` → no entry, so a
     planted `Online` row with that id is swept; a polled system's id → accepted, and its
-    close leaves the polled row `Online` (barrier: the hub's close of the socket);
+    close leaves the polled row `Online` (barrier: the hub drops the socket, read as EOF, as
+    `messages_until_closed` does; a Close frame can come before `end_connection`'s write);
+  - `db_with_unmappable_known_system` gains a row whose `url` is a BLOB: registration answers
+    `Known(Poll)`, never `registry unavailable`;
   - `push_handshake_with_the_configured_token_is_accepted_and_registers_system` asserts the
     new row is `Unknown` (today `Online`);
   - a lease dropped by a panicking task (a test seam that panics in the connection's task after
@@ -715,8 +721,11 @@ checked against axum's `on_upgrade` (`tokio::spawn`) and tokio's harness (the fu
 inside its panic guard).
 
 `rfc-adversary`, third pass, on the second revision (5fe04f6). All resolved in the third
-revision, each by the fix the pass proposed; the red tests in 6842329 and 0fe18c2 follow them
-(`end` takes the lease, the new `sweep` rows, the `Unknown` registration):
+revision, each by the fix the pass proposed. The red tests in 6842329 and 0fe18c2 predate it;
+they are amended in the implementation, before any production code (`end` takes the lease,
+the "online, live" sweep case split into claimed → `Leave` and never claimed → `Leave` at
+119 s / `MarkOffline` at 120 s, the dropped-lease case observed through the sweep, the
+`Unknown` registration):
 
 | Finding | Verdict | Cheapest fix proposed (adopted) |
 |---|---|---|
@@ -733,3 +742,16 @@ revision, each by the fix the pass proposed; the red tests in 6842329 and 0fe18c
 Came closest among the rejected: the honest reconnect that hasn't claimed yet. `end` holds the
 presence lock across its offline write, and the agent's first tick is immediate, so the result
 is a short offline blip.
+
+`rfc-adversary`, fourth pass, on the third revision (d63a300): all nine fixes present, no new
+design flaw.
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the Review claimed the red tests already followed the amendments; one pins the opposite of the new "never claimed" row | CONFIRMED | the Review now says the tests are amended in the implementation, before production code, and lists how |
+| RFC 0010 §10 paraphrases the sweep and misses the "never claimed" row and the `Unknown` registration | CONFIRMED | 0010 §10 points to this RFC's §4 table and §2 registration instead of paraphrasing |
+| reading `url` as text in the existence check can fail on a hand-stored non-text value | PLAUSIBLE | SQLite compares (`url = ?2`, read as an integer); a BLOB-url row in the test database. Decided: adopted |
+| the polled-id test's barrier | PLAUSIBLE | stated as the socket's EOF. Decided: adopted |
+
+The only CONFIRMED findings were a stale claim and a paraphrase, fixed in wording; the RFC is
+`Accepted`.

@@ -668,8 +668,8 @@ tier names, and is an open read like the rest of the hub API.
     It stays in RFC 0016's in-memory `PushPresence`, with each entry's liveness (its lease).
   - **Set only by contact and by transitions.** A successful frame or poll sets `Online` and
     `last_contact`. A failed poll, the end of the current push connection (RFC 0016 §2), and
-    RFC 0016's disconnection sweep (a push system with no live current connection, once the
-    store has been open 120 s) set `Offline { since: now }` unless already offline. `last_contact`
+    RFC 0016's disconnection sweep (whatever RFC 0016 §4's sweep table marks, counting the
+    120 s from the store's open; a new push id starts `Unknown`, RFC 0016 §2) set `Offline { since: now }` unless already offline. `last_contact`
     is a display value, not a liveness rule: a connection that pushes every 300 s is online. Shutdown
     touches nothing.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.
