@@ -19,3 +19,7 @@ system-hub/system-hub.db
 # OS
 .DS_Store
 Thumbs.db
+
+# Local ledger of the test-contract guard (.claude/hooks/tdd_guard.py)
+.claude/tdd-state/
+__pycache__/

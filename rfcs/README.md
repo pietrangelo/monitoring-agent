@@ -43,3 +43,4 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0015](0015-configurable-listen-port.md) | Configurable Listen Address for the Agent and the Hub | Implemented |
 | [0016](0016-current-push-connection.md) | The Current Push Connection, and the Agent's Id Computed Once | Implemented |
 | [0017](0017-mail-transport.md) | Mail Transport: Sealed Reports over SMTP for Agents Without Internet Access | Implemented |
+| [0018](0018-test-contract-guard.md) | The Test-Contract Guard: Frozen Tests, Logged Releases and a Commit Gate | Implemented |

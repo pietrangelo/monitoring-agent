@@ -709,7 +709,11 @@ blocks at the bottom of each source file, per standard Rust convention. Each cra
   depended on.
 - No coverage-measurement tool (`cargo llvm-cov`/`tarpaulin`) is installed in this environment;
   `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` and, for the hub
-  dashboard, `xss.mjs` are what currently gate a change per `CLAUDE.md`.
+  dashboard, `xss.mjs` are what currently gate a change per `CLAUDE.md`, together with the
+  test-contract guard (`.claude/hooks/tdd_guard.py`, RFC 0018): Claude Code hooks that
+  refuse an edit to a graded test without a logged release and refuse a commit while a test
+  differs from `HEAD` unreleased, a new test is ungraded, or production changed unaudited.
+  The guard's own tests (`python3 .claude/hooks/test_tdd_guard.py`) run in CI.
 - CI (`.github/workflows/ci.yml`, GitHub Actions) runs that gate on every pull request,
   every push to `main`, and weekly, so a new stable toolchain's lints surface in a run of
   their own. It has one job per crate (`cargo fmt --check`, then clippy, `cargo test` and
