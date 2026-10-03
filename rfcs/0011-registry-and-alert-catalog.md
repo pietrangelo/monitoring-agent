@@ -94,7 +94,10 @@ The store owns `tombstones`, `retention` and the unprefixed `meta` keys (0010).
 URL 2 KiB, unsealed and sealed token ≤ 2.1 KiB, info 5 × 256 B, map overhead), about 0.7 KiB
 typical. RFC 0008 caps push systems at 10,000 (its upper bound), polled systems need the admin
 token, and mail systems a key the operator derives for each id (RFC 0017 §3: a report opens only
-under its own id's key, so one key registers one system), so at the budgeted 10,000 systems the Registry is ≤ 60 MB worst and ≈ 7 MB typical. redb's
+under its own id's key, so one key registers one system). The two operator-bounded sources have
+no cap of their own, so the worst case is about 6 KiB × all systems (RFC 0008 §2): ≤ 60 MB worst
+and ≈ 7 MB typical at 10,000 systems of any mix, with the count per source and the estimate in
+`/api/storage`. redb's
 page cache (0010 §7) serves the alert tables.
 
 ### 2. Systems
@@ -185,11 +188,13 @@ pub struct AgentToken(String);
 **Generations and registration.** A new registration is one `Durable` transaction that reads
 `systems/<key>` and `meta/hub/generation`, and writes the record and the incremented counter.
 A push registration also reads and increments `meta/hub/push_systems` and asks RFC 0008's
-limit, in the same transaction. **Every registration is source-checked in that transaction**:
+limit, in the same transaction. **Every registration is source-checked on committed state**:
 a present record answers by its source, so a push handshake gets RFC 0008's
 `Reserved(ReservedSource)` for a poll or mail record (RFC 0012 §3), and a mail report gets
-RFC 0017's `TransportMismatch` for a push or poll record. No check runs outside the transaction,
-so neither can race the other or a delete. A mail registration is part of the report's own
+RFC 0017's `TransportMismatch` for a push or poll record. A push handshake decides a held id by
+an MVCC read and a new one inside its transaction (RFC 0008 §3); the mail report decides inside
+its scan's transaction (§7). A stale read can only follow a delete and is fenced by the
+generation, so neither path can write into the other's system. A mail registration is part of the report's own
 transaction (§7) and doesn't touch the push counter. At open, the generation counter is raised to one above every
 generation in `systems` and `tombstones`, as defence in depth.
 
@@ -369,42 +374,46 @@ part of the implementation step.
 ### 7. Mail systems
 
 RFC 0017's `mail_receipts` SQLite table becomes three catalog tables (§1), and its one SQLite
-transaction per report becomes one `transact` (0010 §10's `store_mail_report`). The pure
-decisions stay 0017's (`receipt::fresh`, `receipt::recency`, `mail_status`).
+transaction per report becomes one `Batched` transaction per scan, holding each report's steps
+in turn (0010 §10's `store_mail_scan`). The pure decisions stay 0017's (`receipt::fresh` on the
+system clock, `receipt::recency`, `mail_status`, which 0010 §10 moves onto `received_at`).
 
 ```rust
 /// Persistence struct: a leading version byte, then postcard.
 struct MailReceipt { generation: Generation, created_at: u64, interval_secs: u32, received_at: u64 }
-struct MailNewest { receipt: ReceiptKey, created_at: u64, interval_secs: u32 }
+struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, interval_secs: u32 }
 ```
 
 - **Current and retired.** A receipt is *current* while its generation is the system's, and
   *retired* once the system is deleted (its generation tombstoned) or registered again. This
   replaces 0017's `retired` column: the delete transaction rewrites no receipt (§3), and a
   receipt can't be current for the wrong registration.
-- **The report's transaction**, in 0017 §6's order, all inside `f` on the writer thread:
-  1. read `systems/<key>`: absent → register a `Mail { enabled: true }` system (a new
-     generation); a push or poll record → abort with `TransportMismatch`; a mail record → its
-     generation;
-  2. read `mail_newest/<key>` (written only for the current generation) for `Recency`;
-  3. insert `mail_receipts/<key ‖ run ‖ seq>` unless present: present, **whatever its
-     generation**, is a duplicate, and `f` aborts, so a replay of a report accepted before a
-     delete neither re-registers the system nor stores its points (0017 §6);
-  4. stage the snapshots' points (`CatalogTxn::append`, 0010 §9, at their reported times);
-  5. the alert records (§5);
-  6. for a `Newest` report, write `mail_newest/<key>`.
-  An abort stages nothing and writes nothing. The message is deleted once `transact` returns,
-  accepted or refused, as 0017 deletes every handled message.
+- **Each report's steps**, inside the scan's `f` on the writer thread. **Every refusal is
+  decided by reads, before the report's first write** (0010 §6: an `f` never undoes a write):
+  1. read `systems/<key>`: a push or poll record → `TransportMismatch` (counted), skip the
+     report; a mail record → its generation; absent → to be registered;
+  2. read `mail_receipts/<key ‖ run ‖ seq>`: present, **whatever its generation**, is a
+     duplicate (counted), skip the report, so a replay of a report accepted before a delete
+     neither re-registers the system nor stores its points (0017 §6). Reads see the writes of
+     earlier reports in the same scan, so a duplicate inside one scan is caught too;
+  3. read `mail_newest/<key>` (written only for the current generation) for `Recency`;
+  then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
+  insert the receipt; stage the snapshots' points (`CatalogTxn::append`, 0010 §9, rebased per
+  0010 §2); the alert records (§5); and for a `Newest` report, `mail_newest/<key>`.
+  A skipped report writes and stages nothing. Every message of the scan is deleted after the
+  commit holding the scan, accepted or refused, as 0017 deletes every handled message; a
+  fail-stop before it leaves them for the next scan.
 - **Pruning** moves to 0010's retention pass: receipts whose `created_at` is older than the
   receipt window (7 days) on the **retention clock** are removed, with their
   `mail_receipts_by_time` entries, in its bounded transactions. The retention clock never runs
-  ahead of hub time, and 0017's freshness check refuses a report older than the window on hub
-  time, so a pruned receipt's report is always refused as stale before it could be a
+  ahead of the system clock (0010 §2), and 0017's freshness check refuses a report older than
+  the window on the system clock (0010 §10), so a pruned receipt's report is always refused as stale before it could be a
   duplicate. `mail_newest` is never pruned (0017 §7 needs it), and a deleted system's entry
   goes with the delete.
 - **The overdue sweep** reads `mail_newest` through `read_catalog` (MVCC: it never waits for
-  the writer) on the blocking pool, and calls 0017's `mail_status`; 0010 §10 writes the
-  `LiveStatus`. A mail record with no `mail_newest` entry is overdue, as 0017 §7 says.
+  the writer) on the blocking pool, and calls 0017's `mail_status` on the receipt's
+  `received_at` (0010 §10); 0010 §10 writes the `LiveStatus`. `MailNewest` therefore carries
+  `received_at` too. A mail record with no `mail_newest` entry is overdue, as 0017 §7 says.
 - **No sealed credential.** RFC 0017 offered this RFC's sealed tokens as an alternative to its
   derived mail keys. Not taken: a derived key stores nothing per system and is already bound to
   its id, while a sealed mail credential would add a secret per system to the store for no
@@ -559,8 +568,9 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, interval_secs: u32 }
   - a report for an unseen id registers a `Mail` system in the same transaction as its receipt,
     points and alerts; for a push or poll id, `TransportMismatch` with nothing written; a push
     registration for a mail id answers `Reserved(Mail)`;
-  - a duplicate `(run, seq)` aborts with nothing staged or written, including after the system
-    was deleted (a retired receipt) and when the duplicate is the first report after the delete;
+  - a duplicate `(run, seq)` is skipped with nothing staged or written, including after the
+    system was deleted (a retired receipt), when the duplicate is the first report after the
+    delete, and when both copies are in the same scan; the scan's other reports commit;
   - a new report after a delete registers a new generation, `Newest`, with no `mail_newest`
     carried over;
   - pruning at exactly the receipt window on the retention clock and one second before; a +1
@@ -699,7 +709,7 @@ above; RFC 0012's fourth and fifth passes listed what this RFC must carry for th
 | `Source::Mail { enabled }`, and its column in the per-source API table (`mail://`, no poll settings, `enabled` settable) | §2 |
 | every registration source-checked inside its transaction; RFC 0008's `Reserved` and RFC 0017's `TransportMismatch` decided there | §2 |
 | mail receipts as three catalog tables; retired by generation instead of a column; pruned by the retention pass on the retention clock | §1, §7 |
-| a report's registration, receipt, points and alert records in one transaction; duplicates abort whatever the receipt's generation | §7 |
+| a scan's reports in one transaction, each report's refusals decided by reads before its writes; duplicates skipped whatever the receipt's generation | §7 |
 | delete keeps the receipts and removes `mail_newest` | §3 |
 | alert records from mail reports, with the mail interval in the global-cap rule | §5 |
 | mail systems bounded by operator-derived keys in the memory budget | §1 |

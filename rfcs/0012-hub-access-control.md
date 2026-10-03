@@ -240,10 +240,13 @@ one. Every id the registry holds under another source is a *reserved push id*.
 
 - **Where it is decided.** Not in `authenticate`, which stays a pure parse of the handshake
   message with no registry (0017's reasoning, kept). It is decided by the registration unit, on
-  the blocking pool after the token check, in the **same transaction** that would register the
-  id (today `insert_system_if_absent` answers `Known(url)`, and `SystemSource::of(url)` decides;
-  under 0011, `Source` inside `transact`). So no check-then-insert can race a mail scan, a
-  `POST` or an admin `DELETE`. 0017's `Refusal::TransportMismatch { id }` widens to
+  the blocking pool after the token check, **on the catalog's committed state** (today
+  `insert_system_if_absent` answers `Known(url)` under the database mutex, and
+  `SystemSource::of(url)` decides): under RFC 0008 §3, a held id is decided by an MVCC read
+  (no commit, no writer work, no presence lock), and a new id inside the transaction that
+  would register it, which re-reads. A stale read can only follow a delete, and generations
+  fence it. So no check-then-insert can race a mail scan, a `POST` or an admin `DELETE`, and a
+  refused handshake never forces a commit (0008's fourth-round finding). 0017's `Refusal::TransportMismatch { id }` widens to
   `TransportMismatch { id, held: ReservedSource }`, with `enum ReservedSource { Poll, Mail }`
   (no `Push` variant: a push row is never a mismatch, so the type can't say one is).
 - **One answer for both.** The agent-facing message stays `transport mismatch`, the string 0017
@@ -739,6 +742,11 @@ instant candidates, and CORS `Any` with `Authorization`.
 Came closest and survived in the fifth pass: `MailKeyShaped` against padding, alphabet and
 whitespace variants (both sides decode padded `STANDARD` after trimming); a test pins that the
 rule uses the same engine as `MailMasterKey::from_base64`, so a change of engine fails it.
+
+**Aligned after acceptance (2026-10-03).** RFC 0008's own pass found that deciding every
+handshake inside a durable transaction would stall the fleet; §3's "where it is decided" now
+follows 0008 §3 (an MVCC read for a held id, the transaction for a new one). The rule, the
+answer and the tests are unchanged.
 
 **Still open**: nothing CONFIRMED. The fifth pass's resolutions adopt the fixes it proposed and
 add no design of their own, so no sixth pass was run. The amendments this RFC requires of 0008,

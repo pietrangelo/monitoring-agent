@@ -14,8 +14,8 @@
   new hub starts with an empty store. RFC 0011 keeps every system in memory, so the registry
   must be bounded, and this RFC is what bounds push registration. Polled systems are bounded by
   the operator: registering one needs the admin token (RFC 0012).
-- Related: RFC 0007 (Draft; ingestion cost per frame). It ships first, on SQLite, and
-  introduces the `registry unavailable` answer (`Refusal::RegistryUnavailable`), which §4
+- Related: RFC 0007 (Implemented; ingestion cost per frame). It shipped first, on SQLite, and
+  introduced the `registry unavailable` answer (`Refusal::RegistryUnavailable`), which §4
   reuses for store errors. Split from an earlier, wider draft of RFC 0006. The owner chose the
   default limit, 1000.
 - **Mail systems (RFC 0017, Implemented)** are a third source. RFC 0017 asked whether this
@@ -80,64 +80,96 @@ pub enum PushRegistryLimitError { NotUnicode, Zero, OutOfRange, NotANumber }
 The upper bound is RFC 0011 §1's: its Registry memory budget (≤ 60 MB worst) is stated for
 10,000 systems. A fleet beyond that needs a new budget, and an RFC.
 
+**The Registry's memory, per source.** 0011 §1 budgets about 6 KiB per system at every field's
+limit. This limit bounds the push systems; polled systems (admin token) and mail systems (keys
+the operator derives) are bounded by the operator, not by a number here. So the Registry's worst
+case is **6 KiB × (this limit + the polled and mail systems the operator registers)**: ≤ 60 MB
+for 10,000 systems of any mix, and proportionally beyond. `/api/storage` reports the count per
+source (`registry: {push, poll, mail}`) and that estimate, so an operator sees the total. A
+total cap across sources was considered and not added: the operator already controls the two
+uncounted sources one registration at a time.
+
 **Mail systems aren't counted.** A mail report opens only under the key derived from its own
 id (RFC 0017 §3), and only the holder of `HUB_MAIL_KEY` derives keys, so every mail system is one
 the operator issued a key for: bounded by the operator, as polled systems are by the admin token.
 Counting them here would let a full push registry turn away a mail agent the operator set up, for
 no bound the key doesn't already give.
 
-### 3. Exact registration, inside the catalog transaction
-
-Registration of an unseen push id is one RFC 0011 registration transaction
-(`Store::transact(Commit::Durable, …)`, 0010 §9), the same one that allocates the generation:
+### 3. Exact registration: a read for known ids, a transaction for new ones
 
 ```rust
+/// Fleet Registry (`registry.rs`): the push registration rule, pure.
+pub fn decide_push_registration(existing: Existing, limit: PushRegistryLimit) -> Registration;
+pub enum Existing {
+    Held { source: SourceKind, generation: Generation },
+    Absent { push_systems: u32 },
+}
+pub enum SourceKind { Push, Poll, Mail }
 pub enum Registration {
     AlreadyRegistered { generation: Generation },
-    Registered { generation: Generation },
+    /// Write the record, the counters and the generation (the transaction does it).
+    Register,
     /// The id is held by another source (RFC 0012 §3).
     Reserved(ReservedSource),
     RegistryFull,
 }
-/// No `Push` variant: a push record is never reserved.
+/// Fleet Registry. No `Push` variant: a push record is never reserved.
 pub enum ReservedSource { Poll, Mail }
-
-/// In the hub's `storage/` adapter; `f` runs on the store's writer thread.
-fn register_push_system(store: &Store, id: &SystemId, limit: PushRegistryLimit, now: u64)
-    -> Result<Registration, StoreError>;
 ```
 
-Inside the transaction, on the writer thread:
-1. read `systems/<key>`, and match its source exhaustively: `Push` → `AlreadyRegistered {
-   generation }`, so the connection writes its `LiveStatus` for that generation; `Poll` →
-   `Reserved(Poll)`; `Mail` → `Reserved(Mail)`. A reserved id writes nothing and is never
-   counted. Deciding it here, not before the transaction, means a mail scan or a `POST`
-   committing between a check and the registration can't let a push connection write into
-   another source's system;
-2. read `meta/hub/push_systems`, the count of push systems;
-3. ask `limit.admits(count)`: no → `RegistryFull`, and the transaction writes nothing;
-4. yes → write the new `systems/<key>` record, the incremented `meta/hub/push_systems` and the
-   incremented `meta/hub/generation`, committed together.
+`decide_push_registration` matches exhaustively: `Held { Push }` → `AlreadyRegistered`; `Held {
+Poll }` → `Reserved(Poll)`; `Held { Mail }` → `Reserved(Mail)`; `Absent` → `Register` if
+`limit.admits(push_systems)`, else `RegistryFull`. It is the whole rule, table-tested; the
+adapter only feeds it.
+
+**Two steps, in the hub's `storage/` adapter, on the blocking pool:**
+1. **A read, for every handshake.** `read_catalog` (0010 §9: a redb read transaction, MVCC,
+   never waiting for the writer) reads `systems/<key>`. A held id is decided there:
+   `AlreadyRegistered`, or `Reserved`. **No commit, no writer work.** A read can be stale only
+   across a delete (a source changes only by deletion and re-registration, which gives a new
+   generation): a stale `Push` read's generation is fenced (0011 §3: its writes are refused,
+   `SystemGone` ends the connection, and the agent reconnects); a stale `Reserved` is retried
+   by the agent after 5 s.
+2. **A transaction, only for an absent id.** `Store::transact(Commit::Durable, …)` (0010 §9)
+   re-reads `systems/<key>` and `meta/hub/push_systems` inside `f` on the writer thread and
+   asks `decide_push_registration` again, so the decision is made on the committed state:
+   `Register` writes the new `systems/<key>` record, the incremented `meta/hub/push_systems`
+   and the incremented `meta/hub/generation`, committed together (`Registered { generation
+   }`); `RegistryFull`, or an id registered meanwhile (`AlreadyRegistered`, `Reserved`), writes
+   nothing. **An `f` that writes nothing forces no commit** and is answered as soon as it ran
+   (0011 §1's "identical writes write nothing", extended to the commit it would have forced).
 
 - **The limit is exact.** redb has one writer, and 0010 runs every transaction on one thread, so
-  two handshakes racing for the last slot are serialised, and the second sees the incremented
-  count. An id racing itself gets `AlreadyRegistered`.
+  two handshakes racing for the last slot are serialised inside step 2, and the second sees the
+  incremented count. An id racing itself gets `AlreadyRegistered`. A mail scan or a delete
+  committing between step 1 and step 2 is seen by step 2.
+- **Cost.** A fleet reconnecting after a hub restart costs one MVCC read per handshake. Only new
+  ids reach the writer, and only `Register` commits: durable transactions that arrive while a
+  commit is in flight share the next one (the group commit), so the first registration of a
+  1,000-agent fleet after the upgrade costs well under the measured ≈ 69 commits a second. A
+  refused id over the limit costs the writer one `f` with no commit; one held by another source
+  costs nothing on the writer.
+- **The presence lock** (RFC 0016 §2) is taken only to accept the connection, after step 2,
+  never across a store call. RFC 0016 held it across registration because the SQLite mutex
+  serialised every store anyway; on redb a registration waits for a commit, and holding the
+  presence lock through it would stall every connection's frame claims. Accepting after
+  registration is safe: currency moves only by snapshot claims, and a delete in between fences
+  the accepted generation.
 - RFC 0011's delete transaction decrements `meta/hub/push_systems` when it deletes a push system.
 - **At open, the adapter recomputes the counter** from `systems` in one transaction and corrects
   it, with a `warn` if it differed, as defence in depth. The store doesn't know what a push
   system is; the adapter does.
-- The rule stays in `admits`, a pure function; the transaction only feeds it the count.
-- `transact` blocks until its commit, so the async handshake calls it through `spawn_blocking`
-  (the existing `on_blocking_pool`). The blocking wait itself can't panic: `f` runs on the
-  writer thread, and a panic there is 0010's writer fail-stop, which ends the hub. A
+- `transact` and `read_catalog` block, so the async handshake calls them through
+  `spawn_blocking` (the existing `on_blocking_pool`). The blocking wait itself can't panic: `f`
+  runs on the writer thread, and a panic there is 0010's writer fail-stop, which ends the hub. A
   `JoinError` can only come from runtime shutdown; it maps to `registry unavailable` like a
   store error, and has no test row of its own.
 
 ### 4. Handshake outcomes
 
 The push handshake checks, in order: the shape, the token (constant time), the id's `SystemId`
-rule (RFC 0005), then registration (§3), which decides the reserved-id rule (RFC 0012 §3) in its
-transaction. Nothing else; there
+rule (RFC 0005), then registration (§3), which decides the reserved-id rule (RFC 0012 §3) on the
+catalog's committed state: by its read for a held id, inside its transaction for a new one. Nothing else; there
 is no import in progress to refuse (RFC 0013 is Rejected).
 
 `Refusal` (RFC 0006: `Rejected(HandshakeRejection)` and `Timeout`; RFC 0007:
@@ -148,17 +180,26 @@ ReservedSource }`) gains one variant, `RegistryFull`. Store errors reuse RFC 000
 | Outcome | Answer |
 |---|---|
 | `AlreadyRegistered` | accepted, as today |
-| `Registered` | accepted |
+| `Registered` (after `Register` committed) | accepted |
 | `Reserved(Poll)`, `Reserved(Mail)` | `auth_error` / `transport mismatch` (`Refusal::TransportMismatch`, RFC 0017's answer, RFC 0012 §3); logged and counted as RFC 0012 §3 says |
 | `RegistryFull` | `auth_error` / `registry full` (`Refusal::RegistryFull`) |
 | a `StoreError` (`Closed` during shutdown, `Failed`, `Io`) | `auth_error` / `registry unavailable` (RFC 0007's `Refusal::RegistryUnavailable`), so the agent takes its 5 s backoff instead of reconnecting at once |
 
 Logging (A09):
-- the first `RegistryFull` after the registry fills is logged at `warn`, then **again every
-  hour while it stays full**, with the count of refusals since the last line;
-- a store error is logged at `error` at most once per hour, with the error kind;
-- each refused id is counted in `/api/storage` (`push_registry: {limit, count, refused_full,
-  refused_unavailable}`), never logged per id at a level that is on by default.
+- the first `RegistryFull` is logged at `warn`, then **again every hour while refusals go on**,
+  with the count of refusals since the last line. The hourly slot is **cleared by a
+  `Registered` outcome or a push system's delete**, so a registry that drains and fills again
+  within the hour logs the refill at once;
+- a store error is logged at `error` at most once per hour, with the error kind and no id.
+  **This replaces today's line**: `Refusal::log` logs every `RegistryUnavailable` at `warn`, once
+  per handshake, with the id (`push/mod.rs`), which a store outage under a retrying fleet would
+  turn into hundreds of lines a second. `RegistryFailure { Database(rusqlite::Error), Panicked
+  }` becomes `RegistryFailure { Store(StoreError), Panicked }`, `Panicked` from a `JoinError`
+  at runtime shutdown;
+- `RegistryFull` and `registry unavailable` refusals never log the id. RFC 0012 §3's hourly
+  `transport mismatch` line, per id, is the one per-id refusal line, and it is rate-limited;
+- each refusal is counted in `/api/storage` (`push_registry: {limit, count, refused_full,
+  refused_unavailable}`; `transport mismatch` is RFC 0012's `push_transport_mismatches`).
 
 ### 5. Lifecycle: RFC 0016
 
@@ -183,10 +224,11 @@ re-creations.
 
 ## Domain impact
 
-- **Fleet Registry:** `PushRegistryLimit`, the `meta/hub/push_systems` counter, and
-  `register_push_system` inside the registration transaction.
+- **Fleet Registry:** `PushRegistryLimit`, the pure `decide_push_registration` with `Existing`,
+  `SourceKind`, `Registration` and `ReservedSource`, and the `meta/hub/push_systems` counter.
+  The `storage/` adapter only feeds the rule: its read and its transaction.
 - **Ingestion:** `Refusal::RegistryFull`, and store errors mapped to RFC 0007's
-  `Refusal::RegistryUnavailable`; `Registration::Reserved` mapped to RFC 0017's
+  `Refusal::RegistryUnavailable` (`RegistryFailure::Store`); `Registration::Reserved` mapped to RFC 0017's
   `Refusal::TransportMismatch`; the handshake order stated in §4.
 - **Glossary:**
   - **push system** (RFC 0016's term): its source becomes `Source::Push` (RFC 0011);
@@ -218,7 +260,9 @@ re-creations.
 ## Security implications
 
 - **API4:** push registration is bounded, exactly, at 10,000 at most, and REST can't bypass it
-  (§6).
+  (§6). The Registry's memory is bounded per source (§2), and its total is shown in
+  `/api/storage`. A refused handshake costs an MVCC read, or one writer `f` with no commit for
+  an absent id over the limit (§3), so refusals can't load the commit path.
 - **A04 / API6: onboarding lock-out, accepted.** Registration is permanent and happens at the
   handshake. Anyone who can push (every token holder, or anyone while the token is unset) can
   fill the registry with 1000 handshakes. New and recreated hosts then get `registry full`, and
@@ -231,15 +275,21 @@ re-creations.
   authentication. The registry's fullness is **not** a secret, though: `/api/storage` is an open
   read and shows `push_registry`'s limit and count, as `GET /api/systems` already shows every
   system. Nothing here reveals the token.
-- **A09:** an hourly `warn` while full, with counts; store errors logged once per hour; the
-  configuration error names the variable, never its value; ids never logged by default.
+- **A09:** an hourly `warn` while refusals go on, its slot cleared by a registration or a
+  delete; store errors logged at `error` once per hour, replacing today's per-handshake `warn`;
+  the configuration error names the variable, never its value; no `registry full` or
+  `registry unavailable` refusal logs an id (RFC 0012's hourly `transport mismatch` line is the
+  one per-id line).
 - **A03:** no SQL.
-- **API1:** push ids stay self-asserted. The reserved-id rule, decided in the transaction,
-  keeps a push connection out of poll and mail systems with no check-then-insert window.
+- **API1:** push ids stay self-asserted. The reserved-id rule, decided on committed state (a
+  read for a held id, the transaction for a new one), keeps a push connection out of poll and
+  mail systems; a stale read is fenced by generations.
 - **API4 (mail):** mail registrations are bounded by the keys the operator derives, not by this
   limit (§2).
-- **API9:** `HUB_MAX_PUSH_SYSTEMS` and the `registry full` message go into the README (RFC 0007
-  adds `registry unavailable`).
+- **API9:** `HUB_MAX_PUSH_SYSTEMS` and the `registry full` message go into the README; the
+  README's existing `registry unavailable` row (RFC 0007: "a database error, or a registration
+  that panicked") is reworded for store errors; `/api/storage`'s `push_registry` and `registry`
+  fields are documented.
 - Everything else is unchanged.
 
 ## Testing plan
@@ -249,39 +299,59 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
 - **Pure:**
   - `PushRegistryLimit::from_env` over unset, empty, `1`, `1000`, `10000`, `10001`, `0`, `-1`,
     `1,000`, `18446744073709551616` and non-UTF-8, each with its outcome;
-  - `admits` below the limit, at it, and above it.
-- **Registration transaction** (a temporary store):
+  - `admits` below the limit, at it, and above it;
+  - `decide_push_registration` as a table over `Held { Push | Poll | Mail }` and `Absent` ×
+    {room, exactly full}, each with its `Registration`.
+- **Registration** (a temporary store, with a **writer gate**: a test seam in `StoreOptions`
+  that holds the writer before it runs the next submitted transaction until the test releases
+  it, so two transactions are ordered deterministically):
   - a limit of 1 with one polled system present admits an unseen push id; a limit of 1 with
     one mail system present admits one too (mail isn't counted);
-  - a push registration for a poll id and for a mail id answers `Reserved(Poll)` and
-    `Reserved(Mail)`, writes nothing and leaves the counter as it was; a mail report registering
-    an id in the same group commit as a push handshake for it ends with one record, and the
-    push answer is `Reserved(Mail)` when the mail transaction committed first;
-  - a limit of 1 with one push system present refuses an unseen id and writes nothing, and
-    returns `AlreadyRegistered { generation }` with the stored generation for the known id;
-  - two threads racing for the last slot: exactly one `Registered`;
+  - a push handshake for a poll id and for a mail id answers `Reserved(Poll)` and
+    `Reserved(Mail)` from the read, submits no transaction (the writer gate sees none) and
+    leaves the counter as it was;
+  - a mail scan and a push handshake for the same new id, both submitted behind the gate, **in
+    both orders**: mail first → one mail record, the push answer `Reserved(Mail)` from step 2;
+    push first → one push record, the mail report `TransportMismatch`;
+  - a limit of 1 with one push system present refuses an unseen id, writes nothing and
+    **forces no commit** (the commit counter unchanged), and returns `AlreadyRegistered {
+    generation }` with the stored generation for the known id;
+  - two handshakes for different new ids racing for the last slot, both submitted behind the
+    gate before either runs: exactly one `Registered`, and a hook in `f` asserting each read the
+    count the other committed (the check-then-insert regression would read the same count);
+  - a stale `Push` read: the id deleted and re-registered by mail between step 1 and accept,
+    and the connection's first frame refused `SystemGone`;
+  - a handshake holds no presence lock across a store call (a test that blocks the writer gate
+    while another connection's frame claim completes);
   - deleting a push system decrements the counter; a counter written wrong through a test seam
     is corrected at open, with a `warn`;
   - a child process killed right after a registration answered: at reopen, the record, the
     counter and the generation are all there; killed before the commit, none is.
 - **Real server:**
   - a full registry answers `registry full`, and logs one `warn`, then another after an hour of
-    injected time;
-  - a store closed through a test seam answers `registry unavailable`.
+    injected time; a delete then a refill within the hour logs the refill at once;
+  - a store closed through a test seam answers `registry unavailable`; two store errors within
+    an hour log one `error` line without an id; `refused_full` and `refused_unavailable` reach
+    `/api/storage`, and so do the per-source counts.
 
 ## Impact on `docs/ARCHITECTURE.md`
 
 - § Components: push registration is bounded.
-- § Domain model: the Fleet Registry and Ingestion rows, and the glossary (**push registry
-  limit**).
+- § Domain model: the Fleet Registry row (`decide_push_registration`, `ReservedSource`) and
+  the Ingestion row, and the glossary (**push registry limit**; **mail system**'s line that mail
+  registrations are unbounded "as push's are" becomes "bounded by the keys the operator
+  derives, uncounted by the push limit").
+- § Components (`system-hub`): the presence lock is no longer held across registration.
 - § Trust boundaries, Agent → Hub (push): the limit, the handshake order, and that the limit
   holds everywhere.
 - § Open architectural questions:
   - removed: unbounded auto-registration (RFC 0016 has already removed push systems being
     polled, the stale connection's offline marking and the `hostname` shell-out);
-  - added: expiring stale push systems.
+  - added: expiring stale push systems;
+  - the mail item saying "Mail registrations are unbounded, as push's are (RFC 0008)" is
+    corrected the same way.
 - `README.md`: the `HUB_MAX_PUSH_SYSTEMS` row; `registry full` in
-  the `auth_error` table, beside RFC 0007's `registry unavailable`; "they appear
+  the `auth_error` table, beside RFC 0007's `registry unavailable` (reworded for store errors); "they appear
   automatically" (up to the limit).
 - `docker-compose.yml`: `HUB_MAX_PUSH_SYSTEMS: ${HUB_MAX_PUSH_SYSTEMS:-}` on the hub; nothing on
   the agent. `.env.example`: a commented line.
@@ -346,8 +416,24 @@ step 1 answers `Reserved(ReservedSource)` for a poll or mail record inside the t
 §4's order and table gain it as RFC 0017's `transport mismatch`; mail systems aren't counted
 (§2); Domain impact, Security and Testing follow.
 
-**Still open**: nothing CONFIRMED. This revision has not been reviewed yet; its `rfc-adversary`
-pass comes with the next round on RFCs 0008, 0010, 0011 and 0012.
+`rfc-adversary`, first pass on the redb revision with the mail amendment. Every finding was
+acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| every handshake, refused or known, forced a durable commit while holding the presence lock: 500 agents over the limit would exceed the commit rate and stall every frame claim | CONFIRMED | a held id decided by an MVCC read with no writer work; only an absent id reaches the transaction; an `f` that writes nothing forces no commit; the presence lock only for accept, after registration (§3) |
+| the Registry's memory budget isn't a stated number once poll and mail are uncounted | CONFIRMED | stated per source (6 KiB × systems), counts and estimate in `/api/storage`; a total cap considered and not added (§2) |
+| logging claims contradict today's per-handshake `warn` with the id | CONFIRMED | the change to `Refusal::log` and `RegistryFailure` named; A09 narrowed; test rows (§4) |
+| the reserved-id rule is a business decision inside the adapter's closure | CONFIRMED | the pure `decide_push_registration`, table-tested; `ReservedSource` in the Fleet Registry (§3, Domain impact) |
+| the race rows can't be ordered; the `admits` hook was lost | CONFIRMED / PLAUSIBLE | a writer-gate test seam; both orders asserted; the hook restored (Testing plan) |
+| the hourly `RegistryFull` slot has no reset | PLAUSIBLE | cleared by a registration or a push system's delete; a test row (§4) |
+| inventory: ARCHITECTURE's mail line and glossary, the README `registry unavailable` row, RFC 0007's status | CONFIRMED | listed; RFC 0007 is Implemented (header, API9, Impact) |
+
+Came closest and survived: minting unbounded mail ids with one key (each key opens only its
+own id's reports).
+
+**Still open**: nothing CONFIRMED. These resolutions change the design (§3's read-then-transact,
+the presence lock), so the next pass reviews them before the RFC is accepted.
 
 **Split into RFC 0016 (2026-09-29).** §5 and §7 moved to RFC 0016, with the findings above
 that concerned them (the stale connection, the offline backstop, the agent's id). RFC 0016 also
