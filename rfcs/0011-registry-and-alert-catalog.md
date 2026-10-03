@@ -2,13 +2,20 @@
 
 - Status: Draft
 - Author: Claude (pairing with pietrangelomasalaMD)
-- Date: 2026-09-26 (rewritten on redb the same day; see Review)
+- Date: 2026-09-26 (rewritten on redb the same day; amended 2026-10-03 for RFC 0017's mail
+  systems; see Review)
 - Affects: `system-hub` (the `storage/` adapter, routes, collector, push registration),
   `system-hub/Dockerfile`, `docker-compose.yml`, `.env.example`
 - Depends on: RFC 0010 (the store on redb: one file, the writer thread, `transact`, the commit
   hook, tombstones, the retention clock, `LiveStatus`). **0010 and 0011 are one implementation
   step**, and 0008, 0010, 0011 and 0012 ship in one release (0010's header). RFC 0013 (the
   import) is Rejected: there is no migration.
+- **Carries RFC 0017 (Implemented): mail systems.** A third source, `Source::Mail`, its
+  receipts as catalog tables, alert records from mail reports, and the mail system's row in the
+  per-source API table (§2, §3, §5, §7). RFC 0012's requirements on this RFC (`Mail` in `Source`,
+  receipts retired on delete, `enabled` for mail systems, sources fixed by the transport) are met
+  there. RFC 0017's alternative of replacing its derived mail keys with this RFC's sealed
+  credentials is not taken (§7).
 - With this RFC the registry and alert records leave `db.rs`, and `db.rs` and `rusqlite` are
   gone. RFC 0008's push registry limit is enforced inside this RFC's registration transaction.
 
@@ -21,8 +28,8 @@ still SQLite rows:
 2. **Dynamic SQL.** `update_system_config` and `get_alerts` assemble SQL with `format!`.
 3. **Unbounded alert records.** No retention, one record per incident a poll sees, and
    agent-controlled field sizes.
-4. **A sentinel for push systems.** `url = "push://"` is the only thing that marks a push
-   system, and `PUT /api/systems/:id` can rewrite it.
+4. **Sentinels for sources.** `url = "push://"` and `url = "mail://"` are the only things that
+   mark a push or a mail system, and `PUT /api/systems/:id` can rewrite either.
 5. **Two storage engines** would otherwise remain.
 
 **Decisions carried by this RFC:**
@@ -32,7 +39,7 @@ still SQLite rows:
 | What the new store holds | everything, in 0010's one redb file; SQLite removed | owner |
 | Migration | none: the registry starts empty (0010's Rollout) | owner |
 | Encryption at rest | secrets only: per-system agent tokens sealed with AEAD; metrics unencrypted | owner |
-| What bounds the registry | RFC 0008's push registry limit, in this release; polled systems need the admin token (0012) | owner |
+| What bounds the registry | RFC 0008's push registry limit, in this release; polled systems need the admin token (0012); mail systems need a key the operator derives per id (RFC 0017 §3) | owner (mail: author) |
 | Losing the key | `HUB_SECRET_KEY_RESET=<key id>` drops every token it can't open; one-shot (it must name the stored key id) | author |
 | Key publication and rotation | a generated key is published atomically and checked before the first seal; rotation re-seals every token with a new key in one transaction, at start | author |
 | Alert-record caps | 1,000 per system and 50,000 in total; messages cut to 512 bytes | author |
@@ -53,6 +60,9 @@ the store; this RFC's adapter, `storage/`, defines their encoding.
 | `alerts_seen` | `last_seen_active` (u64 BE) ‖ record key → () |
 | `alerts_listed` | `acknowledged` (u8) ‖ `stored_at` (u64 BE, inverted for newest first) ‖ record key → () |
 | `alerts_api_id` | first 16 bytes of SHA-256 of the API id (§5) → record key |
+| `mail_receipts` | system key ‖ run (16-byte UUID) ‖ u64 BE seq → `MailReceipt` (§7) |
+| `mail_receipts_by_time` | `created_at` (u64 BE) ‖ receipt key → () |
+| `mail_newest` | system key → the newest current receipt's key, `created_at` and interval (§7) |
 | `meta`, keys under `hub/` | `hub/generation`, `hub/key_id`, `hub/push_systems` (0008) |
 
 The store owns `tombstones`, `retention` and the unprefixed `meta` keys (0010).
@@ -83,7 +93,8 @@ The store owns `tombstones`, `retention` and the unprefixed `meta` keys (0010).
 **Memory**: only the Registry, at most about 6 KiB per system at every field's limit (name 255 B,
 URL 2 KiB, unsealed and sealed token ≤ 2.1 KiB, info 5 × 256 B, map overhead), about 0.7 KiB
 typical. RFC 0008 caps push systems at 10,000 (its upper bound), polled systems need the admin
-token, so at the budgeted 10,000 systems the Registry is ≤ 60 MB worst and ≈ 7 MB typical. redb's
+token, and mail systems a key the operator derives for each id (RFC 0017 §3: a report opens only
+under its own id's key, so one key registers one system), so at the budgeted 10,000 systems the Registry is ≤ 60 MB worst and ≈ 7 MB typical. redb's
 page cache (0010 §7) serves the alert tables.
 
 ### 2. Systems
@@ -98,6 +109,9 @@ sees `SystemRecord`.
 pub struct System { id: SystemId, generation: Generation, name: SystemName, source: Source, info: Option<SystemInfoFields> }
 pub enum Source {
     Push,
+    /// Registered by its first accepted mail report (RFC 0017). `enabled` silences its overdue
+    /// marking (0017 §6); it is never polled.
+    Mail { enabled: bool },
     Poll { url: SystemUrl, token: Option<PollToken>, interval: PollInterval, enabled: bool },
 }
 /// The unsealed token, and the sealed bytes it came from, so re-encoding an unchanged record
@@ -106,7 +120,7 @@ pub struct PollToken { plain: AgentToken, sealed: SealedToken }
 
 /// Persistence struct, in `storage/` only.
 struct SystemRecord { generation: Generation, name: SystemName, source: SourceRecord, info: Option<SystemInfoFields> }
-enum SourceRecord { Push, Poll { url: String, token: Option<SealedToken>, interval: u32, enabled: bool } }
+enum SourceRecord { Push, Mail { enabled: bool }, Poll { url: String, token: Option<SealedToken>, interval: u32, enabled: bool } }
 
 /// An http(s) URL, at most 2 KiB, stored as the operator's text.
 pub struct SystemUrl(String);
@@ -116,7 +130,9 @@ pub struct PollInterval(u32);
 pub struct AgentToken(String);
 ```
 
-- **Only a poll system has a URL, a token, an interval and `enabled`.**
+- **Only a poll system has a URL, a token and an interval.** A poll system and a mail system have
+  `enabled`: for a poll system it means "polled", for a mail system "marked offline when
+  overdue" (RFC 0017 §6); a mail system's reports are stored either way.
 - **`SystemUrl`** keeps the operator's text (trailing slashes trimmed, as today) and refuses, with
   400 and the reason:
   - any scheme but `http` and `https` (`push://`, `javascript:`, `file:`), and a URL without a
@@ -138,20 +154,23 @@ pub struct AgentToken(String);
   today's effective cadence. The poller visits only enabled `Poll` systems.
 - **The API, per source:**
 
-| Field | Push system | Poll system |
-|---|---|---|
-| `url` (response) | `push://` | the `SystemUrl` text |
-| `poll_interval_secs` (response) | `null` | the interval |
-| `enabled` (response) | `true` | the flag |
-| `token` | never in a response (removed from the DTO) | never in a response |
-| `status`, `last_seen`, `last_error` | from 0010's `LiveStatus` | from 0010's `LiveStatus` |
-| `POST` | can't create one (`push://` refused) | created; `token: ""` or absent means none; the interval clamped into 5..=86,400, default 30 |
-| `PUT name` | allowed | allowed |
-| `PUT url`, `enabled`, `poll_interval_secs`, `token` | **the values a `GET` shows are accepted as no-ops** (`url: "push://"`, `enabled: true`, `poll_interval_secs: null`, `token` absent); any other value is 400 `not a polled system` | allowed; `token: ""` clears it, absent leaves it; the interval clamped |
-| `PUT` changing the source | 400 | 400 |
+| Field | Push system | Mail system | Poll system |
+|---|---|---|---|
+| `url` (response) | `push://` | `mail://` | the `SystemUrl` text |
+| `poll_interval_secs` (response) | `null` | `null` | the interval |
+| `enabled` (response) | `true` | the flag | the flag |
+| `token` | never in a response (removed from the DTO) | never in a response | never in a response |
+| `status`, `last_seen`, `last_error` | from 0010's `LiveStatus` | from 0010's `LiveStatus` | from 0010's `LiveStatus` |
+| `POST` | can't create one (`push://` refused) | can't create one (`mail://` refused) | created; `token: ""` or absent means none; the interval clamped into 5..=86,400, default 30 |
+| `PUT name` | allowed | allowed | allowed |
+| `PUT enabled` | `true` accepted as a no-op; `false` is 400 `not a polled system` | allowed | allowed |
+| `PUT url`, `poll_interval_secs`, `token` | **the values a `GET` shows are accepted as no-ops** (`url: "push://"`, `poll_interval_secs: null`, `token` absent); any other value is 400 `not a polled system` | the same, with `url: "mail://"`; any other value is 400 `not a polled system` | allowed; `token: ""` clears it, absent leaves it; the interval clamped |
+| `PUT` changing the source | 400 | 400 | 400 |
 
   So a script that `GET`s any system and `PUT`s it back keeps working. A system changes source
-  only by deletion and re-registration. `RegisterSystemPayload` and `UpdateSystemPayload` get a
+  only by deletion and re-registration. A `url` is matched against the two sentinels exactly
+  before `SystemUrl` parses it: `push://` and `mail://` are refused by `SystemUrl` as non-http
+  schemes anyway, and on a `PUT` they mean "this system's own source" only when they equal it. `RegisterSystemPayload` and `UpdateSystemPayload` get a
   hand-written `Debug` that prints `token: <redacted>`.
 - **Field limits at the edge:** `name` ≤ 255 bytes and `token` ≤ 1 KiB (400 above). Agent-supplied
   info fields (hostname, OS, kernel, CPU model, memory display) have **control characters
@@ -166,7 +185,12 @@ pub struct AgentToken(String);
 **Generations and registration.** A new registration is one `Durable` transaction that reads
 `systems/<key>` and `meta/hub/generation`, and writes the record and the incremented counter.
 A push registration also reads and increments `meta/hub/push_systems` and asks RFC 0008's
-limit, in the same transaction. At open, the generation counter is raised to one above every
+limit, in the same transaction. **Every registration is source-checked in that transaction**:
+a present record answers by its source, so a push handshake gets RFC 0008's
+`Reserved(ReservedSource)` for a poll or mail record (RFC 0012 §3), and a mail report gets
+RFC 0017's `TransportMismatch` for a push or poll record. No check runs outside the transaction,
+so neither can race the other or a delete. A mail registration is part of the report's own
+transaction (§7) and doesn't touch the push counter. At open, the generation counter is raised to one above every
 generation in `systems` and `tombstones`, as defence in depth.
 
 ### 3. Deletion, generations and tombstones
@@ -178,7 +202,10 @@ generation in `systems` and `tombstones`, as defence in depth.
   3. removes the system's retention override and pending shortening (`set_retention(…,
      Remove)`, store-owned, 0010 §9), so a re-registered id can't inherit them;
   4. decrements `meta/hub/push_systems` for a push system (RFC 0008);
-  5. deletes `systems/<key>`, and calls `tombstone(key, generation)` (0010 §9).
+  5. for a mail system, removes its `mail_newest` entry and **keeps its receipts**, which are
+     retired by their generation (§7), so a replay of a report accepted before the delete is
+     still a duplicate (RFC 0017 §6);
+  6. deletes `systems/<key>`, and calls `tombstone(key, generation)` (0010 §9).
   Everything a poll committed before it is deleted with the rest; a poll committing after it
   finds no system at its generation and is refused. At that commit the store refuses the
   generation's appends (`SystemGone`) on the writer thread, and the hook removes the system from
@@ -193,6 +220,8 @@ generation in `systems` and `tombstones`, as defence in depth.
     agent reconnects within seconds, and the handshake registers the id again. The README and
     the dashboard's delete confirmation say so: to remove a push system for good, stop its
     agent first.
+  - **A mail system re-registers with its agent's next new report** (RFC 0017 §6), within one
+    mail interval; stop its agent's mail first to remove it for good.
 - **Physical removal** (0010 §5): the retention pass purges a deleted generation's chunks,
   tails and log entries within one pass (10 minutes), resuming from its cursor after a restart.
   The README's "Remove system + all data" becomes "removes the system; its data is unreadable
@@ -265,7 +294,10 @@ struct AlertRecordEntry {
 }
 ```
 
-Alert records come from polls only (push frames carry no alerts).
+Alert records come from polls and from mail reports (push frames carry no alerts). A mail
+report's alerts (RFC 0017 §2: every incident active since the previous report, at most 64,
+typed) go through the same rules, inside the report's own transaction (§7), with the hub time
+of the intake as `last_seen_active`. Where a rule below says "poll", it means either.
 
 - **Identity: one function.**
   ```rust
@@ -309,8 +341,8 @@ Alert records come from polls only (push frames carry no alerts).
   - per system: the system's record with the oldest `last_seen_active` among those not reported
     by this poll;
   - in total: the oldest `alerts_seen` entry that **can't belong to an incident still firing**:
-    its `last_seen_active` is older than **2 hours or twice its system's poll interval,
-    whichever is longer**. A still-firing incident is refreshed at least once per coalescing
+    its `last_seen_active` is older than **2 hours or twice its system's poll interval (for a
+    mail system, its mail interval, from `mail_newest`), whichever is longer**. A still-firing incident is refreshed at least once per coalescing
     window (1 h) of polls, so its `last_seen_active` is never older than the window plus one
     interval; twice either bound leaves a margin.
 
@@ -334,6 +366,50 @@ mode, **`system-hub/Dockerfile` pins the hub user's uid and gid to 10001**, and 
 to `chown 10001:10001` and `chmod 0400` the key file on the host. A smoke test of the example is
 part of the implementation step.
 
+### 7. Mail systems
+
+RFC 0017's `mail_receipts` SQLite table becomes three catalog tables (§1), and its one SQLite
+transaction per report becomes one `transact` (0010 §10's `store_mail_report`). The pure
+decisions stay 0017's (`receipt::fresh`, `receipt::recency`, `mail_status`).
+
+```rust
+/// Persistence struct: a leading version byte, then postcard.
+struct MailReceipt { generation: Generation, created_at: u64, interval_secs: u32, received_at: u64 }
+struct MailNewest { receipt: ReceiptKey, created_at: u64, interval_secs: u32 }
+```
+
+- **Current and retired.** A receipt is *current* while its generation is the system's, and
+  *retired* once the system is deleted (its generation tombstoned) or registered again. This
+  replaces 0017's `retired` column: the delete transaction rewrites no receipt (§3), and a
+  receipt can't be current for the wrong registration.
+- **The report's transaction**, in 0017 §6's order, all inside `f` on the writer thread:
+  1. read `systems/<key>`: absent → register a `Mail { enabled: true }` system (a new
+     generation); a push or poll record → abort with `TransportMismatch`; a mail record → its
+     generation;
+  2. read `mail_newest/<key>` (written only for the current generation) for `Recency`;
+  3. insert `mail_receipts/<key ‖ run ‖ seq>` unless present: present, **whatever its
+     generation**, is a duplicate, and `f` aborts, so a replay of a report accepted before a
+     delete neither re-registers the system nor stores its points (0017 §6);
+  4. stage the snapshots' points (`CatalogTxn::append`, 0010 §9, at their reported times);
+  5. the alert records (§5);
+  6. for a `Newest` report, write `mail_newest/<key>`.
+  An abort stages nothing and writes nothing. The message is deleted once `transact` returns,
+  accepted or refused, as 0017 deletes every handled message.
+- **Pruning** moves to 0010's retention pass: receipts whose `created_at` is older than the
+  receipt window (7 days) on the **retention clock** are removed, with their
+  `mail_receipts_by_time` entries, in its bounded transactions. The retention clock never runs
+  ahead of hub time, and 0017's freshness check refuses a report older than the window on hub
+  time, so a pruned receipt's report is always refused as stale before it could be a
+  duplicate. `mail_newest` is never pruned (0017 §7 needs it), and a deleted system's entry
+  goes with the delete.
+- **The overdue sweep** reads `mail_newest` through `read_catalog` (MVCC: it never waits for
+  the writer) on the blocking pool, and calls 0017's `mail_status`; 0010 §10 writes the
+  `LiveStatus`. A mail record with no `mail_newest` entry is overdue, as 0017 §7 says.
+- **No sealed credential.** RFC 0017 offered this RFC's sealed tokens as an alternative to its
+  derived mail keys. Not taken: a derived key stores nothing per system and is already bound to
+  its id, while a sealed mail credential would add a secret per system to the store for no
+  property the derivation lacks.
+
 ## Domain impact
 
 - **Fleet Registry**:
@@ -341,25 +417,28 @@ part of the implementation step.
     `PollInterval`, `PollToken`, `AgentToken`, `SealedToken`, `Generation`, tombstones (0010);
   - the Registry in memory, maintained by 0010's commit hook in commit order;
   - the info rule stated; the poll interval honoured;
-  - RFC 0008's limit inside the registration transaction;
+  - RFC 0008's limit inside the registration transaction; every registration source-checked
+    inside it (push, poll, mail);
   - `db.rs`'s registry half is gone.
 - **Fleet History**: alert records with a generation, `last_seen_active`, the `record_key`
   function, the alert tables and indexes, `events` retention on the retention clock, the edge
   limits and caps. This closes "the hub's `alerts` table has no retention", "an agent alert
   without an `id` … becomes a new record on every poll", and "alert-record ids are unbounded".
-- **Ingestion**: the poller's per-system timers.
+- **Ingestion**: the poller's per-system timers; the mail intake's report transaction on the
+  catalog (§7), its pure decisions unchanged (RFC 0017).
 - **Fleet Storage** (0010): the catalog tables' place in the one file.
 - **Glossary**: added catalog, commit class (durable, batched), commit hook, generation,
-  tombstone, source (push / poll), system URL, poll interval, poll token, sealed token, secret
+  tombstone, source (push / mail / poll), current and retired receipt, system URL, poll interval, poll token, sealed token, secret
   key, key id, key reset, key rotation, record key, API id, last seen active, `events`
   retention; changed **alert record** (keyed by `record_key`; evicted by last-seen-active on the
   retention clock; kept while active; bounded), **system** (a source, not a URL sentinel), and
   **poll** (on the system's own interval).
-- **Published contracts**: `SystemInfo` keeps `url` (`push://` for push systems) and loses the
-  never-serialised `token`; a push system's `poll_interval_secs` is `null`. `POST`/`PUT` gain
+- **Published contracts**: `SystemInfo` keeps `url` (`push://` for push systems, `mail://` for
+  mail systems) and loses the never-serialised `token`; a push or mail system's
+  `poll_interval_secs` is `null`. The mail report (`mail-report.v1`) is untouched. `POST`/`PUT` gain
   400s for URLs, field sizes, invalid tokens and poll settings on push systems, and clamp the
   interval. `/api/alerts` clamps `limit`. Alert API ids are unchanged.
-- **Mixed-version fleet**: agents unaffected.
+- **Mixed-version fleet**: agents unaffected, mail agents included.
 
 ## Alternatives considered
 
@@ -392,7 +471,8 @@ part of the implementation step.
 **OWASP Top 10 (2021)**
 
 - **A01 Broken Access Control:** every registry write needs the admin token (0012). `PUT` can't
-  switch a source or set poll settings on a push system. A late poll or a closing connection
+  switch a source or set poll settings on a push or mail system. Every registration checks the
+  stored source inside its transaction, so no transport can write into another's system. A late poll or a closing connection
   can't write into a deleted or re-registered system.
 - **A02 Cryptographic Failures:** XChaCha20-Poly1305 with random 192-bit nonces; fixed-width
   associated data binding the token to its system, generation and URL; key-file checks applied
@@ -402,8 +482,9 @@ part of the implementation step.
   with a Compose example of the better one. The legacy `system-hub.db` warning.
 - **A03 Injection:** no SQL. `SystemUrl` refuses `javascript:`, non-http schemes, whitespace and
   control characters; info fields have control characters stripped.
-- **A04 Insecure Design:** atomic deletes, registrations and cap evictions in one writer's
-  transactions; the Registry updated in commit order; alert retention on the retention clock;
+- **A04 Insecure Design:** atomic deletes, registrations, mail reports (receipt, points and
+  alert records) and cap evictions in one writer's transactions; receipts retired by generation,
+  so a delete can't reopen a replay; the Registry updated in commit order; alert retention on the retention clock;
   global-cap victims never recently seen.
 - **A05 Security Misconfiguration:** fail-closed key handling with explicit, one-shot recovery;
   no key generated at a configured path; the key generated only after the store's lock.
@@ -424,7 +505,9 @@ part of the implementation step.
 
 **OWASP API Security Top 10 (2023)**
 
-- **API1:** reserving push ids is 0012's; `Source` gives it a sentinel-free test.
+- **API1:** reserving push ids is 0012's; `Source` gives it a sentinel-free test. A mail system
+  is bound to its id by its derived key (RFC 0017); a push token holder can still register a mail
+  agent's id before its first report, which RFC 0012 §3 records as standing.
 - **API2:** N/A.
 - **API3:** `SystemInfo` carries no `token`; `SystemRecord` is never a DTO or a domain value.
 - **API4:** 100 new alerts per poll, a 1 MiB alerts body, field limits, 1,000 records per system
@@ -438,7 +521,8 @@ part of the implementation step.
   `events=` go into the README, with the recovery and rotation procedures; the 400s, the interval
   (now honoured, default 30 s), the `null` interval of push systems and the `/api/alerts` clamp
   are documented; compose and `.env.example` show the key mount.
-- **API10:** agent alert JSON is bounded and parsed at the edge.
+- **API10:** agent alert JSON is bounded and parsed at the edge; a mail report's alerts arrive
+  typed and bounded by RFC 0017 and pass the same edge limits.
 
 ## Testing plan
 
@@ -467,7 +551,25 @@ part of the implementation step.
   - `SystemInfo` JSON unchanged except `token` and a push system's `poll_interval_secs` (a golden
     test), ordered by name then id; `Debug` of both payloads never shows the token.
 - **Poller**: each system polled at its own interval (an injected clock); offsets spread by id;
-  disabled and push systems never polled.
+  disabled, push and mail systems never polled.
+- **Mail systems**:
+  - the per-source table's mail column row by row: `GET` then `PUT` back unchanged (accepted),
+    `PUT enabled: false` (stored), `PUT` of a URL, an interval or a token (400), `POST` with
+    `mail://` (400); `PUT` from each source to each other (400);
+  - a report for an unseen id registers a `Mail` system in the same transaction as its receipt,
+    points and alerts; for a push or poll id, `TransportMismatch` with nothing written; a push
+    registration for a mail id answers `Reserved(Mail)`;
+  - a duplicate `(run, seq)` aborts with nothing staged or written, including after the system
+    was deleted (a retired receipt) and when the duplicate is the first report after the delete;
+  - a new report after a delete registers a new generation, `Newest`, with no `mail_newest`
+    carried over;
+  - pruning at exactly the receipt window on the retention clock and one second before; a +1
+    year system clock step prunes nothing early; `mail_newest` survives the prune;
+  - the overdue sweep over `mail_newest`: on time, overdue, no entry (overdue), disabled
+    (skipped); a mail system's alert record survives the global cap while seen within twice its
+    mail interval;
+  - the ported tests of `db/mail.rs` and `mail_intake/ingest.rs` keep their meaning, except the
+    backfill points (RFC 0010 §2) and `last_seen` (0010 §10).
 - **Generations, deletion and tombstones**: delete then append to the old generation
   (`SystemGone` at that commit); **a poll's alert transaction in the same group commit as the
   delete, before and after it**: no alert record of the deleted system survives; delete while a
@@ -510,15 +612,20 @@ part of the implementation step.
 - **The legacy file warning**: logged at every start while `system-hub.db` exists, not after.
 - **Compose key example**: the smoke test starts the stack with a key mounted as the example says.
 - **Ported tests**: every registry and alert test from `db.rs` and `routes/api.rs` keeps its
-  meaning, except the documented clamps.
+  meaning, except the documented clamps. A ported test whose expectation changes (the backfill
+  points, a mail system's `last_seen`, a push connection for a polled id) is released under the
+  test-contract guard, with the authority its RFC names, and quoted in the change summary.
 
 ## Impact on `docs/ARCHITECTURE.md`
 
 - **Components**: the registry in memory over the catalog tables; the poller's per-system timers.
 - **Data flow**: `db.rs` replaced by `storage/` over 0010's store.
 - **Storage**: the catalog tables and their keys, commit classes, the commit hook, sealed tokens
-  and the key id, `record_key` and the alert indexes, retention and caps.
-- **Domain model**: Fleet Registry, Fleet History and Ingestion rows, and the glossary.
+  and the key id, `record_key` and the alert indexes, retention and caps; the mail receipt tables
+  replacing `mail_receipts`.
+- **Domain model**: Fleet Registry, Fleet History and Ingestion rows (`SystemSource` becomes
+  `Source`, with `Mail`), and the glossary (**mail system**: `Source::Mail`; current and retired
+  receipt).
 - **Trust boundaries**: the secret key file and its checks; sealed tokens bound to their URL; the
   legacy plaintext file; *Hub → Agent (poll)*: `SystemUrl`'s rules, path-prefix joining, and the
   honoured interval.
@@ -526,8 +633,8 @@ part of the implementation step.
 - **Open questions**: closes dynamic SQL, unbounded alerts, alerts without an id making a record
   per poll, unbounded alert ids, the `INSERT OR REPLACE` cascade hazard, the `push://` sentinel,
   push systems being polled, and the registry's blocking SQLite calls; adds the default key
-  location inside the data directory, and that a deleted online push system re-registers unless
-  its agent is stopped.
+  location inside the data directory, and that a deleted online push or mail system re-registers
+  unless its agent is stopped.
 
 ## Rollout / migration notes
 
@@ -536,13 +643,16 @@ part of the implementation step.
 - **Behaviour changes:** `/api/alerts` clamps `limit` to 1,000; `POST`/`PUT` refuse
   non-http(s) URLs, whitespace in URLs, invalid tokens and oversize fields with 400, and poll
   settings on push systems unless unchanged; the poll interval is honoured (default 30 s);
-  a push system's `poll_interval_secs` is `null`; at most 1,000 alert records per system and
+  a push or mail system's `poll_interval_secs` is `null`; a mail system's `PUT` refuses poll
+  settings; at most 1,000 alert records per system and
   50,000 in total; the API has no `token` field; the hub image's user has uid 10001.
 - Implementation, each step through the full gate:
   1. the catalog tables, commit classes and the hook (on 0010's writer);
   2. the registry, sources, `SystemUrl`, the poller's timers, sealed tokens and the key
      procedures;
   3. tombstones, generations and the delete transaction;
+  3a. the mail receipt tables, the report transaction and the overdue sweep on the catalog
+     (with 0010's `CatalogTxn::append`);
   4. alert records with the edge limits, `record_key`, the indexes and the caps;
   5. removal of `db.rs`, the Dockerfile uid, the compose example and its smoke test.
 
@@ -580,6 +690,20 @@ relevant:
 | a deleted online push system re-registers (first) | CONFIRMED | **stated** in the README and the confirmation (§3) |
 | token secrecy in DTOs and `Debug`; secret mounts (first) | CONFIRMED | **resolved** as before (§2, §4) |
 | "within 14 days" false for the hour tier (second) | CONFIRMED | **resolved**: removed from the store within one pass; freed-page bytes stated (§3; 0010 §5) |
+
+**Mail amendment (2026-10-03).** RFC 0017 (Implemented) added mail systems after the passes
+above; RFC 0012's fourth and fifth passes listed what this RFC must carry for them:
+
+| Change | Where |
+|---|---|
+| `Source::Mail { enabled }`, and its column in the per-source API table (`mail://`, no poll settings, `enabled` settable) | §2 |
+| every registration source-checked inside its transaction; RFC 0008's `Reserved` and RFC 0017's `TransportMismatch` decided there | §2 |
+| mail receipts as three catalog tables; retired by generation instead of a column; pruned by the retention pass on the retention clock | §1, §7 |
+| a report's registration, receipt, points and alert records in one transaction; duplicates abort whatever the receipt's generation | §7 |
+| delete keeps the receipts and removes `mail_newest` | §3 |
+| alert records from mail reports, with the mail interval in the global-cap rule | §5 |
+| mail systems bounded by operator-derived keys in the memory budget | §1 |
+| sealed credentials for mail not taken | §7 |
 
 **Still open**: whether one timer per polled system scales to 10,000 polled systems (it is one
 tokio timer each, which is cheap, but the performance test checks it).

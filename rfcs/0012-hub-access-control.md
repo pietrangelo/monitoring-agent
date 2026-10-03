@@ -23,7 +23,7 @@
   0017's `mail_receipts` as a catalog table, retired on delete, a `mail://` column in 0011's
   per-source API table, and `enabled` settable as 0017 §6 uses it) and 0010's `LiveStatus` carries
   0017's overdue marking. This RFC states what it needs from those amendments (§2, §3); it
-  doesn't design them.
+  doesn't design them. They were made on 2026-10-03 (each RFC's Review, *mail amendment*).
 - The new dashboard reaches Compose users through the static-files prerequisite (0010's header),
   shipped first as its own change.
 - This RFC adds the hub's first client authentication. `docs/ARCHITECTURE.md` says that is "an
