@@ -432,13 +432,13 @@ pub(crate) mod tests {
     }
 
     #[derive(Serialize, Clone)]
-    struct TestAlert {
-        id: String,
-        metric: String,
-        severity: String,
-        current_value: f32,
-        message: String,
-        fired_at: String,
+    pub(crate) struct TestAlert {
+        pub(crate) id: String,
+        pub(crate) metric: String,
+        pub(crate) severity: String,
+        pub(crate) current_value: f32,
+        pub(crate) message: String,
+        pub(crate) fired_at: String,
     }
 
     pub(crate) const CREATED: u64 = 1_700_000_300;

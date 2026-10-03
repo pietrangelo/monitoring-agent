@@ -22,7 +22,7 @@
 use std::time::Instant;
 
 use super::receipt::{self, RECEIPT_WINDOW_SECS, Recency, Stale};
-use super::report::{self, MailReport, MailedSnapshot, ReportRefusal};
+use super::report::{self, MailReport, MailedSnapshot, ReportReason, ReportRefusal};
 use super::seal::{self, MailMasterKey, OpenRefusal};
 use crate::applications::{ScrapeRound, SourcePace};
 use crate::clock::unix_to_iso8601;
@@ -99,6 +99,15 @@ fn store(
     mut report: MailReport,
     now: SnapshotTime,
 ) -> Result<Ingested, MessageRefusal> {
+    match report.reason {
+        ReportReason::Incident => {
+            tracing::info!(
+                "Mail intake: an incident report from {:?}",
+                system_id.as_str()
+            );
+        }
+        ReportReason::Scheduled | ReportReason::Other => {}
+    }
     let info = report.snapshots.last().and_then(reported_info);
     let round = (report.round.take()).and_then(|dto| ScrapeRound::try_from(dto).ok());
     let samples = std::mem::take(&mut report.snapshots);

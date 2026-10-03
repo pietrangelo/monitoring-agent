@@ -99,12 +99,13 @@ mod tests {
         use MailIntakeConfigError::*;
         let dir = || Some(OsString::from("/var/mail/hub"));
         let not_unicode = Err(VarError::NotUnicode(OsString::from("x")));
-        let cases: Vec<(
-            &str,
+        type Case = (
+            &'static str,
             Option<OsString>,
             Result<String, VarError>,
             Result<bool, MailIntakeConfigError>,
-        )> = vec![
+        );
+        let cases: Vec<Case> = vec![
             ("neither", None, Err(VarError::NotPresent), Ok(false)),
             (
                 "both empty",

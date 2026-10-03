@@ -42,7 +42,9 @@ use crate::presence::ConnectionLease;
 use crate::state::AppState;
 pub use config::{PushAuth, PushAuthError, PushConfig};
 use connection::{ConnectionState, OutOfBudget, warn_first};
-use ingest::{PushPayload, SnapshotFrame, end_connection, ingest_frame, register_and_accept};
+use ingest::{
+    Admitted, PushPayload, SnapshotFrame, end_connection, ingest_frame, register_and_accept,
+};
 pub use sweep::start_disconnection_sweep;
 
 /// The push handshake's first message. No `Debug`: `token` holds the presented secret.
@@ -98,6 +100,9 @@ fn authenticate(frame: &str, push_auth: &PushAuth) -> Result<SystemId, Handshake
 struct PushContext {
     app: Arc<AppState>,
     config: PushConfig,
+    /// When each mail system's id was last refused at `warn` (RFC 0017 §6): a shipped agent
+    /// retries every 5 s. At most one entry per mail system.
+    mismatch_warned: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 /// The push router with the production deadlines and limits.
@@ -114,7 +119,11 @@ pub fn router(state: Arc<AppState>, auth: PushAuth) -> Router {
 fn router_with_config(app: Arc<AppState>, config: PushConfig) -> Router {
     Router::new()
         .route("/api/push", get(push_handler))
-        .with_state(PushContext { app, config })
+        .with_state(PushContext {
+            app,
+            config,
+            mismatch_warned: Arc::default(),
+        })
 }
 
 async fn push_handler(ws: WebSocketUpgrade, State(ctx): State<PushContext>) -> impl IntoResponse {
@@ -131,6 +140,8 @@ enum Refusal {
     Rejected(HandshakeRejection),
     /// No first message within the handshake deadline.
     Timeout,
+    /// The id is a mail system's (RFC 0017 §6).
+    TransportMismatch { id: SystemId },
     /// The authenticated id couldn't be checked or registered (RFC 0007 §4). The agent
     /// retries any `auth_error` after 5 s, so a failing registry is never retried at once.
     RegistryUnavailable {
@@ -153,6 +164,7 @@ impl Refusal {
         match self {
             Self::Rejected(rejection) => rejection.message(),
             Self::Timeout => "handshake timeout",
+            Self::TransportMismatch { .. } => "transport mismatch",
             Self::RegistryUnavailable { .. } => "registry unavailable",
         }
     }
@@ -162,6 +174,9 @@ impl Refusal {
     fn log(&self) {
         match self {
             Self::Rejected(_) | Self::Timeout => tracing::warn!("Push handshake refused: {self:?}"),
+            Self::TransportMismatch { id } => {
+                tracing::debug!("Push handshake for mail system {:?} refused", id.as_str())
+            }
             Self::RegistryUnavailable {
                 id,
                 failure: RegistryFailure::Database(err),
@@ -258,7 +273,12 @@ async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
         Err(rejection) => return refuse(socket, Refusal::Rejected(rejection)).await,
     };
     let lease = match register(ctx, &system_id).await {
-        Ok(lease) => lease,
+        Ok(Admitted::Push(lease)) => Some(lease),
+        Ok(Admitted::Polled) => None,
+        Ok(Admitted::MailSystem) => {
+            warn_mismatch_hourly(ctx, &system_id);
+            return refuse(socket, Refusal::TransportMismatch { id: system_id }).await;
+        }
         Err(failure) => {
             let refusal = Refusal::RegistryUnavailable {
                 id: system_id,
@@ -276,10 +296,28 @@ async fn handshake(socket: &mut WebSocket, ctx: &PushContext) -> Handshake {
 }
 
 /// Registers the authenticated id, and accepts its connection, off the async runtime.
-async fn register(
-    ctx: &PushContext,
-    system_id: &SystemId,
-) -> Result<Option<ConnectionLease>, RegistryFailure> {
+/// Warns about a mail system's id presented for push at most hourly per system.
+fn warn_mismatch_hourly(ctx: &PushContext, system_id: &SystemId) {
+    use crate::hourly_warning::{HourlyWarning, hourly_warning};
+    let now = Instant::now();
+    let mut warned = ctx
+        .mismatch_warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last = warned.get(system_id.as_str()).copied();
+    match hourly_warning(last, now) {
+        HourlyWarning::Warn => {
+            tracing::warn!(
+                "A push handshake presented mail system {:?}'s id; refused (transport mismatch)",
+                system_id.as_str()
+            );
+            warned.insert(system_id.as_str().to_owned(), now);
+        }
+        HourlyWarning::Quiet => {}
+    }
+}
+
+async fn register(ctx: &PushContext, system_id: &SystemId) -> Result<Admitted, RegistryFailure> {
     on_blocking_pool(&ctx.app, system_id, register_and_accept)
         .await
         .map_err(|_| RegistryFailure::Panicked)?
@@ -2734,6 +2772,7 @@ mod tests {
         let ctx = PushContext {
             app: state,
             config: PushConfig::production(PushAuth::Open),
+            mismatch_warned: Arc::default(),
         };
         let id = SystemId::try_from("sys-junk".to_string()).unwrap();
         let mut connection = ConnectionState::new(Instant::now(), Duration::ZERO);
@@ -2744,5 +2783,34 @@ mod tests {
         }
 
         assert_eq!(connection.undecodable_frames.count(), 2);
+    }
+
+    /// RFC 0017 §6: a push handshake for a mail system's id is refused, after the token
+    /// check, so a push connection never feeds a mail row.
+    #[tokio::test]
+    async fn a_push_handshake_for_a_mail_systems_id_is_a_transport_mismatch() {
+        let cases = [
+            ("the right token", "token", "transport mismatch"),
+            ("a wrong token", "wrong", "invalid token"),
+        ];
+        for (name, token, message) in cases {
+            let (state, _dir) = temp_state();
+            let mut mailed = register_row("sys-mailed");
+            mailed.url = "mail://".to_string();
+            state.db.insert_system(&mailed).unwrap();
+            let addr = serve_push(state.clone(), "token").await;
+
+            let (_ws, answer) = connect_and_auth(addr, "sys-mailed", token).await;
+
+            assert_eq!(
+                answer,
+                Some(serde_json::json!({"type": "auth_error", "message": message})),
+                "case {name}"
+            );
+            assert_eq!(
+                state.db.get_system("sys-mailed").unwrap().unwrap().url,
+                "mail://"
+            );
+        }
     }
 }

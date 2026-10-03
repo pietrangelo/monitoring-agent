@@ -27,12 +27,23 @@ pub use history::{RoundStored, SnapshotStored};
 pub use mail::{MailPresenceRow, MailReceipt, MailStored, MailWrite};
 pub use sources::SourceRow;
 
-/// What a registration found (RFC 0016 §2): the id was absent and is now inserted, or it was
-/// known, and its stored `url` is, or isn't, the one the registration presented.
+/// What a registration found (RFC 0016 §2, RFC 0017 §6): the id was absent and is now
+/// inserted, or it was known, with what its stored `url` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Registration {
     Inserted,
-    Known { same_url: bool },
+    Known(KnownUrl),
+}
+
+/// A known row's `url`, against the one a registration presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownUrl {
+    /// The one presented.
+    Same,
+    /// Another one, the mail sentinel: a mail system's.
+    Mail,
+    /// Another one: a polled or pushed system's, or a value that isn't text.
+    Other,
 }
 
 /// Whether the system's row exists, on a connection the caller already holds.
@@ -50,12 +61,18 @@ fn known_url(
     conn: &Connection,
     system_id: &str,
     url: &str,
-) -> Result<Option<bool>, rusqlite::Error> {
+) -> Result<Option<KnownUrl>, rusqlite::Error> {
     use rusqlite::OptionalExtension;
     conn.query_row(
-        "SELECT url IS ?2 FROM systems WHERE id = ?1",
-        [system_id, url],
-        |row| row.get(0),
+        "SELECT url IS ?2, url IS ?3 FROM systems WHERE id = ?1",
+        [system_id, url, crate::registry::MAIL_URL],
+        |row| {
+            Ok(match (row.get(0)?, row.get(1)?) {
+                (true, _) => KnownUrl::Same,
+                (false, true) => KnownUrl::Mail,
+                (false, false) => KnownUrl::Other,
+            })
+        },
     )
     .optional()
 }
@@ -273,8 +290,8 @@ impl Database {
         sys: &SystemInfo,
     ) -> Result<Registration, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        if let Some(same_url) = known_url(&conn, &sys.id, &sys.url)? {
-            return Ok(Registration::Known { same_url });
+        if let Some(known) = known_url(&conn, &sys.id, &sys.url)? {
+            return Ok(Registration::Known(known));
         }
         conn.execute(INSERT_SYSTEM, system_params(sys))?;
         Ok(Registration::Inserted)
@@ -1054,23 +1071,32 @@ mod tests {
                     "a known id, the same url",
                     "known",
                     "http://example.com",
-                    Registration::Known { same_url: true },
+                    Registration::Known(KnownUrl::Same),
                 ),
                 (
                     "a known id, another url",
                     "known",
                     "push://",
-                    Registration::Known { same_url: false },
+                    Registration::Known(KnownUrl::Other),
                 ),
                 (
                     "a known id stored with a blob url",
                     "blob",
                     "push://",
-                    Registration::Known { same_url: false },
+                    Registration::Known(KnownUrl::Other),
+                ),
+                (
+                    "a known mail system",
+                    "mailed",
+                    "push://",
+                    Registration::Known(KnownUrl::Mail),
                 ),
             ];
             for (case, id, url, expected) in cases {
                 let (db, _dir) = db_with_unmappable_known_system();
+                let mut mailed = sample_system("mailed", "mailed");
+                mailed.url = "mail://".to_string();
+                db.insert_system(&mailed).unwrap();
                 let mut blob = sample_system("blob", "blob");
                 blob.url = "push://".to_string();
                 db.insert_system(&blob).unwrap();

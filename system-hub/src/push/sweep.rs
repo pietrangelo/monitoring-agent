@@ -79,7 +79,7 @@ pub(super) fn sweep_pass(app: &AppState, up_for: Duration) -> Result<SweepPass, 
 fn is_push(source: SystemSource) -> bool {
     match source {
         SystemSource::Push => true,
-        SystemSource::Poll => false,
+        SystemSource::Poll | SystemSource::Mail => false,
     }
 }
 

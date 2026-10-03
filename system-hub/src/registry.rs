@@ -213,15 +213,17 @@ pub enum SystemSource {
     Push,
     /// Any other url: polled.
     Poll,
+    /// Registered by a mail report (RFC 0017 §1): never polled, never pushed.
+    Mail,
 }
 
 impl SystemSource {
     /// `Push` for exactly `PUSH_URL`, `Poll` for any other url.
     pub fn of(url: &str) -> Self {
-        if url == PUSH_URL {
-            Self::Push
-        } else {
-            Self::Poll
+        match url {
+            PUSH_URL => Self::Push,
+            MAIL_URL => Self::Mail,
+            _ => Self::Poll,
         }
     }
 }
@@ -232,7 +234,7 @@ pub fn polled_systems(systems: &[SystemInfo]) -> impl Iterator<Item = &SystemInf
         system.enabled
             && match SystemSource::of(&system.url) {
                 SystemSource::Poll => true,
-                SystemSource::Push => false,
+                SystemSource::Push | SystemSource::Mail => false,
             }
     })
 }
@@ -341,6 +343,7 @@ mod tests {
             ("http", "http://10.0.0.1:9090", SystemSource::Poll),
             ("https", "https://agent.example", SystemSource::Poll),
             ("empty", "", SystemSource::Poll),
+            ("the mail sentinel", "mail://", SystemSource::Mail),
         ];
         for (name, url, expected) in cases {
             assert_eq!(SystemSource::of(url), expected, "case {name}");

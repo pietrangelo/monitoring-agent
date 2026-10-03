@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use crate::db::{Registration, SnapshotStored};
+use crate::db::{KnownUrl, Registration, SnapshotStored};
 use crate::models::{SystemId, SystemInfo, SystemStatus};
 use crate::presence::{ConnectionLease, Ending, LeaseHandle};
 use crate::registry::{LastSeen, MemoryCapacity, UptimeDisplay};
@@ -167,15 +167,25 @@ impl From<DiskItem> for ReportedDisk {
 pub(super) fn register_and_accept(
     app: &AppState,
     system_id: &SystemId,
-) -> Result<Option<ConnectionLease>, rusqlite::Error> {
+) -> Result<Admitted, rusqlite::Error> {
     let mut presence = app.presence();
-    let lease = match register_if_new(app, system_id)? {
-        Registration::Inserted | Registration::Known { same_url: true } => {
-            Some(presence.accept(system_id))
+    Ok(match register_if_new(app, system_id)? {
+        Registration::Inserted | Registration::Known(KnownUrl::Same) => {
+            Admitted::Push(presence.accept(system_id))
         }
-        Registration::Known { same_url: false } => None,
-    };
-    Ok(lease)
+        Registration::Known(KnownUrl::Other) => Admitted::Polled,
+        Registration::Known(KnownUrl::Mail) => Admitted::MailSystem,
+    })
+}
+
+/// How a registered id may push (RFC 0016 §2, RFC 0017 §6).
+pub(super) enum Admitted {
+    /// A push system's: its connection holds the lease.
+    Push(ConnectionLease),
+    /// A polled system's: accepted, with no lease.
+    Polled,
+    /// A mail system's: refused, so no push connection feeds a mail row.
+    MailSystem,
 }
 
 /// Registers a system the hub hasn't seen before, under its default name. A known id is
@@ -561,7 +571,10 @@ pub(super) mod tests {
             let (app, _dir) = app();
             let mut leases = Vec::new();
             for system in ["sys-ended", "sys-other"] {
-                leases.push(register_and_accept(&app, &id(system)).unwrap());
+                leases.push(match register_and_accept(&app, &id(system)).unwrap() {
+                    Admitted::Push(lease) => Some(lease),
+                    Admitted::Polled | Admitted::MailSystem => None,
+                });
                 plant_live_metrics(&app, system);
             }
             if !registered {
