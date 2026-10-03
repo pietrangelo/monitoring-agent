@@ -6,7 +6,8 @@
 - Affects: both. `system-agent` gains a third way to reach a hub (`mail/`, an SMTP client and
   the `MAIL_*` variables). `system-hub` gains a mail intake (`mail_intake/`, a Maildir reader
   and the `HUB_MAIL_*` variables), one table (`mail_receipts`), an overdue sweep, and a
-  `mail-key` subcommand. No endpoint, push frame or poll response changes.
+  `mail-key` subcommand. The push handshake gains one refusal (`transport mismatch`, §6).
+  No endpoint, push frame or poll response changes.
 - Depends on:
   - RFC 0005 (Implemented): the `SystemId` rule, which the sealed report's header carries.
   - RFC 0007 (Implemented): the snapshot rule and `snapshot_intake::store_snapshot`, which
@@ -124,7 +125,7 @@ pub struct MailReport {
   v1 hub refuse the whole report.
 - **Snapshot times are bounded by the report.** Parsing refuses a report (`BadReport`) any
   of whose snapshots has `collected_at` outside `created_at − interval − 120 s ..=
-  created_at`, or whose snapshots aren't in ascending order. An authentic report from an
+  created_at + 5 s` (the slack absorbs an NTP step back between a sample and the close), or whose snapshots aren't in ascending order. An authentic report from an
   agent whose clock jumped can't reach the store with a far-future point that would prune a
   series' history, because `created_at` itself is bounded on the hub (§6).
 
@@ -277,24 +278,34 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
   statements inside its own transaction instead.
   1. **Freshness** (pure, `receipt::fresh(created_at, now) -> Result<(), Stale>`): refuse a
      report whose `created_at` is more than 5 minutes ahead of the hub's clock or older than
-     the **receipt window** (24 h, the default retention).
+     the **receipt window** (7 days). The window is the replay bound, not the retention: a
+     weekend gateway outage or a day's outbox backlog still arrives inside it, and its alert
+     records are kept even when its points have expired (step 5).
   2. **Transport** (in the transaction): if the id's row exists and its URL isn't `mail://`,
      refuse the report (`TransportMismatch`, counted): a mail report never writes into a
-     pushed or polled system, and the overdue sweep (§7) only ever sees mail rows. Otherwise
+     pushed or polled system. The other direction is closed too: the **push handshake
+     refuses an id whose row is `mail://`** (a new `HandshakeRejection::TransportMismatch`,
+     answered `auth_error` with `transport mismatch`, checked after the token like the id
+     rule), so a push connection can never feed a mail row that the overdue sweep (§7) then
+     marks offline under it. Shipped agents retry any `auth_error` after 5 s, as today. Otherwise
      insert the row if absent, with `url = "mail://"`.
-  3. **Receipt first**: `INSERT INTO mail_receipts ... ON CONFLICT DO NOTHING`. No row
+  3. **Recency** (pure, `receipt::recency(created_at, previous_newest) -> Recency`), from
+     the system's newest receipt **read before this report's receipt is inserted**: the
+     report is `Newest` when the system has no receipt yet, or when its `created_at` is at
+     least the previous newest's (an incident report and a scheduled one in the same second
+     are both `Newest`, the later arrival winning); otherwise it is `Backfill` (delivered
+     late or out of order).
+  4. **Receipt**: `INSERT INTO mail_receipts ... ON CONFLICT DO NOTHING`. No row
      inserted means `(run, seq)` was already accepted: the report is a duplicate (mail is
      delivered at least once, and a relay may replay it), the transaction is rolled back and
      the message deleted. Because the receipt and the points commit together, a failure
      anywhere leaves neither, and a later duplicate of the same message is ingested whole,
      never twice.
-  4. **Recency** (pure, `receipt::recency(created_at, newest_receipt) -> Recency`): the
-     report is `Newest` if its `created_at` is later than every receipt of the system, else
-     `Backfill` (delivered late or out of order).
-  5. **Snapshots**: each through the snapshot rule, oldest first, at its own `collected_at`;
-     a snapshot older than the series' snapshot retention (`snapshot_retention`, read in the
-     transaction) is left out and counted as `Expired`, a new mail-intake count (the snapshot
-     rule itself takes no time). Only a `Newest` report updates the system's status (online),
+  5. **Snapshots**: each through the snapshot rule, oldest first, at its own `collected_at`.
+     Expiry is per point, not per snapshot: a point older than its own series' retention
+     (`snapshot_retention`, read in the transaction for that series) is left out and counted
+     as `Expired`, a new mail-intake count, while the snapshot's other points are kept (the
+     snapshot rule itself takes no time). Only a `Newest` report updates the system's status (online),
      last seen and live metrics, from its newest snapshot. A `Backfill` report adds points and
      alert records only, so a late report never rewinds the dashboard or flips an overdue
      system back online.
@@ -302,9 +313,12 @@ gateways that strip or quarantine unknown attachments are common in exactly thes
   7. **Prune**: delete the system's receipts older than the receipt window, **except its
      newest**, which `mail_status` (§7) reads.
 
-  After the commit, the round (if any) goes through `round_intake::store_round` with the
-  system's mail source pace; its own duplicate rule (recent rounds) makes a replayed round a
-  duplicate. A database failure rolls everything back: the message is refused, deleted and
+  After the commit, the round of a `Newest` report (if any) goes through
+  `round_intake::store_round` with the system's mail source pace; its own duplicate rule
+  (recent rounds) makes a replayed round a duplicate. A `Backfill` report's round is dropped
+  and counted: `store_round` replaces the shown round and stamps `app:*` points at hub time
+  (RFC 0009), so storing a late round would show stale data as fresh. Stamping late rounds at
+  `created_at` would be a change to RFC 0009 and is out of scope. A database failure rolls everything back: the message is refused, deleted and
   counted, and its samples are lost (see Alternatives for keeping a failed message). There
   is **no per-system report pace**: a link that was down for hours delivers its backlog in
   one scan, and every report in it is stored. Cost is bounded per report (API4) and per
@@ -385,7 +399,10 @@ error message, and their types implement no `Debug`.
   - A later incompatible report (`mail-report.v2`): a v1 hub refuses it as `BadReport` and
     counts it; the agent must keep sending v1 until the hub is upgraded (a `MAIL_REPORT_KIND`
     switch would be that RFC's business).
-- The push frame, the push handshake and the poll responses are unchanged.
+- The push frame and the poll responses are unchanged. The push handshake gains one
+  refusal, `transport mismatch`, for an id whose row is `mail://`. Every shipped agent treats
+  it as any `auth_error` (logs it, retries after 5 s), so no agent changes for it; it can
+  only occur once a hub with this RFC has mail systems.
 
 ## Alternatives considered
 
@@ -472,8 +489,8 @@ error message, and their types implement no `Debug`.
   rule's 1024-disk bound), 64 alerts and one round. Unauthenticated mail costs one bounded
   read, one MIME parse and one AEAD attempt, then deletion. Authentic reports are stored
   without a pace, so a backlog isn't lost (§6): a compromised agent can store as many
-  reports as it can mail, bounded by its relay, the 256-a-scan cap and the 24 h window's
-  points, and only as its own id. `mail_receipts` is pruned to the 24 h window plus each
+  reports as it can mail, bounded by its relay, the 256-a-scan cap and the 7-day window's
+  points, and only as its own id. `mail_receipts` is pruned to the 7-day window plus each
   system's newest receipt. Registrations are unbounded, as push's are (RFC 0008, Draft).
 - **API5 Function-level authorization:** no new HTTP endpoint.
 - **API6 Sensitive business flows:** N/A.
@@ -501,7 +518,8 @@ Domain cores, table-driven:
 - Hub armour: a footer after the block, quoted-printable re-encoding, CRLF line ends, two
   blocks (the first wins), no block, an oversize block.
 - Hub `receipt::fresh` and `receipt::recency`: 5 min + 1 s in the future, window + 1 s old,
-  a new run, an older report after a newer one (`Backfill`), equal `created_at`.
+  a system's first report (`Newest`), a new run, an older report after a newer one
+  (`Backfill`), equal `created_at` (`Newest`).
 - Hub report parsing: a `collected_at` one second outside its bounds, snapshots out of
   order, an unknown reason (→ `Other`), an unknown metric and severity (kept), an extra map
   key (ignored), each pinned by a golden variant.
@@ -519,7 +537,10 @@ Adapters:
   points and no receipt, and the same message ingested again stores each point once; a
   duplicate stores nothing; a backfill report doesn't change status, last seen or live
   metrics; a report for a `push://` id is refused; pruning keeps the newest receipt with a
-  86400 s interval; a point older than retention is counted `Expired`.
+  86400 s interval; a point older than its series' retention is counted `Expired` while the
+  same snapshot's other points are kept; a backfill report's round is dropped and counted.
+- Hub push handshake: an id whose row is `mail://` is answered `transport mismatch`, after a
+  wrong token is still answered as a wrong token.
 - Hub: the poller skips `mail://` rows (`SystemSource::Mail`); the sweep marks an overdue
   mail system offline and evicts its live metrics; `delete_system` removes the receipts.
 - Hub `mail-key` subcommand: prints the derived key for an id, refuses an invalid id, never
@@ -564,7 +585,15 @@ While this RFC is a Draft, the document is unchanged: it describes the system as
   If RFC 0010 (Draft) is accepted, the table becomes a catalog table of the hub store.
 - **Order:** upgrade the hub and set `HUB_MAIL_DIR` / `HUB_MAIL_KEY` first, derive each
   system's key, then configure agents. Reports mailed before the hub is ready wait in the
-  mailbox and are ingested when it starts, as long as they are inside the 24 h window.
+  mailbox and are ingested when it starts, as long as they are inside the 7-day window.
+- **Moving an agent between push and mail** (either way): delete the system on the hub
+  first, then reconfigure the agent. Its history goes with it; until it is deleted, the new
+  transport is refused (`TransportMismatch`) on both sides.
+- **Rolling back to a hub without this RFC:** first disable every mail system
+  (`PUT /api/systems/:id` with `enabled: false`), since an older hub classifies `mail://`
+  as a polled URL and would mark it offline every 30 s. An older `delete_system` leaves
+  `mail_receipts` rows behind; they are harmless and ignored by that hub, and an upgraded hub
+  prunes them past the window.
 - **Deleting a mail system** from the dashboard deletes its receipts (`delete_system`); its agent's
   next report registers it again with no history, as a push system's reconnect does.
 - **Key rotation:** set a new `HUB_MAIL_KEY`, re-derive and redeploy every agent's
@@ -598,5 +627,23 @@ one PLAUSIBLE, and all were addressed in place:
 
 Closest attack to a design flaw that held: the crypto (AEAD with the header as associated
 data, per-id HKDF keys, the id parsed before any key is derived) and the absence of blocking
-work on the runtime. The amendments change the design, so a second pass is due before the
-RFC becomes `Accepted`.
+work on the runtime.
+
+A second pass on the amendments (2026-10-03) confirmed the first pass's fixes against the code
+and found five new problems (three CONFIRMED, two PLAUSIBLE), all addressed:
+
+- Recency was computed after the report's own receipt was inserted, so no report could be
+  `Newest`: it now reads the previous newest receipt first, and ties count as `Newest`.
+- A backfill report's round would have replaced the shown round and been charted at hub
+  time: only a `Newest` report's round is stored.
+- `TransportMismatch` was one-way, so a push connection could feed a mail row that the sweep
+  then marked offline every minute: the push handshake refuses `mail://` ids, and Rollout
+  documents moving an agent between transports.
+- (PLAUSIBLE) A 24 h receipt window lost reports from a weekend outage: the replay window is
+  now 7 days, separate from retention. Decided: adopted.
+- (PLAUSIBLE) Rolling back to an older hub polls mail rows: Rollout now says to disable them
+  first. Decided: adopted, as a documented step rather than a change to RFC 0016.
+- Minor: 5 s of slack after `created_at` for a clock step; expiry is per point.
+
+The push handshake refusal touches the published push handshake contract, so a third pass is
+due before the RFC becomes `Accepted`.
