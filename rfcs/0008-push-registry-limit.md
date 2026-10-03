@@ -585,7 +585,20 @@ Came closest and survived: generation fencing between a stale and a re-registere
 Came closest and survived: the Registry lagging redb between a commit and its hook (`transact`
 answers after the hook, and the next frame heals the window).
 
-**Still open**: nothing CONFIRMED.
+**Open after the final pass of 2026-10-03** (not yet resolved; the next session starts here).
+The session's rounds stopped converging: each pass found new CONFIRMED defects in the previous
+pass's fixes, so these are recorded instead of patched once more:
+
+| Finding | Verdict | Suggested fix |
+|---|---|---|
+| releasing the admission lock before `on_stored` lets overlapping polls store one round twice and overrun the pace (breaks RFC 0009's guarantee and `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`) | CONFIRMED | split `on_stored`: record round and pace under the admission lock; show under Registry read → `live_applications` after; amend RFC 0009 |
+| the Registry read lock must be held across the `live_applications` insert, which 0010 §9 doesn't say | CONFIRMED | state it in 0010 §9; a seam inside `on_stored` |
+| `append_round` cloning the admission and `log_refused_round` create `live_applications` entries unchecked | CONFIRMED | create only under a generation check, replacing an entry of another generation |
+| 0011 §3 still evicts by id after the transaction, which can wipe a re-registered generation's status | CONFIRMED | evict in the delete's hook only, by generation; the registration hook replaces another generation's entry |
+| `Abort` is undefined; registration's refusals and `TransactError::Aborted` have no arm | CONFIRMED (low) | registration never aborts (`Ok((refusal, AtOnce))`); a generic `TransactError<A>` |
+| the writer gate can't count submissions; a merged and a contradictory test row | PLAUSIBLE | a submission counter with timeouts; split and reword the rows |
+
+**Still open**: the CONFIRMED findings in the table above.
 
 **Split into RFC 0016 (2026-09-29).** §5 and §7 moved to RFC 0016, with the findings above
 that concerned them (the stale connection, the offline backstop, the agent's id). RFC 0016 also

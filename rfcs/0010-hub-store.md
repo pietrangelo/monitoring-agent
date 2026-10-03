@@ -1392,6 +1392,25 @@ From RFC 0008's fifth pass: `transact` returns `TransactError { Aborted, Store }
 `LiveStatus` write for an absent entry is dropped (§10). Came closest and survived: the overdue
 mark as one write-free transaction delivered through `notify`.
 
+**Open after the final pass of 2026-10-03** (not yet resolved; the next session starts here).
+The session's rounds stopped converging: each pass found new CONFIRMED defects in the previous
+pass's fixes, so these are recorded instead of patched once more:
+
+| Finding | Verdict | Suggested fix |
+|---|---|---|
+| the rewind leaves future-stamped points in `points_log`; a crash after it replays them and the series jump forward again | CONFIRMED | drop future points from the log in the rewind transaction; put the rewind after replay in §6's order; a kill-after-rewind row |
+| a mail agent's clock slower than one interval + 15 min makes every report "not current": accepted, online, but no history, silently | CONFIRMED | count and warn per system; README sentence; fix the line saying the agent's clock never reaches a series |
+| the currency gate's scope differs between §2, §10 and 0011 §7: a backlog's round and live metrics still show as current, or `mail_newest` is never written | CONFIRMED | gate points, round and live metrics; never gate status and `mail_newest`; one wording everywhere |
+| the storage cap bounds allocated bytes, not file length: the file can fill the volume, then the open-time floor refuses to start; compaction unordered with the floor | CONFIRMED | bound file length (or allocated plus measured growth); floor and compaction in §8's open order, compaction first |
+| who writes `mail_newest`, and when, differs between §10 and 0011 §7 | CONFIRMED (minor) | written once per system at the end of `f` for the `newest_of_scan` choice |
+| §9's `on_stored` path disagrees with 0008 §3; "the only nested pair" | CONFIRMED (minor) | list `on_stored` as admission (released), then Registry read → `live_applications` |
+| §9's `Answer` wording says "uncommitted write", 0008 says catalog writes only | CONFIRMED (minor) | align to 0008 |
+| scan names logged only on `StoreError::Failed`, not on `Io` | CONFIRMED (minor) | log on any store error but `Closed`; `main` waits for the in-flight scan |
+| "an open below the floor creates nothing" vs §8 creating the directory first | CONFIRMED (minor) | floor check in §8 step 1 on the nearest existing ancestor |
+| a bucket straddling the rewind point stays closed | PLAUSIBLE | reopen it in the rewind |
+| `CatalogTxn::now(&self)` can't advance `HubClock` | PLAUSIBLE | one hub time stamped per transaction before `f`, persisted with `meta/clock` |
+| the retention clock's formula allows 3× real time, not the stated 2× (from 0011's pass) | CONFIRMED (text) | correct the bound or the formula |
+
 **Still open**, carried into the next `rfc-adversary` pass: whether the rotating tail flush plus
 the log meets the stated open time at the scale target (to be measured), and whether redb's
 copy-on-write amplification keeps the physical write volume near §7's logical figure.

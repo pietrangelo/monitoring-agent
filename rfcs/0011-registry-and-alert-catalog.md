@@ -810,6 +810,19 @@ overdue mark is a transaction applied by the commit hook (0010 §10). A second p
 amendment ran before the simplification and its report never reached the session; the next pass
 covers both.
 
+**Open after the final pass of 2026-10-03** (not yet resolved; the next session starts here).
+The session's rounds stopped converging: each pass found new CONFIRMED defects in the previous
+pass's fixes, so these are recorded instead of patched once more:
+
+| Finding | Verdict | Suggested fix |
+|---|---|---|
+| the bounded victim search reads the oldest `alerts_seen` entries, which under the 7-day mail rule are the unevictable ones: every new alert fleet-wide refused | CONFIRMED | key the eviction index by `evictable_at` (last seen + class bound), re-keyed on refresh and interval change; a mixed-class row |
+| `mail_prune_floor` isn't reset by `HUB_CLOCK_REWIND`: after a long forward fault every current report is refused as stale until real time catches up | CONFIRMED | include the floor in the rewind (`min(floor, rewound retention clock − window)`), show it in `/api/storage` |
+| three answers to when and for which report `mail_newest` is written; two orders for `newest_of_scan` | CONFIRMED | write it inside `f` only when a report beats the current entry under one order |
+| the currency gate's scope differs from 0010 §2 | CONFIRMED | as 0010's open finding |
+| two release items name categories, not tests; one "ported" test changes its `last_seen` assertion; `scan.rs::a_backlog_is_stored_whole` changes meaning | CONFIRMED (low) | name each `file::test` under its decision |
+| `on_retention_pass` can't signal more work; the receipt prune's throughput at 10,000 mail systems | PLAUSIBLE | return `More`/`Done`; state the throughput |
+
 **Still open**: whether one timer per polled system scales to 10,000 polled systems (it is one
 tokio timer each, which is cheap, but the performance test checks it).
 
