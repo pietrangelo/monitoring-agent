@@ -23,6 +23,7 @@ use rusqlite::{OptionalExtension, Transaction};
 use super::history::{store_unexpired_points, write_status};
 use super::{Database, INSERT_SYSTEM, insert_alert_record, system_params};
 use crate::mail_intake::receipt::Recency;
+use crate::mail_intake::report::MailInterval;
 use crate::models::{AlertRecord, SystemId, SystemInfo};
 use crate::registry::{MAIL_URL, StatusUpdate};
 use crate::snapshot::{Snapshot, SnapshotTime};
@@ -78,7 +79,7 @@ pub struct MailPresenceRow {
     pub status: crate::models::SystemStatus,
     pub enabled: bool,
     /// The newest current receipt's creation time and interval.
-    pub newest: Option<(SnapshotTime, u64)>,
+    pub newest: Option<(SnapshotTime, MailInterval)>,
 }
 
 impl Database {
@@ -104,6 +105,26 @@ impl Database {
             ))
         })?;
         Ok(rows.filter_map(|row| row.ok().flatten()).collect())
+    }
+
+    /// Marks a mail system offline as overdue, keeping its last seen, only if it isn't offline
+    /// yet and its newest current receipt is still `newest`: a report stored since the sweep
+    /// read the row wins. Returns whether the row changed.
+    pub fn mark_mail_overdue(
+        &self,
+        system_id: &str,
+        newest: Option<SnapshotTime>,
+        last_error: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE systems SET status = 'offline', last_error = ?3
+             WHERE id = ?1 AND status != 'offline'
+               AND (SELECT MAX(created_at) FROM mail_receipts
+                    WHERE system_id = ?1 AND retired = 0) IS ?2",
+            rusqlite::params![system_id, newest.map(SnapshotTime::seconds), last_error],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Stores one report in one transaction. `decide` gets the system's newest current receipt
@@ -161,11 +182,13 @@ fn presence_row(
         .ok()
         .flatten()
         .and_then(|secs| SnapshotTime::try_from(secs).ok());
+    let interval =
+        (interval_secs.ok().flatten()).and_then(|secs| MailInterval::try_from(secs).ok());
     Some(MailPresenceRow {
         id: id.ok()?,
         status: super::parse_status(&status.ok()?),
         enabled: enabled.ok()?,
-        newest: created_at.zip(interval_secs.ok().flatten()),
+        newest: created_at.zip(interval),
     })
 }
 
@@ -312,7 +335,7 @@ mod tests {
             snapshots: (cpus.iter().enumerate())
                 .map(|(i, cpu)| (snapshot(*cpu), at(first + 60 * i as u64)))
                 .collect(),
-            status: StatusUpdate::after_snapshot(LastSeen::ReportedAt(format!("t{created_at}"))),
+            status: StatusUpdate::after_snapshot(LastSeen::ReportedAt(at(created_at))),
             alerts: vec![alert(&format!("mailed_run-a-{seq}"))],
             now: at(NOW),
             prune_before: at(NOW - 7 * 86_400),
@@ -376,7 +399,7 @@ mod tests {
         );
         assert_eq!(
             status(&db, "mailed"),
-            Some((SystemStatus::Online, format!("t{NOW}")))
+            Some((SystemStatus::Online, crate::clock::unix_to_iso8601(NOW)))
         );
         assert_eq!(db.get_alerts(Some("mailed"), None, 10).unwrap().len(), 1);
         assert_eq!(receipts(&db), [(1, false)]);

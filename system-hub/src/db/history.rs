@@ -335,9 +335,11 @@ pub(super) fn write_status(
     status: &StatusUpdate,
 ) -> Result<(), rusqlite::Error> {
     let last_seen = match status.last_seen() {
-        LastSeen::Uptime(uptime) => Some(uptime.as_str()),
-        LastSeen::PolledAt(polled_at) => Some(polled_at.as_str()),
-        LastSeen::ReportedAt(reported_at) => Some(reported_at.as_str()),
+        LastSeen::Uptime(uptime) => Some(uptime.as_str().to_owned()),
+        LastSeen::PolledAt(polled_at) => Some(polled_at.clone()),
+        LastSeen::ReportedAt(reported_at) => {
+            Some(crate::clock::unix_to_iso8601(reported_at.unix_secs()))
+        }
         LastSeen::Unchanged => None,
     };
     tx.prepare_cached(WRITE_STATUS)?.execute(rusqlite::params![

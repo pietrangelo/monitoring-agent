@@ -18,7 +18,6 @@
 //! overdue is marked offline and its live metrics evicted. Blocking: runs on the blocking pool.
 
 use super::receipt::{MailPresence, mail_status};
-use super::report::MailInterval;
 use crate::db::MailPresenceRow;
 use crate::models::SystemStatus;
 use crate::snapshot::SnapshotTime;
@@ -31,9 +30,8 @@ pub const OVERDUE: &str = "mail overdue";
 pub fn overdue_pass(app: &AppState, now: SnapshotTime) -> Result<usize, rusqlite::Error> {
     let mut marked = 0;
     for row in app.db.mail_presence()? {
-        if is_overdue(&row, now) {
-            app.db
-                .update_system_status(&row.id, &SystemStatus::Offline, "", Some(OVERDUE))?;
+        let seen = row.newest.map(|(at, _)| at);
+        if is_overdue(&row, now) && app.db.mark_mail_overdue(&row.id, seen, OVERDUE)? {
             // The evicted entry is dropped here, after the live lock is released.
             drop(app.evict_live_metrics(&row.id));
             marked += 1;
@@ -48,10 +46,7 @@ fn is_overdue(row: &MailPresenceRow, now: SnapshotTime) -> bool {
         SystemStatus::Offline => false,
         SystemStatus::Online | SystemStatus::Unknown => row.enabled,
     };
-    let newest = row
-        .newest
-        .and_then(|(at, secs)| Some((at, MailInterval::try_from(secs).ok()?)));
-    swept && mail_status(newest, now) == MailPresence::Overdue
+    swept && mail_status(row.newest, now) == MailPresence::Overdue
 }
 
 #[cfg(test)]
@@ -118,6 +113,12 @@ mod tests {
             assert_eq!(overdue_pass(&app, at(now)).unwrap(), marked, "case {name}");
 
             assert_eq!(status(&app, "web-01").0, expected, "case {name}");
+            let last_seen = app.db.get_system("web-01").unwrap().unwrap().last_seen;
+            assert_eq!(
+                last_seen,
+                crate::clock::unix_to_iso8601(CREATED),
+                "case {name}: last seen is the newest report's, overdue or not"
+            );
             assert_eq!(
                 status(&app, "pushed").0,
                 SystemStatus::Online,
@@ -147,6 +148,35 @@ mod tests {
             (SystemStatus::Offline, Some(OVERDUE.into()))
         );
         assert_eq!(overdue_pass(&app, at(NOW)).unwrap(), 0, "already offline");
+    }
+
+    /// RFC 0017 §7: a report stored after the sweep read a system wins: the marking writes
+    /// only while the newest receipt is the one the sweep saw.
+    #[test]
+    fn a_report_stored_since_the_read_isnt_marked_overdue() {
+        let (app, _dir) = app();
+        assert!(ingest_message(&app, &master(), &valid_mail("web-01", 1), NOW).is_ok());
+        let seen = app.db.mail_presence().unwrap()[0].newest.map(|(at, _)| at);
+        let newer = crate::mail_intake::ingest::tests::mail_at("web-01", 2, CREATED + 60);
+        assert!(ingest_message(&app, &master(), &newer, NOW).is_ok());
+
+        let stale = app.db.mark_mail_overdue("web-01", seen, OVERDUE).unwrap();
+        let current = app.db.mail_presence().unwrap()[0].newest.map(|(at, _)| at);
+        let fresh = app
+            .db
+            .mark_mail_overdue("web-01", current, OVERDUE)
+            .unwrap();
+
+        assert!(!stale, "the stale read writes nothing");
+        assert!(fresh, "the current read marks it");
+        let sys = app.db.get_system("web-01").unwrap().unwrap();
+        assert_eq!(
+            (sys.status, sys.last_seen),
+            (
+                SystemStatus::Offline,
+                crate::clock::unix_to_iso8601(CREATED + 60)
+            )
+        );
     }
 
     fn app_row(id: &str) -> crate::models::SystemInfo {

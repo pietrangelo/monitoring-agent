@@ -91,6 +91,11 @@ impl SnapshotTime {
         self.0
     }
 
+    /// The time in Unix seconds, unsigned: it was built from a `u64` at most `i64::MAX`.
+    pub fn unix_secs(self) -> u64 {
+        self.0.unsigned_abs()
+    }
+
     /// The time `retention_secs` before this one, never before 0: a series' points older
     /// than it are past their retention.
     pub fn cutoff(self, retention_secs: u64) -> Self {

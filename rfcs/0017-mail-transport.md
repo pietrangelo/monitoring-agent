@@ -1,6 +1,6 @@
 # RFC 0017: Mail Transport: Sealed Reports over SMTP for Agents Without Internet Access
 
-- Status: Implemented
+- Status: Accepted
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-10-03 (revised the same day for four `rfc-adversary` passes; accepted after the
   fourth, see Review)

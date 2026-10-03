@@ -99,15 +99,7 @@ fn store(
     mut report: MailReport,
     now: SnapshotTime,
 ) -> Result<Ingested, MessageRefusal> {
-    match report.reason {
-        ReportReason::Incident => {
-            tracing::info!(
-                "Mail intake: an incident report from {:?}",
-                system_id.as_str()
-            );
-        }
-        ReportReason::Scheduled | ReportReason::Other => {}
-    }
+    log_reason(system_id, report.reason);
     let info = report.snapshots.last().and_then(reported_info);
     let round = (report.round.take()).and_then(|dto| ScrapeRound::try_from(dto).ok());
     let samples = std::mem::take(&mut report.snapshots);
@@ -128,16 +120,47 @@ fn store(
             )
         },
     );
+    let newest = Newest { info, round, now };
+    outcome(app, system_id, stored, newest)
+}
+
+/// An incident report is logged; others aren't.
+fn log_reason(system_id: &SystemId, reason: ReportReason) {
+    match reason {
+        ReportReason::Incident => {
+            tracing::info!(
+                "Mail intake: an incident report from {:?}",
+                system_id.as_str()
+            );
+        }
+        ReportReason::Scheduled | ReportReason::Other => {}
+    }
+}
+
+/// What the newest report brings beyond its transaction.
+struct Newest {
+    info: Option<ReportedInfo>,
+    round: Option<ScrapeRound>,
+    now: SnapshotTime,
+}
+
+/// Maps the store's answer to the message's outcome, running the newest report's follow-ups.
+fn outcome<R>(
+    app: &AppState,
+    system_id: &SystemId,
+    stored: Result<MailStored<R>, rusqlite::Error>,
+    newest: Newest,
+) -> Result<Ingested, MessageRefusal> {
     match stored {
         Ok(MailStored::Stored {
             recency,
             expired,
-            newest,
+            newest: replaced,
         }) => {
             // The replaced live entry is dropped here, outside both locks.
-            drop(newest);
+            drop(replaced);
             if recency == Recency::Newest {
-                after_newest(app, system_id, info, round, now);
+                after_newest(app, system_id, newest.info, newest.round, newest.now);
             }
             Ok(Ingested::Stored { recency, expired })
         }
@@ -172,7 +195,6 @@ fn mail_write<'a>(
             (snapshot, sample.time)
         })
         .collect();
-    let created_at = u64::try_from(report.created_at.seconds()).unwrap_or_default();
     let write = MailWrite {
         system_id,
         system: row,
@@ -184,7 +206,7 @@ fn mail_write<'a>(
             received_at: now,
         },
         snapshots,
-        status: StatusUpdate::after_snapshot(LastSeen::ReportedAt(unix_to_iso8601(created_at))),
+        status: StatusUpdate::after_snapshot(LastSeen::ReportedAt(report.created_at)),
         alerts: alert_records(system_id, report, now),
         now,
         prune_before: now.cutoff(RECEIPT_WINDOW_SECS),
@@ -216,7 +238,7 @@ fn mail_row(system_id: &SystemId) -> SystemInfo {
 
 /// One alert record per incident, keyed `<system id>_<incident id>` as the poll keys them.
 fn alert_records(system_id: &SystemId, report: &MailReport, now: SnapshotTime) -> Vec<AlertRecord> {
-    let stored_at = unix_to_iso8601(u64::try_from(now.seconds()).unwrap_or_default());
+    let stored_at = unix_to_iso8601(now.unix_secs());
     let id = system_id.as_str();
     report
         .alerts
@@ -265,7 +287,7 @@ fn after_newest(
     };
     let arrival = Arrival {
         now: Instant::now(),
-        received_at: u64::try_from(now.seconds()).unwrap_or_default(),
+        received_at: now.unix_secs(),
     };
     let (stored, _pace) =
         round_intake::store_round(app, system_id, round, SourcePace::new(arrival.now), arrival);
@@ -340,6 +362,15 @@ pub(crate) mod tests {
 
     fn mail_for(id: &str, change: impl FnOnce(&mut report::tests::TestReport)) -> Vec<u8> {
         message(&armour(&sealed_for(id, change)), "7bit")
+    }
+
+    /// A valid message for `id`: report `seq`, created at `created_at`.
+    pub(crate) fn mail_at(id: &str, seq: u64, created_at: u64) -> Vec<u8> {
+        mail_for(id, |r| {
+            r.seq = seq;
+            r.created_at = created_at;
+            r.snapshots = vec![sample(created_at)];
+        })
     }
 
     /// A valid message for `id`: report `seq`, created at `CREATED`.
