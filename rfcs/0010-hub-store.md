@@ -236,7 +236,7 @@ pub enum TimeSource { HubNow, Reported }
   longer than an hour. So no in-order point ever falls in a closed bucket, and rollups never
   reopen one. A quiet mail series' open accumulators stay in memory up to that window, counted
   as active series (§7).
-- **So a backfill report's points are dropped** (author's decision, a change to RFC 0017 §6
+- **So a backfill report's points are dropped** (owner's decision, 2026-10-03, a change to RFC 0017 §6
   step 5, which stores them): a report older than the system's newest has points older than its
   series' last, which an append-only series can't take. Its alert records are still stored, and
   its points are counted as `Late`. The agent's outbox mails in order (0017 §5), so backfill
@@ -505,7 +505,10 @@ send it requests over a bounded channel and wait for its answer:
   that holds them** and after the commit hook ran (read-your-writes). A catalog transaction may
   **stage points** (`CatalogTxn::append`, §9): they are checked as an `append` is, applied to
   the head only if `f` returns `Ok`, and committed in the same redb transaction as its catalog
-  writes. The mail intake uses it, so a report's receipt and its points commit together or not
+  writes. **A transaction that writes nothing** forces no commit, and is answered after the
+  commit holding the transaction it read, because it may have read earlier transactions'
+  uncommitted writes; at once only when that transaction held no write when it ran (RFC 0008
+  §3). The mail intake uses it, so a report's receipt and its points commit together or not
   at all (RFC 0017 §6), as one SQLite transaction does today. Staged points refused for any
   reason (`Degraded` included) don't abort the transaction: the report is accepted, its
   refusals counted, and the message deleted, as RFC 0017 deletes every handled message.
@@ -727,8 +730,9 @@ pub enum StoreError { Closed, Failed, Io(IoKind) }
   takes the Registry's write lock on the writer thread, inside no store lock; a head shard lock
   is a leaf. RFC 0009's admission lock is taken around an `append` call, and no store lock is
   held while taking it. RFC 0016's presence lock comes first: it may be held while taking
-  `live_status` or calling the store (a connection's end writes `Offline` under it), and is
-  never taken while holding any of them.
+  `live_status` (a connection's end writes `Offline` under it), and is never taken while
+  holding any of them. **It is never held across a store call** (RFC 0008 §3): a push
+  registration commits first and takes the presence lock only to accept.
 
 **`/api/storage`** is owned by this RFC. It answers `StoreStats` as JSON: allocated bytes per
 tier and in total, the file size and reclaimable bytes, the cap and its source, the volume size
@@ -795,7 +799,7 @@ tier names, and is an open read like the rest of the hub API.
     from it). A `Backfill` report touches neither. 0017's overdue sweep (every 60 s, only while
     the mail intake is on, skipping disabled systems) reads each mail system's newest receipt
     from 0011's catalog and decides with `mail_status`, which now measures from the receipt's
-    **`received_at`** (hub time), not its `created_at` (author's decision, a change to 0017 §7):
+    **`received_at`** (hub time), not its `created_at` (owner's decision, 2026-10-03, a change to 0017 §7):
     *overdue* means "no report has arrived for 3 intervals plus 15 minutes", on the same clock
     as `last_seen`, so an agent with a slow clock no longer flaps between online and overdue
     on every report. An overdue system becomes `Offline`, unless already offline; an `Unknown`
@@ -1218,7 +1222,7 @@ above, and RFC 0012's fourth and fifth passes found what this RFC must carry for
 | Change | Where |
 |---|---|
 | mailed points keep their reported time (`PointTime::Reported`, clamped to hub now); `Late` refuses one not after its series' last or in a closed bucket; every other path stays on hub now | §2, §9 |
-| a backfill report's points are dropped, its alert records kept (author's decision; changes 0017 §6 step 5) | §2, Rollout |
+| a backfill report's points are dropped, its alert records kept (owner's decision; changes 0017 §6 step 5) | §2, Rollout |
 | mailed points older than retention are accepted and removed by the pass; 0017's per-point `Expired` count goes | §2 |
 | `CatalogTxn::append` stages points in a catalog transaction, so a report's receipt and points commit together | §6, §9 |
 | `store_mail_scan`: one batched transaction per scan, messages deleted after its commit | §10 |
@@ -1240,7 +1244,7 @@ above, and RFC 0012's fourth and fifth passes found what this RFC must carry for
 | mail systems `Unknown` for up to an interval after every restart | CONFIRMED | the overdue sweep sets an on-time `Unknown` system `Online` (§10) |
 | the recovered `last_contact` could be a flush rotation stale | CONFIRMED / PLAUSIBLE | the latest of the flushed value, the newest `HubNow` series point and the newest `received_at`; a crash row (§10) |
 | README and ARCHITECTURE mail text would contradict the design | CONFIRMED | listed (Impact) |
-| overdue on agent time flaps next to a hub-time `last_seen` | PLAUSIBLE | `mail_status` on `received_at` (author's decision, a change to 0017 §7) (§10) |
+| overdue on agent time flaps next to a hub-time `last_seen` | PLAUSIBLE | `mail_status` on `received_at` (owner's decision, a change to 0017 §7) (§10) |
 | freshness clock unstated | PLAUSIBLE | the system clock, never hub time (§10) |
 | the overdue sweep could run before a backlog drains | PLAUSIBLE | held until a scan takes fewer than 256 messages (§10) |
 | bare primitives in `PointTime` and `TierSetting` | minor | `ReportedTime`, `TierPeriod` (§2, §5) |

@@ -136,12 +136,17 @@ adapter only feeds it.
    `Register` writes the new `systems/<key>` record, the incremented `meta/hub/push_systems`
    and the incremented `meta/hub/generation`, committed together (`Registered { generation
    }`); `RegistryFull`, or an id registered meanwhile (`AlreadyRegistered`, `Reserved`), writes
-   nothing. **An `f` that writes nothing forces no commit** and is answered as soon as it ran
-   (0011 §1's "identical writes write nothing", extended to the commit it would have forced).
+   nothing. **An `f` that writes nothing forces no commit**, but it is answered **after the
+   commit that holds the transaction it read**, as a `Batched` one is (0010 §6), because `f`
+   reads earlier `f`s' uncommitted writes: an `AlreadyRegistered` read from another handshake's
+   uncommitted `Register` must not be accepted if that commit then fails. It is answered at once
+   only when the open transaction held no write when it ran.
 
 - **The limit is exact.** redb has one writer, and 0010 runs every transaction on one thread, so
   two handshakes racing for the last slot are serialised inside step 2, and the second sees the
-  incremented count. An id racing itself gets `AlreadyRegistered`. A mail scan or a delete
+  incremented count. An id racing itself gets `AlreadyRegistered`, answered only once the
+  registration it read has committed; if that commit fails (`ENOSPC`, 0010 §6), both answers are
+  `registry unavailable`. A mail scan or a delete
   committing between step 1 and step 2 is seen by step 2.
 - **Cost.** A fleet reconnecting after a hub restart costs one MVCC read per handshake. Only new
   ids reach the writer, and only `Register` commits: durable transactions that arrive while a
@@ -152,18 +157,31 @@ adapter only feeds it.
 - **The presence lock** (RFC 0016 §2) is taken only to accept the connection, after step 2,
   never across a store call. RFC 0016 held it across registration because the SQLite mutex
   serialised every store anyway; on redb a registration waits for a commit, and holding the
-  presence lock through it would stall every connection's frame claims. Accepting after
-  registration is safe: currency moves only by snapshot claims, and a delete in between fences
-  the accepted generation.
+  presence lock through it would stall every connection's frame claims. RFC 0010 §9's lock order
+  is amended to match. Accept takes currency when no live current connection exists, and
+  otherwise a snapshot claim moves it (RFC 0016 §2).
+- **Presence carries the generation** (a change to RFC 0016's implemented presence, in this
+  release). A delete and re-registration between the read and accept, or later, must fence
+  everything the stale connection does, not only its appends: `ConnectionLease` and the
+  presence entry carry the generation the connection was accepted for; `claim` and the end
+  (`end_connection`) act only when that generation is the Registry's current one for the id;
+  the offline write passes it to `LiveStatus`, which ignores another generation (0010 §10); and
+  the live-metrics entry stores the generation it was filled for, so eviction by a stale end
+  compares it and evicts nothing. A connection whose append answered `SystemGone` ends with no
+  side effect.
+- **The disconnection sweep's grace** (RFC 0016 §4, 120 s from the store's open) counts, for a
+  system registered after open, from its registration, which the commit hook records in memory.
+  So a new push system can't be marked offline in the moment between its registration's commit
+  and its accept.
 - RFC 0011's delete transaction decrements `meta/hub/push_systems` when it deletes a push system.
 - **At open, the adapter recomputes the counter** from `systems` in one transaction and corrects
   it, with a `warn` if it differed, as defence in depth. The store doesn't know what a push
   system is; the adapter does.
 - `transact` and `read_catalog` block, so the async handshake calls them through
-  `spawn_blocking` (the existing `on_blocking_pool`). The blocking wait itself can't panic: `f`
-  runs on the writer thread, and a panic there is 0010's writer fail-stop, which ends the hub. A
-  `JoinError` can only come from runtime shutdown; it maps to `registry unavailable` like a
-  store error, and has no test row of its own.
+  `spawn_blocking` (the existing `on_blocking_pool`). `f` runs on the writer thread, and a panic
+  there is 0010's writer fail-stop, which ends the hub. The blocking unit also runs adapter code
+  of its own (decoding the read, the decision, accept); a panic there, or runtime shutdown,
+  is a `JoinError`, which maps to `registry unavailable` (`RegistryFailure::Panicked`), as today.
 
 ### 4. Handshake outcomes
 
@@ -317,10 +335,19 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     **forces no commit** (the commit counter unchanged), and returns `AlreadyRegistered {
     generation }` with the stored generation for the known id;
   - two handshakes for different new ids racing for the last slot, both submitted behind the
-    gate before either runs: exactly one `Registered`, and a hook in `f` asserting each read the
-    count the other committed (the check-then-insert regression would read the same count);
-  - a stale `Push` read: the id deleted and re-registered by mail between step 1 and accept,
-    and the connection's first frame refused `SystemGone`;
+    gate before either runs: exactly one `Registered`, and a hook in `f` asserting the second
+    `f` read the first one's increment (the check-then-insert regression would read the same
+    count);
+  - a stale `Push` read, through a **handshake seam** between `read_catalog` and accept: the id
+    deleted and re-registered by mail at the seam; the connection's first frame is refused
+    `SystemGone`, and its end leaves the mail system's `LiveStatus`, live metrics and presence
+    unchanged; the same with the delete after `auth_ok`;
+  - push to push: connection A (generation 1) still open while the id is deleted and B
+    registers generation 2 and claims; A's last frame claims nothing, and A's end neither marks
+    B offline nor evicts B's live metrics;
+  - two handshakes for one new id behind the gate with an injected commit failure: neither is
+    accepted, both answer `registry unavailable`;
+  - a sweep pass between a new id's registration commit and its accept doesn't mark it offline;
   - a handshake holds no presence lock across a store call (a test that blocks the writer gate
     while another connection's frame claim completes);
   - deleting a push system decrements the counter; a counter written wrong through a test seam
@@ -330,6 +357,12 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
 - **Real server:**
   - a full registry answers `registry full`, and logs one `warn`, then another after an hour of
     injected time; a delete then a refill within the hour logs the refill at once;
+  - a registration unit that panics through a seam answers `registry unavailable` (today's
+    `push/mod.rs::a_registration_that_panics_answers_registry_unavailable`, kept, its panic moved
+    from the poisoned database mutex to the seam: a call-site follow-through released with
+    authority author). `push/ingest.rs::registration_panics_on_a_poisoned_database_mutex` pins
+    a mutex this release removes; retiring it is a contract change, released only with the
+    owner's authority when implemented, quoted in the change summary;
   - a store closed through a test seam answers `registry unavailable`; two store errors within
     an hour log one `error` line without an id; `refused_full` and `refused_unavailable` reach
     `/api/storage`, and so do the per-source counts.
@@ -341,7 +374,11 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   the Ingestion row, and the glossary (**push registry limit**; **mail system**'s line that mail
   registrations are unbounded "as push's are" becomes "bounded by the keys the operator
   derives, uncounted by the push limit").
-- § Components (`system-hub`): the presence lock is no longer held across registration.
+- § Components (`system-hub`): the presence lock is no longer held across registration; leases,
+  presence entries and live-metrics entries carry the generation.
+- § Domain model, glossary: **push handshake**'s refusals become rejection, timeout, registry
+  unavailable, registry full and transport mismatch; **current connection** fenced by
+  generation.
 - § Trust boundaries, Agent → Hub (push): the limit, the handshake order, and that the limit
   holds everywhere.
 - § Open architectural questions:
@@ -432,8 +469,22 @@ acted on:
 Came closest and survived: minting unbounded mail ids with one key (each key opens only its
 own id's reports).
 
-**Still open**: nothing CONFIRMED. These resolutions change the design (§3's read-then-transact,
-the presence lock), so the next pass reviews them before the RFC is accepted.
+`rfc-adversary`, second pass (the first pass's resolutions). Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| a write-free `f` answered at once can accept a connection on another handshake's uncommitted registration, which a failed commit then loses | CONFIRMED | answered after the commit holding the transaction it read, unless that transaction had no writes; a commit-failure row (§3; 0010 §6) |
+| presence entries and live-metrics eviction are keyed by id, so a fenced connection's end acts on the new holder | CONFIRMED | the generation in the lease, the presence entry, the end's offline write and the live-metrics entry; an end after `SystemGone` has no effect; rows (§3) |
+| the stale-read row can't be staged by the writer gate; the hook assertion can't hold | CONFIRMED | a handshake seam between read and accept; the hook reworded (Testing plan) |
+| the sweep can mark a new system offline between registration and accept | PLAUSIBLE | the sweep's grace counts from registration for systems registered after open; "currency moves only by claims" corrected (§3) |
+| `JoinError` overclaimed; two tests in `HEAD` silently retired | CONFIRMED / PLAUSIBLE | the claim corrected; one test kept through a seam (author release), the mutex test's retirement named for the owner's release (§3, Testing plan) |
+| inventory: the push handshake glossary row; 0010 §9's lock order | CONFIRMED | listed; 0010 §9 amended in the same change (Impact) |
+
+Came closest and survived: a flood of fresh-id handshakes with the token unset through the
+shared writer channel (two point reads per `f`, no commit, bounded channel back-pressure).
+
+**Still open**: nothing CONFIRMED. The generation in presence changes RFC 0016's implemented
+design, so a third pass reviews it before the RFC is accepted.
 
 **Split into RFC 0016 (2026-09-29).** §5 and §7 moved to RFC 0016, with the findings above
 that concerned them (the stale connection, the offline backstop, the agent's id). RFC 0016 also

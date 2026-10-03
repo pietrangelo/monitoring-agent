@@ -180,7 +180,8 @@ pub struct AgentToken(String);
   stripped** and are cut to 256 bytes on a character boundary, so their JSON form is at most
   about 1.5 KiB in total and fits 0012's 8 KiB `PUT` cap.
 - **The info rule.** System info is filled while `hostname` or `os` is missing (today's rule),
-  from push frames and polls alike, and written only if the values differ. A default name is
+  from push frames, polls and a mail report's newest sample alike (0017's fill), and written
+only if the values differ. A default name is
   replaced by the hostname, **cut to 255 bytes** (the name limit), only if they differ. So a short
   hostname equal to its default name writes nothing per frame.
 - `POST /api/systems` never takes an id from the caller: it mints a UUID, as today.
@@ -346,8 +347,10 @@ of the intake as `last_seen_active`. Where a rule below says "poll", it means ei
   - per system: the system's record with the oldest `last_seen_active` among those not reported
     by this poll;
   - in total: the oldest `alerts_seen` entry that **can't belong to an incident still firing**:
-    its `last_seen_active` is older than **2 hours or twice its system's poll interval (for a
-    mail system, its mail interval, from `mail_newest`), whichever is longer**. A still-firing incident is refreshed at least once per coalescing
+    its `last_seen_active` is older than **2 hours or twice its system's poll interval,
+    whichever is longer**; for a mail system, older than the **receipt window** (7 days), since
+    a relay outage or a lost outbox can delay a still-firing incident's refresh by hours, and
+    0017 treats that as normal. A still-firing incident is refreshed at least once per coalescing
     window (1 h) of polls, so its `last_seen_active` is never older than the window plus one
     interval; twice either bound leaves a margin.
 
@@ -397,22 +400,30 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
      neither re-registers the system nor stores its points (0017 §6). Reads see the writes of
      earlier reports in the same scan, so a duplicate inside one scan is caught too;
   3. read `mail_newest/<key>` (written only for the current generation) for `Recency`;
+  4. read the persisted retention clock (0010 §2): a report whose `created_at` is older than it
+     minus the receipt window is **stale** (counted as 0017's `Stale`), skip the report. The
+     freshness check before the scan uses the system clock once per scan, and a retention pass
+     can prune between it and this transaction; refusing here on the same clock the prune uses
+     means a pruned receipt's replay can never pass as new;
   then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
   insert the receipt; stage the snapshots' points (`CatalogTxn::append`, 0010 §9, rebased per
   0010 §2); the alert records (§5); and for a `Newest` report, `mail_newest/<key>`.
-  A skipped report writes and stages nothing. Every message of the scan is deleted after the
+  A skipped report writes and stages nothing. **After the commit**, the live metrics, the info
+  fill and the round (`append_round`) run once per system, for its newest `Newest` report of the
+  scan by `created_at`, so an older report later in the scan never replaces what is shown. Every message of the scan is deleted after the
   commit holding the scan, accepted or refused, as 0017 deletes every handled message; a
   fail-stop before it leaves them for the next scan.
-- **Pruning** moves to 0010's retention pass: receipts whose `created_at` is older than the
+- **Pruning** moves to 0010's retention pass: ******** whose `created_at` is older than the
   receipt window (7 days) on the **retention clock** are removed, with their
-  `mail_receipts_by_time` entries, in its bounded transactions. The retention clock never runs
-  ahead of the system clock (0010 §2), and 0017's freshness check refuses a report older than
-  the window on the system clock (0010 §10), so a pruned receipt's report is always refused as stale before it could be a
-  duplicate. `mail_newest` is never pruned (0017 §7 needs it), and a deleted system's entry
-  goes with the delete.
+  `mail_********_by_time` entries, in its bounded transactions, **except each system's newest
+  current receipt** (the one `mail_newest` names), as 0017 keeps it. A report older than that
+  bound is refused in the transaction (step 4 above), so a pruned receipt's replay is always
+  stale, never new. Retired ******** are pruned by the window alone.
 - **The overdue sweep** reads `mail_newest` through `read_catalog` (MVCC: it never waits for
   the writer) on the blocking pool, and calls 0017's `mail_status` on the receipt's
-  `received_at` (0010 §10); 0010 §10 writes the `LiveStatus`. `MailNewest` therefore carries
+  `received_at` (0010 §10); 0010 §10 writes the `LiveStatus`, **only while the system's
+  `last_contact` still equals the `received_at` the sweep read** (a compare-and-set, as 0017's
+  `mark_mail_overdue` does today): a report committed after the read keeps the system online. `MailNewest` therefore carries
   `received_at` too. A mail record with no `mail_newest` entry is overdue, as 0017 §7 says.
 - **No sealed credential.** RFC 0017 offered this RFC's sealed tokens as an alternative to its
   derived mail keys. Not taken: a derived key stores nothing per system and is already bound to
@@ -578,8 +589,24 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   - the overdue sweep over `mail_newest`: on time, overdue, no entry (overdue), disabled
     (skipped); a mail system's alert record survives the global cap while seen within twice its
     mail interval;
-  - the ported tests of `db/mail.rs` and `mail_intake/ingest.rs` keep their meaning, except the
-    backfill points (RFC 0010 §2) and `last_seen` (0010 §10).
+  - a report committed between the overdue sweep's read and its write leaves the system online
+    (`overdue.rs::a_report_stored_since_the_read_isnt_marked_overdue`, ported);
+  - a retention pass pruning between the scan's freshness check and its transaction: the
+    replay of a deleted system's report is refused as stale, nothing registered;
+  - the prune keeps each system's newest current receipt
+    (`db/mail.rs::the_prune_keeps_the_newest_current_receipt`, ported);
+  - two `Newest` reports of one system in one scan, in both orders: the shown metrics, info and
+    round are the later-created report's;
+  - a mail report's newest sample fills the system's info and default name;
+  - a mail system's acknowledged incident unseen for 3 hours survives the global cap; unseen for
+    7 days + 1 s it is a victim;
+  - the ported tests of `db/mail.rs`, `mail_intake/ingest.rs`, `mail_intake/overdue.rs` and
+    `mail_intake/scan.rs` keep their meaning, except: the backfill points (RFC 0010 §2, owner's
+    decision), `last_seen` and overdue on hub time (0010 §10, owner's decision), and
+    `db/mail.rs::a_failure_partway_leaves_nothing_and_a_retry_stores_once`, whose store error
+    after the first write now stops the hub (0010 §6) instead of rolling back; each is released
+    under the test-contract guard with the owner's authority when implemented, and quoted in the
+    change summary.
 - **Generations, deletion and tombstones**: delete then append to the old generation
   (`SystemGone` at that commit); **a poll's alert transaction in the same group commit as the
   delete, before and after it**: no alert record of the deleted system survives; delete while a
@@ -634,8 +661,10 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   and the key id, `record_key` and the alert indexes, retention and caps; the mail receipt tables
   replacing `mail_receipts`.
 - **Domain model**: Fleet Registry, Fleet History and Ingestion rows (`SystemSource` becomes
-  `Source`, with `Mail`), and the glossary (**mail system**: `Source::Mail`; current and retired
-  receipt).
+  `Source`, with `Mail`), and the glossary: **mail system** (`Source::Mail`; its push refusal is
+  still answered `transport mismatch`, decided as `Reserved(Mail)`), **mail receipt** (retired by
+  generation rather than a column; pruned by the retention clock except the newest current one),
+  current and retired receipt.
 - **Trust boundaries**: the secret key file and its checks; sealed tokens bound to their URL; the
   legacy plaintext file; *Hub → Agent (poll)*: `SystemUrl`'s rules, path-prefix joining, and the
   honoured interval.
@@ -714,6 +743,23 @@ above; RFC 0012's fourth and fifth passes listed what this RFC must carry for th
 | alert records from mail reports, with the mail interval in the global-cap rule | §5 |
 | mail systems bounded by operator-derived keys in the memory budget | §1 |
 | sealed credentials for mail not taken | §7 |
+
+`rfc-adversary`, first pass on the mail amendment. Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the overdue sweep could overwrite a report committed after its read (today's compare-and-set dropped) | CONFIRMED | offline only while `last_contact` equals the `received_at` read; 0017's test ported (§7) |
+| a prune between the scan's freshness check and its transaction let a deleted system's replay register it anew | CONFIRMED | the transaction refuses `created_at` older than the persisted retention clock minus the window (§7) |
+| mail incidents delayed hours by a relay became global-cap victims and came back unacknowledged | CONFIRMED | for mail systems, evictable only after the receipt window (§5) |
+| three tests in `HEAD` contradicted the design without being named; `overdue.rs` and `scan.rs` missing | CONFIRMED | the newest receipt kept (test ported); the overdue test ported; the partial-failure test named for the owner's release; both files in the port list (Testing plan) |
+| after-commit steps of two `Newest` reports in one scan unordered | PLAUSIBLE | once per system, for its newest `Newest` by `created_at` (§7) |
+| the info fill from mail reports not carried | PLAUSIBLE | added to the info rule; a row (§2) |
+| ARCHITECTURE glossary lines for mail system and mail receipt | CONFIRMED (low) | listed (Impact) |
+| `MailNewest.receipt` could name a pruned receipt | PLAUSIBLE (low) | moot: the newest current receipt is never pruned (§7) |
+
+Came closest and survived: a message that fails every scan, and a delete sharing a group commit
+with a scan (store errors after a write stop the hub, and messages are deleted only after the
+commit, so committed reports return as duplicates).
 
 **Still open**: whether one timer per polled system scales to 10,000 polled systems (it is one
 tokio timer each, which is cheap, but the performance test checks it).
