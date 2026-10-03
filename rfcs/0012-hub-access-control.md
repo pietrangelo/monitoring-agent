@@ -146,7 +146,8 @@ global policy, every override and each pending shortening), and `GET /api/storag
   §7), which can lag the hub by up to the 7-day receipt window; used as `since`, a reporting
   mail system with a slow clock would be listed as offline for days after a restart and deleted.
   So the 0010 amendment stores, for a mail system, the **hub time at which its newest report was
-  accepted** as `last_contact`; `created_at` stays for display and for 0017's overdue rule only.
+  accepted** as `last_contact`; `created_at` stays for display only (RFC 0010 §10 later moved
+  0017's overdue rule onto `received_at` too, owner's decision).
   The retention clock trails hub time after an outage, so with `since` on hub time the age shown
   is a lower bound and a candidate can only appear late, never early.
   With the mail intake off, no sweep marks mail systems and they stay `Unknown`, so they are

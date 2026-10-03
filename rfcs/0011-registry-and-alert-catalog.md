@@ -384,7 +384,11 @@ system clock, `receipt::recency`, `mail_status`, which 0010 §10 moves onto `rec
 ```rust
 /// Persistence struct: a leading version byte, then postcard.
 struct MailReceipt { generation: Generation, created_at: u64, interval_secs: u32, received_at: u64 }
-struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, interval_secs: u32 }
+struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, interval_secs: u32,
+                    clock_lead: ClockLead }
+/// RFC 0010 §2's rebase: the largest `created_at − received_at` (≥ 0) seen within the receipt
+/// window, with the `received_at` of that maximum so it can leave the window.
+struct ClockLead { secs: u32, seen_at: u64 }
 ```
 
 - **Current and retired.** A receipt is *current* while its generation is the system's, and
@@ -421,9 +425,10 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   stale, never new. Retired ******** are pruned by the window alone.
 - **The overdue sweep** reads `mail_newest` through `read_catalog` (MVCC: it never waits for
   the writer) on the blocking pool, and calls 0017's `mail_status` on the receipt's
-  `received_at` (0010 §10); 0010 §10 writes the `LiveStatus`, **only while the system's
-  `last_contact` still equals the `received_at` the sweep read** (a compare-and-set, as 0017's
-  `mark_mail_overdue` does today): a report committed after the read keeps the system online. `MailNewest` therefore carries
+  `received_at` (0010 §10); 0010 §10 writes the `LiveStatus`, **only while `mail_newest` still
+  names the receipt the sweep read** (a compare-and-set, as 0017's `mark_mail_overdue` does
+  today, keyed on the receipt rather than on `last_contact`, which application rounds also
+  move): a report committed after the read keeps the system online. `MailNewest` therefore carries
   `received_at` too. A mail record with no `mail_newest` entry is overdue, as 0017 §7 says.
 - **No sealed credential.** RFC 0017 offered this RFC's sealed tokens as an alternative to its
   derived mail keys. Not taken: a derived key stores nothing per system and is already bound to

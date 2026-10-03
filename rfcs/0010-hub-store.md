@@ -155,7 +155,8 @@ to an unknown id, and the counter can't fall behind a committed id. Ids are neve
 exhaustion (2³²) new series are refused and logged.
 
 **Series caps** (§8), all counted by the store:
-- **active** series (a point within the global raw retention): `HUB_MAX_SERIES` in total and
+- **active** series: a `HubNow` series with a point within the global raw retention, or a
+  `Reported` series with an open rollup bucket (§2 *Mail points*): `HUB_MAX_SERIES` in total and
   `HUB_MAX_SERIES_PER_SYSTEM` per system. Only active series live in memory (§7);
 - **interned** series (rows in `series`): at most **ten times** the per-system active cap per
   system. A per-system bound means one system rotating metric names can't starve the others,
@@ -192,8 +193,9 @@ impl HubClock {
   every chunk whose span starts after the system clock (the misdated future), discards open
   chunks that start after it, resets `last_issued` to the system clock and every series' last
   timestamp to `min(last, system clock)` (a mail series stamped at reported times was never in
-  the future, and moving its last forward would make the next report `Late`), and logs the
-  counts at `warn`. Misdated points inside the current span stay,
+  the future, and moving its last forward would make the next report `Late`), applies the same
+  `min(x, system clock)` to every other persisted hub time (0011's `MailNewest.received_at`
+  and `last_seen_active`, the flushed `LiveStatus` times), and logs the counts at `warn`. Misdated points inside the current span stay,
   and age out with retention. A value that doesn't match is logged at `error` and ignored.
 
 **Mail points** (RFC 0017). A mailed snapshot is a sample taken up to one mail interval (at most
@@ -216,30 +218,41 @@ pub struct ReportedTime(u64);
 pub enum TimeSource { HubNow, Reported }
 ```
 
-- **A report is rebased as a whole, never clamped point by point.** When a report's
-  `created_at` is later than hub now (0017 accepts up to 5 minutes ahead), the intake shifts
-  every `collected_at` of the report back by that difference, so the samples keep their spacing
-  and the newest lands at hub now; a residual second still ahead (0017 allows `collected_at`
-  5 s past `created_at`) is cut to hub now. Clamping each point would put a fast agent's newest
-  samples on one second and refuse all but one, on every report. The shift is counted
-  (`mail_rebased`). A committed point is never later than the committed clock.
+- **A report is rebased as a whole, never clamped point by point, by a per-system shift that
+  never decreases.** The system's **clock lead** is the largest `created_at − received_at` seen
+  over the receipt window (kept in 0011's `MailNewest`, 0 when the agent is behind). Every
+  `collected_at` of a report is shifted back by the lead, so the samples keep their spacing and
+  successive reports keep their order whatever each one's delivery delay (a shift that tracked
+  each report's own `created_at − hub now` would vary with the delay, and a faster delivery
+  would put a report's first samples before the previous report's last). A residual second
+  still ahead of hub now is cut to it. The lead decays only as its maximum leaves the window, so
+  an agent whose clock is corrected stores its samples up to the old lead early for at most 7
+  days. The shift is counted (`mail_rebased`). A committed point is never later than the
+  committed clock.
 - The series' order still holds: a `Reported` point not later than its series' last one is
   refused as `Late` (not `NotAfterLast`, whose causes are clock holds and same-second writes).
   Snapshots inside one report are ascending (0017 §2); of two with equal times, the second is
   `Late`.
 - **The sweep doesn't close a `Reported` series' buckets on hub time.** Its minute or hour bucket
-  closes when the series' first later point arrives, as any series' does, or once hub time is
-  past the bucket's end plus the **receipt window** (7 days, 0017), after which 0017's freshness
-  refuses any report that could bring a point for it. Closing them on hub time, as for `HubNow`
+  closes when the series' first later point arrives, as any series' does, or once
+  `min(hub time, system clock)` is past the bucket's end plus the **mail horizon**: the receipt
+  window (7 days) plus the longest mail interval (24 h) plus 0017's 120 s sample slack and its
+  5-minute lead. 0017's freshness (on the system clock) refuses any report older than the
+  window, and a report's samples reach back at most one interval plus 120 s before its
+  `created_at`, so no accepted report can bring a point for a bucket past that horizon. Measured
+  on the smaller clock, a hub time held in the future can't close them early. A point that does
+  fall in a closed bucket is `Late`. Closing them on hub time, as for `HubNow`
   series, would refuse in-order samples on every report (10 s sampling puts a report's first
   samples in the previous report's last minute) and up to an hour of samples after a delay
   longer than an hour. So no in-order point ever falls in a closed bucket, and rollups never
-  reopen one. A quiet mail series' open accumulators stay in memory up to that window, counted
-  as active series (§7).
+  reopen one. A quiet mail series' open accumulators stay in memory up to that horizon, and the
+  series counts as active until then (§2 caps, §7).
 - **So a backfill report's points are dropped** (owner's decision, 2026-10-03, a change to RFC 0017 §6
   step 5, which stores them): a report older than the system's newest has points older than its
-  series' last, which an append-only series can't take. Its alert records are still stored, and
-  its points are counted as `Late`. The agent's outbox mails in order (0017 §5), so backfill
+  series' last, which an append-only series can't take. **It is decided by 0017's `Recency`
+  read, before any write**: a `Backfill` report stages nothing at all (not even a metric the
+  newest report lacked), its alert records are still stored, and its points are counted as
+  `Late`. So a series never takes points out of real-time order. The agent's outbox mails in order (0017 §5), so backfill
   arises only when a relay reorders or replays; the README says so beside the counter.
 - An agent's clock can move only its own system's points, inside 0017's bounds (`created_at`
   within 7 days back and 5 minutes ahead of the hub; each `collected_at` within one interval
@@ -248,7 +261,8 @@ pub enum TimeSource { HubNow, Reported }
   poll shares them.
 - **Expiry is retention's.** A mailed point older than its tier's retention is accepted and
   removed by the next pass with its span, as any old span is; RFC 0017's per-point `Expired`
-  count goes. Rollups are fed before that, so a 24 h-interval report under `raw=1h` still
+  count goes. A point still in a series' open raw chunk (its tail) would outlive its span, so
+  the pass also seals and drops open raw chunks whose span has expired. Rollups are fed before that, so a 24 h-interval report under `raw=1h` still
   reaches the minute and hour tiers.
 - Every other path stays `PointTime::HubNow`; the agent's timestamp in a push frame is still
   decoded and never stored.
@@ -513,7 +527,8 @@ send it requests over a bounded channel and wait for its answer:
   reason (`Degraded` included) don't abort the transaction: the report is accepted, its
   refusals counted, and the message deleted, as RFC 0017 deletes every handled message.
   **An `f` may abort only before its first write.** Every refusal a transaction can make
-  (absent record, wrong source, duplicate receipt, full registry) is decided by reads first; a
+  (a wrong source, a duplicate or stale receipt, a backfill report's points, a push registry
+  over its limit) is decided by reads first; a
   write (catalog or staged) is never undone. `CatalogTxn` enforces it: after a write, `Abort`
   is a programming error that fails the store stop, as a writer panic does, and a redb error
   after a write is `StoreError`, also fail-stop. So redb needs no savepoint inside the shared
@@ -548,7 +563,7 @@ group commit.
    milliseconds (§1).
 2. Load `meta`, the in-memory Registry (0011), the tombstones and `Policies`.
 3. Load `tails` into the head: each active series' open chunks, accumulators and last
-   timestamp.
+   timestamp, including every `Reported` series with an open bucket.
 4. Replay `points_log` in sequence order, applying each point only to a series whose last
    timestamp is earlier than the point's. Points already in a tail or a sealed chunk are
    therefore skipped, and none is applied twice.
@@ -570,11 +585,15 @@ one atomic redb transaction.
   fails stop, as for a panic; retrying after a failed `fsync` can report success for lost pages.
 - **`ENOSPC` or `EDQUOT` on commit**: the transaction aborts. The head already holds that
   interval's points and staged points, which redb no longer has, so the writer first
-  **re-derives the head from redb**, exactly as recovery does at open (§6 steps 3–5): the
+  **re-derives the head from redb for the series written in the aborted interval** (the writer
+  knows them: it reloads their tails and replays the log for their ids, as recovery does at open,
+  §6 steps 3–5; the writer serves nothing else meanwhile, typically milliseconds): the
   interval's points are lost, as a crash would lose them (the 1 s window), and no point without
   its receipt can reach a later tail flush. Catalog transactions waiting on that commit get
-  `StoreError::Io`; a mail scan's messages stay in the mailbox for the next scan (§10). Then the
-  writer enters **degraded mode**: appends are refused (`Rejected::Degraded`) and counted, queries and catalog reads
+  `StoreError::Io`; a mail scan's messages stay in the mailbox for the next scan (§10). **While
+  the store is degraded the mail intake doesn't scan**: the mailbox is the buffer, and a scan
+  would store receipts whose points are all refused, so a resend would be a duplicate and the
+  points lost for good. Then the writer enters **degraded mode**: appends are refused (`Rejected::Degraded`) and counted, queries and catalog reads
   still work, and every 60 s the writer checks free space (`statvfs`'s `f_bavail`, the space an
   unprivileged process may use: the hub runs as a non-root user). While free space is below the
   **floor** (the larger of 1 GiB and 2% of the volume), it deletes the oldest raw span, then the
@@ -604,7 +623,11 @@ second is lost), just not clean.
 | the point buffer of one commit interval (~1 MB at 76k points/s), and the writer channel | — | ~10 MB | ~10 MB |
 | **Total** | | **≈ 0.75 GB** | **≈ 1 GB** |
 
-Quiet interned series and every closed chunk live in redb, not in memory. At 100 systems the
+Quiet interned series and every closed chunk live in redb, not in memory. A `Reported` (mail)
+series stays active while it has an open bucket, up to the mail horizon (§2), so a mail
+system's series count against the caps for up to about 8 days after its last point. A mail scan
+holds at most 256 decoded reports at once (each sealed report ≤ 512 KiB, RFC 0017): ≤ 128 MiB
+transient, typically a few MiB. At 100 systems the
 total is about 270 MB, almost all of it the page cache, which the README says can be lowered.
 The performance test measures resident memory at the scale target, and it must land within 20%
 of this table, or the table is corrected.
@@ -762,6 +785,12 @@ tier names, and is an open read like the rest of the hub API.
   next scan, where any that did commit are duplicates. One commit per scan instead of one per
   message keeps a busy mailbox from multiplying commits. The round of a `Newest` report goes
   through `append_round` after the commit, as 0017 does.
+- **A message that fails the store every time can't loop the hub.** Before a scan's transaction,
+  the intake writes the scan's message names to `meta/mail/in_flight` (a `Batched` write that
+  the scan's commit clears). At open, messages still listed there are taken **one per
+  transaction**; one that fails the store a second time (a fail-stop with it alone in flight)
+  is moved to the Maildir's `quarantine/` folder and counted, so one bad message can't keep a
+  restarting hub down.
 - **Freshness uses the system clock**, as 0017's `receipt::fresh` does today, never hub time: a
   hub time held in the future (§2) would otherwise make every report look older than the
   receipt window and refuse them all.
@@ -806,26 +835,32 @@ tier names, and is an open read like the rest of the hub API.
     one that is on time becomes `Online` without touching `last_contact`, so a restart doesn't
     leave every mail system `Unknown` for up to a mail interval (today mail rows keep their
     status across a restart).
-  - **After a hub outage the sweep waits for the mailbox to drain**: it doesn't run until a scan
-    after open has taken fewer than its 256-message maximum, so a backlog that is still arriving
-    oldest first can't mark reporting systems offline (and offline candidates, RFC 0012 §2)
-    while it drains.
+  - **After a hub outage the sweep waits for the mailbox to drain**: it doesn't run until the
+    intake has handled the first message delivered after open (Maildir file names start with
+    their delivery time), so a backlog still arriving oldest first can't mark reporting systems
+    offline (and offline candidates, RFC 0012 §2) while it drains. A count of messages per scan
+    would let anyone who can mail the mailbox keep the sweep off.
+  - **The overdue mark is a compare-and-set on the newest receipt**: the sweep's write applies
+    only while `MailNewest` still names the receipt it read (0011 §7), never by comparing
+    `last_contact`, which a mail system's `HubNow` application rounds also move.
   - The API's `last_seen` is rendered from `last_contact` (RFC 3339), empty when there is none.
     *Behaviour change: today a push system's `last_seen` holds its agent's uptime display, and a
     failed poll updates it; a mail system's holds its newest report's `created_at`
     (`LastSeen::ReportedAt`, RFC 0017 §7), which becomes the time the hub accepted it.*
   - At open every system has `Unknown` (RFC 0016 §4's startup reset) and a `last_contact` that
-    is the latest of: the flushed value (up to one flush rotation old), the newest timestamp of
-    its `HubNow` series (durable to the commit interval through `points_log` and tails), and for
-    a mail system its newest receipt's `received_at`. The flushed value alone could be 15 minutes
+    is the latest of the flushed value (up to one flush rotation old) and the newest timestamp of
+    its `HubNow` series (durable to the commit interval through `points_log` and tails); for a
+    mail system, its newest receipt's `received_at` alone. The flushed value alone could be 15 minutes
     to hours stale, which would make `since` early. A polled system not heard from within **120 s** becomes `Offline { since:
     last_contact }`, or the open time if it has none. A push system goes offline only through
     its current connection's end or RFC 0016's disconnection sweep; a mail system only through
-    the overdue sweep. **A transition from `Unknown` to `Offline` uses `since: last_contact`**
-    (`now` if there is none), whichever sweep or rule writes it, as the 120 s rule does; a
-    transition from `Online` uses `since: now`. Every system is `Unknown` after open, so a
-    restart never resets an offline age (RFC 0012 §2). One pure function,
-    `offline_since(liveness, last_contact, now)`, decides it for every source. With the mail intake off, no sweep runs and mail systems stay
+    the overdue sweep. **A transition from `Unknown` to `Offline` uses `since` = when the
+    system went silent by its own rule**, not when the sweep ran: `last_contact` for a polled or
+    push system, and `received_at + 3 × interval + 15 min` (the moment it became overdue) for a
+    mail system, never later than `now`, and `now` when there is no contact. A transition from
+    `Online` uses `since: now`, which is that same moment for a live sweep. So a restart neither
+    resets nor stretches an offline age (RFC 0012 §2). One pure function,
+    `offline_since(liveness, silent_since, now)`, decides it for every source. With the mail intake off, no sweep runs and mail systems stay
     `Unknown`.
 - **RFC 0007 §2's cache rule, carried forward.** The per-frame `refresh_cache()` goes. The
   in-memory Registry (0011) is maintained by the commit hook, so there is no cache to refresh.
@@ -869,6 +904,8 @@ tier names, and is an open read like the rest of the hub API.
   - changed: **retention** (per tier, globally and per system; no longer per metric), **metric
     point** (stamped in hub time), **system status** (the typed `LiveStatus`), **last seen**
     (the last successful contact; for a mail system, when the hub accepted its newest report),
+    **mail system** (overdue when no report has *arrived* for 3 intervals plus 15 minutes; its
+    offline age counts from that moment),
     **snapshot** (container mounts are not metric points), **backfill report** (RFC 0017: its
     alert records are stored, its points are late and dropped).
 - **Published contracts**: push frames, poll responses and the handshake are untouched (RFC
@@ -966,8 +1003,8 @@ tier names, and is an open read like the rest of the hub API.
   the new `last_seen` are documented; `GET /api/storage` is new; nine variables go into the
   README.
 - **API10:** values checked against their kind's domain at the edge. The one agent-chosen time
-  that reaches the store is a mailed `collected_at`, bounded by RFC 0017's report rules, clamped
-  to hub now and ordered per series (§2 *Mail points*); a backfill can't rewrite history.
+  that reaches the store is a mailed `collected_at`, bounded by RFC 0017's report rules, rebased
+  by the system's non-decreasing clock lead and ordered per series (§2 *Mail points*); a backfill can't rewrite history.
 
 ## Testing plan
 
@@ -1053,6 +1090,20 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   tail flush writes them, the scan's messages stay in the mailbox, and the next scan stores the
   report once; the scan's messages are deleted only after the commit, and a child killed before
   it leaves them in the mailbox.
+- **Third-round rows**: a 24 h-interval report arriving at the edge of the receipt window
+  stores its samples in buckets the horizon hasn't closed; with hub time held a year ahead, no
+  `Reported` bucket closes early; a system whose delivery delay alternates 60 s and 5 s with an
+  agent 120 s fast loses no sample (the lead holds at 120 s); while degraded, the intake doesn't
+  scan and the mailbox is kept; a backfill report carrying a metric the newest report lacked
+  stages nothing; a mailed point in an open raw chunk past its span is gone after the next
+  pass; a mail system with application rounds, restarted then silent, is marked overdue (the
+  compare-and-set on the receipt); a mail system overdue 5 minutes before a restart shows an
+  offline age of about 5 minutes after it, not 3 intervals more; `HUB_CLOCK_REWIND` brings
+  `received_at`, `last_seen_active` and `LiveStatus` times back to the system clock; a mail
+  series with an open bucket is reloaded at open and its bucket closes at the horizon; the sweep
+  waits for the first message delivered after open whatever the per-scan count; a message that
+  fails the store twice is quarantined and the hub keeps running (a child-process test);
+  `ENOSPC` re-derives only the interval's series.
 - **Mail status**: the overdue sweep on `received_at` (on time, overdue, exactly at the bound);
   an agent clock 2 days slow stays `Online`; after a restart an on-time mail system goes from
   `Unknown` to `Online` at the first sweep, and a disabled one stays `Unknown`; the sweep
@@ -1138,7 +1189,7 @@ the workspace gate. `docker-compose.yml` gains `restart: unless-stopped` and
     the hub warns at every start that it holds agent tokens in plaintext (0011 §6);
   - a hub downgrade after upgrading is a rollback to the old file, as above.
 - Push snapshot timestamps switch from agent time to hub time. Mailed snapshots keep their
-  reported times, clamped to hub now.
+  reported times, rebased by the system's clock lead (§2).
 - **Behaviour changes:** container-runtime and per-pod mounts disappear from disk lists and
   history; a backfill mail report's points are dropped (its alert records are kept); a mail
   system's `last_seen` is when the hub accepted its newest report, and it is overdue when no
@@ -1221,7 +1272,7 @@ above, and RFC 0012's fourth and fifth passes found what this RFC must carry for
 
 | Change | Where |
 |---|---|
-| mailed points keep their reported time (`PointTime::Reported`, clamped to hub now); `Late` refuses one not after its series' last or in a closed bucket; every other path stays on hub now | §2, §9 |
+| mailed points keep their reported time (`PointTime::Reported`, rebased per system, §2); `Late` refuses one not after its series' last; every other path stays on hub now | §2, §9 |
 | a backfill report's points are dropped, its alert records kept (owner's decision; changes 0017 §6 step 5) | §2, Rollout |
 | mailed points older than retention are accepted and removed by the pass; 0017's per-point `Expired` count goes | §2 |
 | `CatalogTxn::append` stages points in a catalog transaction, so a report's receipt and points commit together | §6, §9 |
@@ -1251,6 +1302,28 @@ above, and RFC 0012's fourth and fifth passes found what this RFC must carry for
 
 Came closest and survived: replay against closed buckets (a refused point never reaches the
 log, so replay reproduces the head).
+
+`rfc-adversary`, second pass on the mail amendment (the first pass's resolutions). Every finding
+was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| closing `Reported` buckets at 7 days was too early for 24 h intervals, and ran on hub time, which a held clock pushes ahead | CONFIRMED | the mail horizon (window + longest interval + slacks) on `min(hub, system clock)`; a closed-bucket point is `Late` (§2) |
+| a per-report rebase varied with each delivery delay and lost samples when delivery got faster | CONFIRMED | a per-system clock lead, the maximum over the receipt window, never decreasing within it (§2; 0011 §7) |
+| degraded mode stored receipts and dropped their points, so resends became duplicates | CONFIRMED | no mail scan while degraded; the mailbox is the buffer (§6) |
+| `last_contact` at open mixed in `HubNow` application rounds, so the overdue compare-and-set never matched again | CONFIRMED | mail systems take `received_at` alone; the compare-and-set is on the newest receipt (§10; 0011 §7) |
+| after a restart a mail system's offline age jumped by up to 3 intervals | CONFIRMED | `since` is when the system went silent by its own rule: overdue time for mail (§10) |
+| `HUB_CLOCK_REWIND` left other hub times in the future | CONFIRMED | the same `min` applied to `received_at`, `last_seen_active` and `LiveStatus` times (§2) |
+| mail accumulators lived outside the active definition and recovery | CONFIRMED | active per time source; recovery loads every open bucket (§2, §6, §7) |
+| a mailed point in an open raw chunk outlived its span | CONFIRMED | the pass seals and drops expired open raw chunks (§2) |
+| nothing actually dropped a backfill report's points | CONFIRMED | decided by `Recency` before any write: a backfill stages nothing (§2) |
+| a per-scan count let anyone keep the overdue sweep off | PLAUSIBLE | gated on the first message delivered after open (§10) |
+| a deterministic fail-stop message could loop the hub | PLAUSIBLE | in-flight names in `meta`, one per transaction after a restart, quarantine on a second failure (§10) |
+| re-deriving the whole head on `ENOSPC` stalls for the open time | PLAUSIBLE | only the aborted interval's series (§6) |
+| wording, 0012 §2, glossary, scan buffer | CONFIRMED (minor) | corrected; 0012 §2 noted; the glossary; the scan buffer in §7 |
+
+Came closest and survived: one batched transaction per scan with refusals decided by reads, so a
+report's duplicate never aborts after another report's writes.
 
 **Still open**, carried into the next `rfc-adversary` pass: whether the rotating tail flush plus
 the log meets the stated open time at the scale target (to be measured), and whether redb's
