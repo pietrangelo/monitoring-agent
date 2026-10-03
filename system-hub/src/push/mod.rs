@@ -384,6 +384,12 @@ async fn ingest(
         return ingest_snapshot(ctx, system_id, payload, connection, lease).await;
     }
     let Some(frame) = application_wire::decode(data) else {
+        let message = format!(
+            "Dropped a binary message from {:?} that is neither a snapshot nor an application \
+             frame",
+            system_id.as_str()
+        );
+        warn_first(connection.undecodable_frames.note(), &message);
         return Ok(());
     };
     match ScrapeRound::try_from(frame) {
@@ -406,7 +412,7 @@ async fn ingest_snapshot(
     system_id: &SystemId,
     payload: PushPayload,
     connection: &mut ConnectionState,
-    _lease: Option<&ConnectionLease>,
+    lease: Option<&ConnectionLease>,
 ) -> Result<(), IngestStop> {
     let id = system_id.as_str();
     let frame = match SnapshotFrame::try_from(payload) {
@@ -417,7 +423,8 @@ async fn ingest_snapshot(
             return Ok(());
         }
     };
-    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, frame, None);
+    let handle = lease.map(ConnectionLease::handle);
+    let work = move |app: &AppState, id: &SystemId| ingest_frame(app, id, frame, handle);
     let stored = on_blocking_pool(&ctx.app, system_id, work)
         .await
         .map_err(|_| IngestStop::WorkFailed)?;

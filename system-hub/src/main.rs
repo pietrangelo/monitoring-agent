@@ -80,6 +80,23 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Turns every `Online` push system `Unknown` before anything reads the registry (RFC 0016
+/// §4): the previous process wrote that status, and no connection's end ran since. A failure
+/// is logged, and the hub serves anyway.
+async fn reset_push_status(db: &Arc<db::Database>) {
+    let db = Arc::clone(db);
+    let reset = tokio::task::spawn_blocking(move || {
+        use models::SystemStatus::{Online, Unknown};
+        db.reset_status(registry::PUSH_URL, &Online, &Unknown)
+    })
+    .await;
+    match reset {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => tracing::warn!("Couldn't reset push systems' status at startup: {err}"),
+        Err(err) => tracing::warn!("Resetting push systems' status at startup failed: {err}"),
+    }
+}
+
 async fn run() -> Result<(), StartupError> {
     // Configuration first, so a refused start leaves nothing behind.
     let listen = listen::ListenAddress::from_env(std::env::var(listen::ListenAddress::VARIABLE))
@@ -94,6 +111,8 @@ async fn run() -> Result<(), StartupError> {
     let db = Arc::new(db::Database::new("system-hub.db").map_err(StartupError::Database)?);
     tracing::info!("📁 Database initialized: system-hub.db");
 
+    reset_push_status(&db).await;
+
     // The first summary reads the database, so the state is built on the blocking pool.
     let app_state = tokio::task::spawn_blocking(move || state::AppState::new(db))
         .await
@@ -104,6 +123,7 @@ async fn run() -> Result<(), StartupError> {
     collector::start_collectors(app_state.clone());
     retention::start(app_state.clone());
     routes::sse::start_publisher(app_state.clone());
+    push::start_disconnection_sweep(app_state.clone(), std::time::Instant::now());
 
     let app = app(app_state, push_auth, &static_dir);
 

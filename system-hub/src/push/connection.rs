@@ -77,6 +77,7 @@ impl ConnectionState {
             ),
             (self.refused_snapshot_frames, "snapshot frame(s) refused"),
             (self.store_errors, "snapshot(s) that failed to store"),
+            (self.undecodable_frames, "undecodable binary message(s)"),
         ];
         for (Tally(count), what) in counts.into_iter().filter(|(tally, _)| tally.0 > 0) {
             tracing::info!(

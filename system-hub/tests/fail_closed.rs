@@ -691,3 +691,37 @@ async fn wait_for(client: &reqwest::Client, url: &str, hub: &mut tokio::process:
     }
     panic!("the hub did not answer {url} within 10 s");
 }
+
+/// RFC 0016 §4: `main` resets push systems' status before it serves. A push system the
+/// previous process left `online` reads `unknown` from the first request on.
+#[tokio::test]
+async fn a_push_system_left_online_reads_unknown_once_the_hub_serves_again() {
+    let dir = tempfile::tempdir().unwrap();
+    // A first run creates the schema, then stops.
+    let mut first = hub_listening_at(dir.path(), "127.0.0.1:0");
+    bound_address(&mut first)
+        .await
+        .expect("the first run serves");
+    first.kill().await.unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("system-hub.db")).unwrap();
+    db.execute(
+        "INSERT INTO systems (id, name, url, token, status, last_seen, poll_interval_secs, enabled)
+         VALUES ('sys-left', 'sys-left', 'push://', '', 'online', '1h', 10, 1)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut hub = hub_listening_at(dir.path(), "127.0.0.1:0");
+    let addr = bound_address(&mut hub).await.expect("the hub serves again");
+    let body = wait_for(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/api/systems/sys-left"),
+        &mut hub,
+    )
+    .await;
+
+    let system: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(system["status"], "unknown", "{body}");
+    assert_eq!(system["last_seen"], "1h", "last seen kept: {body}");
+}

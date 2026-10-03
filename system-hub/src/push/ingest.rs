@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use crate::db::{Registration, SnapshotStored};
 use crate::models::{SystemId, SystemInfo, SystemStatus};
-use crate::presence::ConnectionLease;
+use crate::presence::{ConnectionLease, Ending, LeaseHandle};
 use crate::registry::{
     LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh, needs_system_info,
 };
@@ -181,7 +181,14 @@ pub(super) fn register_and_accept(
     app: &AppState,
     system_id: &SystemId,
 ) -> Result<Option<ConnectionLease>, rusqlite::Error> {
-    register_if_new(app, system_id).map(|_| None)
+    let mut presence = app.presence();
+    let lease = match register_if_new(app, system_id)? {
+        Registration::Inserted | Registration::Known { same_url: true } => {
+            Some(presence.accept(system_id))
+        }
+        Registration::Known { same_url: false } => None,
+    };
+    Ok(lease)
 }
 
 /// Registers a system the hub hasn't seen before, under its default name. A known id is
@@ -195,7 +202,7 @@ pub(super) fn register_if_new(
         name: system_id.default_name(),
         url: "push://".to_string(),
         token: String::new(),
-        status: SystemStatus::Online,
+        status: SystemStatus::Unknown,
         last_seen: String::new(),
         last_error: None,
         os: None,
@@ -215,8 +222,12 @@ pub(super) fn ingest_frame(
     app: &AppState,
     system_id: &SystemId,
     frame: SnapshotFrame,
-    _lease: Option<&ConnectionLease>,
+    lease: Option<LeaseHandle>,
 ) -> Result<SnapshotStored<LeftOutLog>, rusqlite::Error> {
+    if let Some(lease) = &lease {
+        // Claimed just before the store, outside the presence lock (RFC 0016 §2).
+        app.presence().claim(system_id, lease);
+    }
     let SnapshotFrame {
         reported,
         time,
@@ -277,13 +288,25 @@ fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
     }
 }
 
-/// Ends a push connection's hold on its system (RFC 0007 §4): marks it offline, then removes
-/// its live metrics. One unit of blocking work, so no wait separates the two.
-pub(super) fn end_connection(
-    app: &AppState,
-    system_id: &SystemId,
-    _lease: Option<ConnectionLease>,
-) {
+/// Ends a push connection (RFC 0016 §2): only the current connection's end marks its system
+/// offline and removes its live metrics (RFC 0007 §4), under the presence lock, in one unit
+/// of blocking work. A connection without a lease (a polled system's id) writes nothing.
+pub(super) fn end_connection(app: &AppState, system_id: &SystemId, lease: Option<ConnectionLease>) {
+    let Some(lease) = lease else {
+        return;
+    };
+    let mut presence = app.presence();
+    match presence.end(system_id, lease) {
+        Ending::Current => mark_disconnected(app, system_id),
+        Ending::NotCurrent => tracing::info!(
+            "Push connection of {:?} ended; another connection is current",
+            system_id.as_str()
+        ),
+    }
+}
+
+/// Marks a system offline, then removes its live metrics.
+fn mark_disconnected(app: &AppState, system_id: &SystemId) {
     let id = system_id.as_str();
     let offline =
         app.db

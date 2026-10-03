@@ -41,5 +41,5 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0013](0013-sqlite-import.md) | One-Shot Import from SQLite into the Hub Store | Rejected |
 | [0014](0014-execution-environment.md) | Execution Environment: the Agent Monitors What It Runs In | Implemented |
 | [0015](0015-configurable-listen-port.md) | Configurable Listen Address for the Agent and the Hub | Implemented |
-| [0016](0016-current-push-connection.md) | The Current Push Connection, and the Agent's Id Computed Once | Accepted |
+| [0016](0016-current-push-connection.md) | The Current Push Connection, and the Agent's Id Computed Once | Implemented |
 | [0017](0017-mail-transport.md) | Mail Transport: Sealed Reports over SMTP for Agents Without Internet Access | Accepted |

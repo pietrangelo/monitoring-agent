@@ -209,14 +209,30 @@ For push-mode agents, they appear automatically — no manual registration neede
 | `SYSTEM_AGENT_TOKEN` | *(none)* | API token required for REST access |
 | `PUSH_TO` | *(none)* | Hub WebSocket URL, e.g. `ws://hub:9091`; its port is the hub's `HUB_LISTEN` port |
 | `PUSH_TOKEN` | *(none)* | Shared secret for hub authentication |
+| `SYSTEM_AGENT_ID_FILE` | *(none)* | Absolute path of a file that keeps the push system id. When the file exists its content is the id; when it's missing, the id resolved at that start is written there, so it survives container re-creations. A relative path, or a file that isn't UTF-8 or holds an invalid id, refuses startup (exit 78); a file that can't be read or written refuses it with exit 1. Unset or empty: nothing is written. The image has `/var/lib/system-agent`, owned by the agent's user, for a volume (see below) |
 | `PUSH_INTERVAL` | `2` | Seconds between push ticks (min 2). A tick sends the latest snapshot only if the hub hasn't had it yet; a stale snapshot closes the connection, and the agent reconnects once a fresh one is read |
 | `SPRING_BOOT_APPS` | *(none)* | Spring Boot applications to monitor, as comma-separated `name=actuator-base-url` pairs (at most 16), e.g. `orders=http://127.0.0.1:8081/actuator`. A name is 1–64 of `A-Z a-z 0-9 _ . -`. The URL is http(s), with no credentials, query or fragment |
 | `SPRING_BOOT_APP_<NAME>_USERNAME` / `_PASSWORD` | *(none)* | HTTP Basic credentials for one application; both or neither. `<NAME>` is the name upper-cased, with `-` and `.` as `_`. A username can't contain `:`, and neither value a control character (HTTP Basic can't carry them). Never logged. Over plain `http://` to a non-loopback address, the agent logs a startup warning |
 | `SPRING_BOOT_SCRAPE_INTERVAL` | `15` | Seconds between scrape rounds, 10 to 3600 |
 
-The agent parses `SYSTEM_AGENT_LISTEN` and the `SPRING_BOOT_*` variables before it starts
-anything. If one is malformed, it logs which variable is wrong (never its value) and exits with
-code **78** (`EX_CONFIG`); no other failure uses that code. With applications configured, the agent
+The agent parses `SYSTEM_AGENT_LISTEN`, the `SPRING_BOOT_*` variables and, when `PUSH_TO` is
+set, `SYSTEM_AGENT_ID_FILE` before it starts anything, and resolves its push system id there,
+once. If a value is malformed, it logs which variable is wrong (never its value) and exits with
+code **78** (`EX_CONFIG`); no other failure uses that code (an id file that can't be read or
+written exits 1).
+
+To keep a containerised agent's id across re-creations, mount a volume and point the variable
+into it:
+
+```yaml
+    environment:
+      SYSTEM_AGENT_ID_FILE: /var/lib/system-agent/id
+    volumes:
+      - agent-id:/var/lib/system-agent
+```
+
+Turning this on re-creates the container, whose new host name is the id captured: delete the
+old system on the hub once. With applications configured, the agent
 scrapes each one's Actuator every interval and serves the result on `GET /api/applications`.
 See [Spring Boot applications](#spring-boot-applications) for what each application must expose.
 
@@ -290,10 +306,14 @@ Agent → Hub:  {"type":"auth","system_id":"<system id>","token":"<secret>"}
 Hub → Agent:  {"type":"auth_ok"}   or   {"type":"auth_error","message":"..."}
 ```
 
-The system id is the host's `/etc/machine-id`, else the dbus machine id, else its hostname,
-else a random UUID. It must be one URL path segment: not empty, at most 255 bytes, and not
-`.` or `..`. The hub registers an unseen id as a new system,
-named after the first 8 bytes of the id until the first data frame supplies a hostname.
+The system id is resolved once at startup: the content of `SYSTEM_AGENT_ID_FILE` when set
+and present, else the host's `/etc/machine-id`, else the dbus machine id, else its host name
+(`/proc/sys/kernel/hostname`), else a random UUID (logged with a warning: it lives for that
+process only). A source that is missing or breaks the rule is skipped. It must be one URL path
+segment: not empty, at most 255 bytes, and not `.` or `..`. The hub registers an unseen id as a
+new push system, with status `unknown` until its first snapshot is stored, and named after the
+first 8 bytes of the id until the first data frame supplies a hostname. A push connection
+presenting a polled system's id is accepted, but its end never marks that system offline.
 When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` messages are:
 
 | `message` | Cause |
@@ -306,8 +326,18 @@ When `HUB_PUSH_TOKEN` is set, `token` must match it. The possible `auth_error` m
 
 The agent retries after 5 s, as for any `auth_error`.
 
+**Status of a push system.** Of a system's open push connections, the one whose snapshot was
+stored last is current (before any, the first one accepted); only its end marks the system
+offline. Push systems are never polled. Every 30 s a sweep marks offline a push system with no
+live current connection, or one that reads online while its current connection never sent a
+snapshot, once the hub has run for 120 s. At every hub start, push systems that read `online`
+read `unknown` until their agent's first snapshot is stored; one whose agent is gone goes
+offline 120 to 150 s after the start. A binary message that is neither a snapshot nor an
+application frame is dropped and counted: the first one is logged at `warn`, the count when the
+connection ends.
+
 **Deadlines and limits:** after `auth_ok`, the client must send some message at least every
-90 s, or the hub closes the connection and marks the system offline. Pings count, and the hub
+90 s, or the hub closes the connection (marking the system offline when it was current). Pings count, and the hub
 answers them itself; the agent pings every 30 s. Every message is at most 512 KiB. An
 oversize message gets no answer and no Close frame: before `auth_ok` the hub drops the
 connection at once, and after it the hub stops reading for 30 s, then closes the connection

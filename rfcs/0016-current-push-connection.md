@@ -1,6 +1,6 @@
 # RFC 0016: The Current Push Connection, and the Agent's Id Computed Once
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-29 (revised the same day for two `rfc-adversary` passes; a third pass's findings are open; see Review)
 - Affects: `system-hub` (a push connection's end, a disconnection sweep, the poller), and

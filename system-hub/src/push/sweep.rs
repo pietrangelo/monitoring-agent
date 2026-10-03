@@ -20,6 +20,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::SourceRow;
+use crate::models::SystemStatus;
+use crate::presence::{OfflineReason, Sweep};
+use crate::registry::SystemSource;
 use crate::state::AppState;
 
 /// How often the sweep runs.
@@ -36,12 +40,95 @@ pub(super) struct SweepPass {
 /// Starts the sweep for the hub's lifetime; `started` is when the hub started, on the
 /// monotonic clock, so a pass knows how long the hub has been up.
 pub fn start_disconnection_sweep(app: Arc<AppState>, started: Instant) {
-    let _ = (app, started, SWEEP_PERIOD);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(SWEEP_PERIOD);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let up_for = started.elapsed();
+            let app = Arc::clone(&app);
+            match tokio::task::spawn_blocking(move || sweep_pass(&app, up_for)).await {
+                Ok(Ok(pass)) => log_pass(pass),
+                Ok(Err(err)) => {
+                    tracing::warn!("The disconnection sweep couldn't read the registry: {err}");
+                }
+                Err(err) => tracing::error!("A disconnection sweep pass failed: {err}"),
+            }
+        }
+    });
 }
 
-/// One pass, the hub up for `up_for`: a blocking unit.
-pub(super) fn sweep_pass(_app: &AppState, _up_for: Duration) -> Result<SweepPass, rusqlite::Error> {
-    Ok(SweepPass::default())
+/// One pass, the hub up for `up_for`: a blocking unit. Each push system is decided and, when
+/// disconnected, written under the presence lock, so no claim falls between the two.
+pub(super) fn sweep_pass(app: &AppState, up_for: Duration) -> Result<SweepPass, rusqlite::Error> {
+    let read = app.db.system_sources()?;
+    let mut pass = SweepPass {
+        skipped: read.skipped,
+        ..SweepPass::default()
+    };
+    for row in read.rows.iter().filter(|row| is_push(row)) {
+        let mut presence = app.presence();
+        match presence.sweep(&row.id, &row.status, up_for) {
+            Sweep::Leave => {}
+            Sweep::MarkOffline(reason) => pass.note(mark_offline(app, row, reason)),
+        }
+    }
+    Ok(pass)
+}
+
+fn is_push(row: &SourceRow) -> bool {
+    match SystemSource::of(&row.url) {
+        SystemSource::Push => true,
+        SystemSource::Poll => false,
+    }
+}
+
+/// Writes the sweep's offline marking: the same columns a connection's end writes.
+fn mark_offline(
+    app: &AppState,
+    row: &SourceRow,
+    reason: OfflineReason,
+) -> Result<(), rusqlite::Error> {
+    let offline = SystemStatus::Offline;
+    app.db
+        .update_system_status(&row.id, &offline, "", Some(reason.last_error()))
+}
+
+impl SweepPass {
+    /// Counts one marking; the pass's first failure is logged with its error.
+    fn note(&mut self, marked: Result<(), rusqlite::Error>) {
+        match marked {
+            Ok(()) => self.marked += 1,
+            Err(err) => {
+                if self.failed == 0 {
+                    tracing::warn!("The disconnection sweep couldn't mark a system offline: {err}");
+                }
+                self.failed += 1;
+            }
+        }
+    }
+}
+
+/// One line per pass that did anything; no id is logged.
+fn log_pass(pass: SweepPass) {
+    if pass.marked > 0 {
+        tracing::info!(
+            "Disconnection sweep: {} push system(s) marked offline",
+            pass.marked
+        );
+    }
+    if pass.failed > 0 {
+        tracing::warn!(
+            "Disconnection sweep: {} offline marking(s) failed",
+            pass.failed
+        );
+    }
+    if pass.skipped > 0 {
+        tracing::warn!(
+            "Disconnection sweep: {} row(s) with an id that isn't text skipped",
+            pass.skipped
+        );
+    }
 }
 
 #[cfg(test)]

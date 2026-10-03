@@ -23,7 +23,7 @@ use crate::models::*;
 mod history;
 mod sources;
 pub use history::{RoundStored, SnapshotStored};
-pub use sources::{SourceRow, SourceRows};
+pub use sources::SourceRow;
 
 /// What a registration found (RFC 0016 §2): the id was absent and is now inserted, or it was
 /// known, and its stored `url` is, or isn't, the one the registration presented.
