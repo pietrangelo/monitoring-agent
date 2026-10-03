@@ -2603,6 +2603,60 @@ mod tests {
         assert_eq!(status_of(&state, "sys-ping"), offline, "the pinger's end");
     }
 
+    /// RFC 0016 §2: the old connection timing out on its idle deadline, after a reconnect that
+    /// delivered a snapshot, leaves the system online.
+    #[tokio::test]
+    async fn an_old_connection_timing_out_after_a_reconnect_leaves_the_system_online() {
+        let (state, _dir) = temp_state();
+        let config = config_with(|c| c.idle_timeout = Duration::from_millis(1000));
+        let addr = serve_push_with(state.clone(), config).await;
+        let mut old = connect_authenticated(addr, "sys-idle").await;
+        send_snapshot(&mut old, "host").await;
+        let mut new = connect_authenticated(addr, "sys-idle").await;
+        send_snapshot(&mut new, "host").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_until_hub_caught_up(&mut new).await;
+
+        let closed = messages_until_closed(&mut old, Duration::from_secs(3)).await;
+
+        assert!(closed.is_some(), "the old connection timed out");
+        assert_eq!(status_of(&state, "sys-idle").0, SystemStatus::Online);
+        assert!(has_live_metrics(&state, "sys-idle"), "live metrics kept");
+    }
+
+    /// RFC 0016 §2, newest exits first, over two sockets (characterisation: today's hub marks
+    /// every end offline too): the newest end marks offline, the older one's snapshot marks
+    /// online again, and its own end marks offline.
+    #[tokio::test]
+    async fn when_the_newest_connection_exits_first_the_older_one_takes_over() {
+        let (state, _dir) = temp_state();
+        let addr = serve_push(state.clone(), "").await;
+        let mut older = connect_authenticated(addr, "sys-two").await;
+        send_snapshot(&mut older, "host").await;
+        let mut newer = connect_authenticated(addr, "sys-two").await;
+        send_snapshot(&mut newer, "host").await;
+
+        close_and_wait_for_the_hubs_end(&mut newer, "the newer connection").await;
+        assert_eq!(
+            status_of(&state, "sys-two").0,
+            SystemStatus::Offline,
+            "newer ends"
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        send_snapshot(&mut older, "host").await;
+        assert_eq!(
+            status_of(&state, "sys-two").0,
+            SystemStatus::Online,
+            "older claims"
+        );
+        close_and_wait_for_the_hubs_end(&mut older, "the older connection").await;
+        assert_eq!(
+            status_of(&state, "sys-two").0,
+            SystemStatus::Offline,
+            "older ends"
+        );
+    }
+
     /// RFC 0016 §2 (A01): a push connection presenting a polled system's id holds no lease,
     /// so its end never marks the polled system offline.
     #[tokio::test]

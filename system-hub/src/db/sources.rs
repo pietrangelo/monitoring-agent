@@ -19,12 +19,14 @@
 
 use super::{Database, parse_status};
 use crate::models::SystemStatus;
+use crate::registry::{PUSH_URL, SystemSource};
 
-/// One system as the disconnection sweep reads it.
+/// One system as the disconnection sweep reads it: its source decided at this edge, from
+/// whether its `url` is the push sentinel (any stored type maps; only text can equal it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceRow {
     pub id: String,
-    pub url: String,
+    pub source: SystemSource,
     pub status: SystemStatus,
 }
 
@@ -36,13 +38,16 @@ pub struct SourceRows {
 }
 
 impl Database {
-    /// Every system's id, url and status. Each row maps on its own, so no other column, and no
+    /// Every system's id, source and status. Each row maps on its own, so no other column, and no
     /// other row, can fail the read; it reads no token.
     pub fn system_sources(&self) -> Result<SourceRows, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, url, status FROM systems")?;
+        let mut stmt = conn.prepare("SELECT id, url IS ?1, status FROM systems")?;
         let mut read = SourceRows::default();
-        for row in stmt.query_map([], |row| Ok(source_row(row.get(0), row.get(1), row.get(2))))? {
+        let rows = stmt.query_map([PUSH_URL], |row| {
+            Ok(source_row(row.get(0), row.get(1), row.get(2)))
+        })?;
+        for row in rows {
             match row? {
                 Some(row) => read.rows.push(row),
                 None => read.skipped += 1,
@@ -67,15 +72,19 @@ impl Database {
     }
 }
 
-/// One row, or `None` when its id, url or status isn't text: a row the sweep skips.
+/// One row, or `None` when its id isn't text: a row the sweep skips.
 fn source_row(
     id: rusqlite::Result<String>,
-    url: rusqlite::Result<String>,
+    is_push: rusqlite::Result<bool>,
     status: rusqlite::Result<String>,
 ) -> Option<SourceRow> {
+    let source = match is_push {
+        Ok(true) => SystemSource::Push,
+        Ok(false) | Err(_) => SystemSource::Poll,
+    };
     Some(SourceRow {
         id: id.ok()?,
-        url: url.ok()?,
+        source,
         status: status.map_or(SystemStatus::Unknown, |status| parse_status(&status)),
     })
 }
@@ -167,12 +176,15 @@ mod tests {
             .unwrap();
         db.insert_system(&system("c-odd", "push://", SystemStatus::Online, None))
             .unwrap();
+        db.insert_system(&system("d-blob-url", "push://", SystemStatus::Online, None))
+            .unwrap();
         db.conn
             .lock()
             .unwrap()
             .execute_batch(
                 "UPDATE systems SET poll_interval_secs = -1 WHERE id = 'b-polled';
                  UPDATE systems SET status = 'sleeping' WHERE id = 'c-odd';
+                 UPDATE systems SET url = CAST('push://' AS BLOB) WHERE id = 'd-blob-url';
                  INSERT INTO systems (id, name, url, token, status, last_seen,
                                       poll_interval_secs, enabled)
                      VALUES (NULL, 'z', 'push://', '', 'online', '', 10, 1),
@@ -189,7 +201,7 @@ mod tests {
 
         let row = |id: &str, url: &str, status| SourceRow {
             id: id.to_string(),
-            url: url.to_string(),
+            source: SystemSource::of(url),
             status,
         };
         assert_eq!(
@@ -199,6 +211,7 @@ mod tests {
                     row("a-push", "push://", SystemStatus::Online),
                     row("b-polled", "http://b", SystemStatus::Offline),
                     row("c-odd", "push://", SystemStatus::Unknown),
+                    row("d-blob-url", "a blob is no sentinel", SystemStatus::Online),
                 ],
                 skipped: 2,
             }

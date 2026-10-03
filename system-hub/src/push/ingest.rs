@@ -200,7 +200,7 @@ pub(super) fn register_if_new(
     app.db.insert_system_if_absent(&SystemInfo {
         id: system_id.as_str().to_string(),
         name: system_id.default_name(),
-        url: "push://".to_string(),
+        url: crate::registry::PUSH_URL.to_string(),
         token: String::new(),
         status: SystemStatus::Unknown,
         last_seen: String::new(),

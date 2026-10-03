@@ -755,3 +755,13 @@ design flaw.
 
 The only CONFIRMED findings were a stale claim and a paraphrase, fixed in wording; the RFC is
 `Accepted`.
+
+`rosette-auditor` on the implementation (no VIOLATED; five AT-RISK, each decided):
+
+| Finding | Decision |
+|---|---|
+| registration writes the literal `"push://"`, and `Registration::Known` carries a bool, not `Known(SystemSource)` | `register_if_new` writes `PUSH_URL`. The bool stays: `insert_system_if_absent` is the registry's, shared by every transport (RFC 0017 registers `mail://` through it), and only knows whether the stored url is the presented one; `register_and_accept` maps it to push or not with an exhaustive match |
+| a row whose `url` isn't text was skipped by the sweep's read and logged as a bad id | the read now decides the source at the edge (`url IS 'push://'`), so such a row reads `Poll` and is never skipped; only a non-text id is |
+| RFC adapter rows missing | added: the old connection timing out after a reconnect, and newest-exits-first over two sockets (both caught by the "every end marks offline" mutation, the second a characterisation). Deferred, with no test yet: the lease dropped by a panicking task (needs a panic seam in the connection task), the handshake table observed through the sweep, and the poller at 500 ms over a push row (`polled_systems` is covered as a pure unit) |
+| `PUSH_TOKEN` and `PUSH_INTERVAL` still read inside the push task | accepted for now: this RFC moved `PUSH_TO` and the id to `start`; moving the other two, and refusing a malformed interval with exit 78, changes behaviour and belongs with the next change to the push client's configuration |
+| `PushPresence::sweep` parses the id itself | accepted: the parse is pure and local to the one decision that needs it |

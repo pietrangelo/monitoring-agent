@@ -66,7 +66,7 @@ pub(super) fn sweep_pass(app: &AppState, up_for: Duration) -> Result<SweepPass, 
         skipped: read.skipped,
         ..SweepPass::default()
     };
-    for row in read.rows.iter().filter(|row| is_push(row)) {
+    for row in read.rows.iter().filter(|row| is_push(row.source)) {
         let mut presence = app.presence();
         match presence.sweep(&row.id, &row.status, up_for) {
             Sweep::Leave => {}
@@ -76,8 +76,8 @@ pub(super) fn sweep_pass(app: &AppState, up_for: Duration) -> Result<SweepPass, 
     Ok(pass)
 }
 
-fn is_push(row: &SourceRow) -> bool {
-    match SystemSource::of(&row.url) {
+fn is_push(source: SystemSource) -> bool {
+    match source {
         SystemSource::Push => true,
         SystemSource::Poll => false,
     }
@@ -125,7 +125,7 @@ fn log_pass(pass: SweepPass) {
     }
     if pass.skipped > 0 {
         tracing::warn!(
-            "Disconnection sweep: {} row(s) with an id that isn't text skipped",
+            "Disconnection sweep: {} row(s) whose id isn't text skipped",
             pass.skipped
         );
     }
