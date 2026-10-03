@@ -19,5 +19,6 @@
 
 pub mod batch;
 pub mod config;
+pub mod outbox;
 pub mod report;
 pub mod seal;
