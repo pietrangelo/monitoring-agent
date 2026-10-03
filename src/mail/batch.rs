@@ -69,6 +69,8 @@ pub struct MailBatch {
     last_kept: Option<Instant>,
     samples: Vec<MailedSnapshot>,
     alerts: Vec<MailedAlert>,
+    /// The incident ids active on the last tick, across closes: an incident is new only once.
+    active: Vec<String>,
 }
 
 impl MailBatch {
@@ -80,6 +82,7 @@ impl MailBatch {
             last_kept: None,
             samples: Vec::new(),
             alerts: Vec::new(),
+            active: Vec::new(),
         }
     }
 
@@ -100,10 +103,11 @@ impl MailBatch {
         Offer::Kept
     }
 
-    /// Notes the alerts active on a tick, once each by incident id. Returns whether any is new
-    /// to this batch: an incident that may send a report at once.
+    /// Notes the alerts active on a tick, once each by incident id per report. Returns whether
+    /// an incident became active since the last tick: one that may send a report at once.
     pub fn note_alerts(&mut self, alerts: &[ActiveAlert]) -> bool {
-        let mut any_new = false;
+        let any_new = alerts.iter().any(|alert| !self.active.contains(&alert.id));
+        self.active = alerts.iter().map(|alert| alert.id.clone()).collect();
         for alert in alerts {
             if self.alerts.iter().any(|noted| noted.id == alert.id) {
                 continue;
@@ -112,7 +116,6 @@ impl MailBatch {
                 self.alerts.remove(0);
             }
             self.alerts.push(MailedAlert::from(alert));
-            any_new = true;
         }
         any_new
     }
@@ -238,7 +241,7 @@ mod tests {
             "the same incident again"
         );
         assert!(
-            batch.note_alerts(&[other]),
+            batch.note_alerts(&[active_alert(), other]),
             "another incident, ended by the close"
         );
 
@@ -260,8 +263,22 @@ mod tests {
             "nothing kept since"
         );
         batch.offer(sample(240), start + Duration::from_secs(140));
+        assert!(
+            !batch.note_alerts(&[active_alert()]),
+            "an incident still active after the close is not new: it sends no incident report"
+        );
         let next = batch.close(mail_interval(300), ReportReason::Scheduled, 240, None);
-        assert_eq!(next.map(|r| (r.id.seq, r.alerts.len())), Some((2, 0)));
+        let ids = next.map(|r| {
+            (
+                r.id.seq,
+                r.alerts.into_iter().map(|a| a.id).collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            ids,
+            Some((2, vec!["run-1".to_string()])),
+            "but it rides the report"
+        );
     }
 
     /// RFC 0017 §2: at most 60 samples and 64 alerts; past them, the oldest go.
