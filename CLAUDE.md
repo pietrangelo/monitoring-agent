@@ -187,10 +187,13 @@ All production code is written test-first, in a closed loop per behaviour:
    compiles and returns a wrong value (`Default::default()`, an empty `Vec`, the wrong
    variant) — not `todo!()`, whose panic proves nothing about behaviour. Then launch the
    `red-test-adversary` subagent on the test. `DECORATION` (a cheat implementation passed) →
-   rewrite the test and run the adversary again. `WEAK-RED` (fails on compilation or a panic
-   rather than an assertion) → add the stub and re-run.
+   release the test (see § Tests are the contract), rewrite it and run the adversary again.
+   `WEAK-RED` (fails on compilation or a panic rather than an assertion) → add the stub and
+   re-run. The run that proved the red also froze the test: from here on it is the contract.
 3. **Minimal green.** Write the least code that satisfies the test: no tidying nearby code,
-   no speculative generality.
+   no speculative generality, and **no edit to the test**. If green seems to need a change to
+   the test, the test or the contract is wrong, and that is decided in phase 1, out loud,
+   with a release — never by the implementer in phase 3.
 4. **Refactor under green.** Improve the code you just wrote against the Rosette and the DDD
    rules. The tests stay green throughout.
 5. **Gate.** Run the toolchain sequence above in every touched crate, then run the
@@ -200,7 +203,68 @@ All production code is written test-first, in a closed loop per behaviour:
 **Circuit breaker:** if a test failure persists after 2 compilation/implementation attempts
 (phases 3–4), STOP immediately. Revert dirty changes (`git checkout -- <files>`), state the
 exact blocker, and ask the user for guidance rather than burning context in trial-and-error
-loops.
+loops. Weakening the test is not a third attempt.
+
+### Tests are the contract: the test-contract guard
+
+A test that has been run is a contract, and the implementation changes to meet it, never the
+other way round. "Make the test pass" is never satisfied by changing an expectation, dropping
+a table row, loosening an assertion, adding `#[ignore]`, renaming or deleting the test, or
+weakening a fixture. This holds for red tests in phases 3–4, for characterisation tests, and
+for tests that already exist in `HEAD`.
+
+The rule is enforced mechanically by `.claude/hooks/tdd_guard.py`, wired through
+`.claude/settings.json` (RFC 0018). What it does:
+
+- Every `cargo test` / `xss.mjs` run **freezes** each test function in the tree (a hash of
+  its source with whitespace removed, so `cargo fmt` is not a change). The ledger lives in
+  `.claude/tdd-state/` (gitignored, local to the checkout).
+- An Edit/Write that changes, renames, deletes or ignores a frozen test is **refused**. So is
+  removing a line of fixture or helper code in a `#[cfg(test)]` region or an integration-test
+  file, removing a line of `system-hub/dashboard-tests/xss.mjs` or of the guard's own tests,
+  or adding a line to `xss.mjs` that could skip its checks. Adding tests, rows, helpers and
+  checks is free. A bare `#[ignore]` is refused anywhere; `#[ignore = "why"]` on a new test
+  is not.
+- A shell command that writes a `.rs`/`.mjs` file in place (`sed -i`, `tee`, `>`, `cp`
+  over it) is refused: use Edit/Write, where the guard can read the change.
+- `git commit` is refused while any test function differs from `HEAD` without a release,
+  while a new test has never been run, while a new or rewritten test has not been attacked
+  by `red-test-adversary`, or while production code changed and `rosette-auditor` has not
+  run since the last edit. This is the backstop for edits that slipped past the hooks.
+
+When the contract itself is wrong, say so and **release** the test, which is logged:
+
+```sh
+python3 .claude/hooks/tdd_guard.py release <file> [<test> ...] --reason '<why>' --authority adversary|user
+```
+
+- `--authority adversary`: `red-test-adversary` returned `DECORATION` or `WEAK-RED`, or named
+  a missing row; quote the verdict in the reason.
+- `--authority user`: the user asked for the change to the contract, in their words. A
+  release is never the implementer's own call: if nothing in the conversation authorises it,
+  stop and ask.
+- A release opens only the named tests (or, with no test named, the whole file's test
+  surface), until the next commit consumes it. The rewritten test is frozen again by its
+  next run and needs the adversary again.
+- Every release is quoted in the change summary, from `.claude/tdd-state/releases.log`.
+
+The adversaries leave records the commit gate reads. A subagent run of `red-test-adversary`
+or `rosette-auditor` is recorded automatically. The in-process check allowed at medium
+effort is recorded explicitly, and the record is a declaration, so it carries the verdict
+and the closest attack:
+
+```sh
+python3 .claude/hooks/tdd_guard.py attacked --in-process --verdict EVIDENCE --closest '<the cheat that came closest>'
+python3 .claude/hooks/tdd_guard.py audited  --in-process --verdict HOLDS
+python3 .claude/hooks/tdd_guard.py status   # what is frozen, pending or released
+```
+
+The guard protects against the author's own shortcuts, not against a determined attacker:
+deleting the ledger, editing the hook, or using a tool it doesn't see are all possible, and
+each of them is a deliberate act that must be reported as such. Never edit
+`.claude/hooks/tdd_guard.py` or `.claude/settings.json` as part of a change to the Rust
+crates; the guard changes in a commit of its own, with its tests
+(`python3 .claude/hooks/test_tdd_guard.py`) green and a mutation check in the summary.
 
 Cases where red-first works differently:
 
@@ -235,8 +299,10 @@ directory, and must never edit the repository. Running them is required:
 - **At medium effort** (see Token & Context Optimization Rules), `red-test-adversary` and
   `rosette-auditor` run in-process as sequential checks instead of subagents, unless the user
   asks for the subagent. Apply the same criteria and verdict vocabulary as the agent files in
-  `.claude/agents/`, and label the result in the summary as an **in-process check**, not as
-  the adversary's verdict. `rfc-adversary` always runs as a subagent.
+  `.claude/agents/`, label the result in the summary as an **in-process check**, not as
+  the adversary's verdict, and record it with `tdd_guard.py attacked --in-process` /
+  `audited --in-process` (see § Tests are the contract), or the commit gate refuses the
+  commit. `rfc-adversary` always runs as a subagent.
 - If a subagent can't be launched in the current environment, say so in your summary.
   Outside the medium-effort case above, never substitute your own self-review, and never
   present a self-review as the adversary's verdict.
@@ -397,9 +463,10 @@ For any non-trivial change, before reporting it as done:
    status.
 2. Backfill characterisation tests for untested existing behaviour in the files you'll touch.
 3. For each behaviour: write the red test, prove it red, and have `red-test-adversary` attack
-   it (TDD phases 1–2).
+   it (TDD phases 1–2). The run froze the test; a rewrite after `DECORATION`/`WEAK-RED` goes
+   through a logged release first.
 4. Implement minimally, then refactor against the Rosette and the DDD rules, following the
-   Rust conventions above (TDD phases 3–4).
+   Rust conventions above (TDD phases 3–4). The tests don't change in these phases.
 5. Run `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`,
    `cargo test`, `cargo build --release` in every crate touched, plus
    `node system-hub/dashboard-tests/xss.mjs` if the change touches the hub dashboard or that
@@ -409,5 +476,6 @@ For any non-trivial change, before reporting it as done:
    model when contexts or glossary terms change); otherwise note explicitly that it doesn't.
 8. Update `README.md`'s endpoint/config tables if you added, removed, or changed an
    externally-visible endpoint or environment variable.
-9. In the summary, report each adversary's verdict next to the OWASP findings, and the
-   `xss.mjs` result for a hub dashboard change.
+9. In the summary, report each adversary's verdict next to the OWASP findings, the
+   `xss.mjs` result for a hub dashboard change, and every test release from
+   `.claude/tdd-state/releases.log` with its reason and authority (or "no releases").
