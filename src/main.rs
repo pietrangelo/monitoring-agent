@@ -34,6 +34,7 @@ use collectors::SnapshotReceiver;
 use collectors::sampler::SysinfoSource;
 use environment::cgroup::MonitoredCgroup;
 use listen::ListenAddress;
+use push::identity::{self, IdFilePath};
 use snapshot::SnapshotSeq;
 use std::fmt;
 use std::net::SocketAddr;
@@ -62,6 +63,7 @@ impl StartupError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) | Self::Listen(_) => 78,
+            Self::PushId(err) if err.is_refused_value() => 78,
             Self::PushId(_)
             | Self::Runtime(_)
             | Self::Scraper(_)
@@ -105,12 +107,49 @@ fn start() -> Result<(), StartupError> {
         ApplicationsConfig::parse(|key| std::env::var(key)).map_err(StartupError::Config)?;
     let listen = ListenAddress::from_env(std::env::var(ListenAddress::VARIABLE))
         .map_err(StartupError::Listen)?;
+    let push = push_target()?;
     announce(&applications);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    runtime.block_on(run(applications, listen))
+    runtime.block_on(run(applications, listen, push))
+}
+
+/// Where to push, and as which id: `PUSH_TO` read once, and the id resolved once, before the
+/// runtime exists, so its file reads and writes block nothing (RFC 0016 §6).
+fn push_target() -> Result<Option<PushTarget>, StartupError> {
+    let Ok(hub_url) = std::env::var("PUSH_TO") else {
+        return Ok(None);
+    };
+    let id_file = IdFilePath::from_env(std::env::var_os(identity::ID_FILE_VARIABLE))
+        .map_err(StartupError::PushId)?;
+    let resolved = identity::resolve_push_id(id_file.as_ref(), &identity::IdSources::system())
+        .map_err(StartupError::PushId)?;
+    announce_push_id(resolved.resolution);
+    Ok(Some(PushTarget {
+        hub_url,
+        system_id: resolved.id,
+    }))
+}
+
+/// The hub to push to, and the id to present.
+struct PushTarget {
+    hub_url: String,
+    system_id: identity::AgentId,
+}
+
+/// Logs where the push system id came from, and warns when it lives for this process only.
+fn announce_push_id(resolution: identity::Resolution) {
+    use identity::{IdSource, Resolution};
+    tracing::info!("Push system id resolved: {resolution:?}");
+    if resolution == Resolution::Resolved(IdSource::Random) {
+        tracing::warn!(
+            "The push system id is a random UUID that lives for this process only; set {} \
+             to keep it",
+            identity::ID_FILE_VARIABLE
+        );
+    }
 }
 
 /// Logs what the applications configuration asks for, and warns about credentials that would
@@ -156,7 +195,11 @@ async fn execution_environment() -> Result<environment::ExecutionEnvironment, St
     Ok(found)
 }
 
-async fn run(applications: ApplicationsConfig, listen: ListenAddress) -> Result<(), StartupError> {
+async fn run(
+    applications: ApplicationsConfig,
+    listen: ListenAddress,
+    push: Option<PushTarget>,
+) -> Result<(), StartupError> {
     let environment = execution_environment().await?;
     let cgroup = environment.monitored_cgroup().cloned();
     // The startup snapshot is read before anything can ask for one, so none ever waits.
@@ -195,7 +238,9 @@ async fn run(applications: ApplicationsConfig, listen: ListenAddress) -> Result<
             }
         }
     });
-    spawn_push_client(snapshots, app_state.rounds.clone());
+    if let Some(push) = push {
+        spawn_push_client(push, snapshots, app_state.rounds.clone());
+    }
 
     serve(router(app_state), listen).await
 }
@@ -223,36 +268,27 @@ fn start_applications(
     Ok(app_state)
 }
 
-/// Starts the push client if `PUSH_TO` names a hub. It reconnects for the agent's lifetime,
-/// sending the scrape loop's rounds too when applications are on.
+/// Starts the push client. It reconnects for the agent's lifetime with the one id resolved at
+/// startup, sending the scrape loop's rounds too when applications are on.
 fn spawn_push_client(
+    PushTarget { hub_url, system_id }: PushTarget,
     snapshots: SnapshotReceiver,
     rounds: Option<applications::scrape_loop::RoundReceiver>,
 ) {
-    let Ok(hub_url) = std::env::var("PUSH_TO") else {
-        return;
-    };
     let token = std::env::var("PUSH_TOKEN").unwrap_or_default();
     let interval: u64 = std::env::var("PUSH_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     tokio::spawn(async move {
-        // Resolved once, off the runtime: it reads files and may shell out to `hostname`.
-        let system_id = match tokio::task::spawn_blocking(push::get_persistent_id).await {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::error!("Couldn't resolve the push system id: {err}; not pushing");
-                return;
-            }
-        };
         let mut feed = push::PushFeed {
             snapshots: push::SnapshotCursor::new(snapshots),
             rounds,
         };
         loop {
             let pushed =
-                push::run_push_client(&hub_url, &token, &system_id, interval, &mut feed).await;
+                push::run_push_client(&hub_url, &token, system_id.as_str(), interval, &mut feed)
+                    .await;
             match pushed {
                 Ok(()) => {}
                 Err(push::PushError::CollectorEnded) => {

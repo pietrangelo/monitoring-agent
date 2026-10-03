@@ -250,7 +250,7 @@ fn hub_hung_up<E>(incoming: &Option<Result<Message, E>>) -> bool {
 
 /// The line logged when the hub accepts the handshake.
 fn authenticated_line(system_id: &str) -> String {
-    format!("✅ Push authenticated — system_id={system_id}")
+    format!("✅ Push authenticated — system_id={system_id:?}")
 }
 
 /// Sends the auth message and reads the hub's answer; `Err` on an `auth_error`.
@@ -398,35 +398,6 @@ where
             Ok(())
         }
     }
-}
-
-/// Get a persistent machine identifier. Uses /etc/machine-id on systemd Linux,
-/// falls back to a hostname-based hash, then to a file-stored UUID. Blocking: reads files
-/// and shells out, so call it off the async runtime.
-pub fn get_persistent_id() -> String {
-    // 1. Try /etc/machine-id (systemd)
-    if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-        let id = id.trim().to_string();
-        if !id.is_empty() {
-            return id;
-        }
-    }
-    // 2. Try /var/lib/dbus/machine-id
-    if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
-        let id = id.trim().to_string();
-        if !id.is_empty() {
-            return id;
-        }
-    }
-    // 3. Fall back to hostname
-    if let Ok(host) = std::process::Command::new("hostname").output() {
-        let host = String::from_utf8_lossy(&host.stdout).trim().to_string();
-        if !host.is_empty() {
-            return host;
-        }
-    }
-    // 4. Last resort: random UUID
-    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
@@ -652,14 +623,6 @@ mod tests {
             serde_json::from_str(r#"{"type":"auth_error","message":"invalid token"}"#).unwrap();
         assert_eq!(msg.msg_type, "auth_error");
         assert_eq!(msg.message, "invalid token");
-    }
-
-    #[test]
-    fn get_persistent_id_returns_non_empty_id() {
-        // On any real host this resolves via /etc/machine-id, dbus machine-id, hostname,
-        // or a random UUID fallback -- it should never be empty.
-        let id = get_persistent_id();
-        assert!(!id.is_empty());
     }
 
     /// RFC 0016 §6: the accepted handshake's line prints the id in `Debug` form, so an id holding

@@ -378,6 +378,9 @@ mod tests {
         Directory,
     }
 
+    /// Puts something at the id path in a scratch directory, and returns that path.
+    type PlantAt = fn(&Scratch) -> PathBuf;
+
     /// Sources under `scratch`, each planted as asked.
     fn sources(scratch: &Scratch, machine_id: Plant, dbus: Plant, host: Plant) -> IdSources {
         let place = |name: &str, plant: Plant| match plant {
@@ -478,7 +481,8 @@ mod tests {
     #[test]
     fn the_id_file_variable_is_unset_empty_or_an_absolute_path() {
         let not_utf8 = OsString::from_vec(b"/var/lib/agent-\xff/id".to_vec());
-        let cases: [(&str, Option<OsString>, Result<Option<PathBuf>, ()>); 7] = [
+        type Expected = Result<Option<PathBuf>, ()>;
+        let cases: [(&str, Option<OsString>, Expected); 7] = [
             ("unset", None, Ok(None)),
             ("empty", Some(OsString::new()), Ok(None)),
             (
@@ -735,7 +739,10 @@ mod tests {
                 .collect();
 
             let stored = fs::read_to_string(&path);
-            assert!(stored.is_ok(), "round {round}: the file was written: {stored:?}");
+            assert!(
+                stored.is_ok(),
+                "round {round}: the file was written: {stored:?}"
+            );
             let winner = agent_id(stored.unwrap_or_default().trim());
             assert!(
                 results.iter().all(|resolved| resolved.id == winner),
@@ -760,7 +767,7 @@ mod tests {
     fn an_unusable_id_file_refuses_startup() {
         // (case, what to plant at the id path, the expected error, what its message says)
         type Check = fn(&AgentIdError) -> bool;
-        let cases: [(&str, fn(&Scratch) -> PathBuf, Check, &str); 7] = [
+        let cases: [(&str, PlantAt, Check, &str); 7] = [
             (
                 "a dot segment",
                 |s| s.write("id", b"..\n"),
@@ -922,7 +929,7 @@ mod tests {
     #[test]
     fn after_losing_the_link_the_read_is_final() {
         type Check = fn(&Result<ResolvedId, AgentIdError>) -> bool;
-        let cases: [(&str, fn(&Scratch) -> PathBuf, Check); 3] = [
+        let cases: [(&str, PlantAt, Check); 3] = [
             (
                 "a valid file",
                 |s| s.write("id", b"the-other-process\n"),
