@@ -57,7 +57,7 @@ the store; this RFC's adapter, `storage/`, defines their encoding.
 |---|---|
 | `systems` | system key → `SystemRecord` |
 | `alerts` | record key (§5) → `AlertRecordEntry` |
-| `alerts_seen` | `last_seen_active` (u64 BE) ‖ record key → () |
+| `alerts_seen` | `evictable_at` (u64 BE) ‖ record key → (); `evictable_at` = `last_seen_active` + the record's class bound (§5) |
 | `alerts_listed` | `acknowledged` (u8) ‖ `stored_at` (u64 BE, inverted for newest first) ‖ record key → () |
 | `alerts_api_id` | first 16 bytes of SHA-256 of the API id (§5) → record key |
 | `mail_receipts` | system key ‖ run (16-byte UUID) ‖ u64 BE seq → `MailReceipt` (§7) |
@@ -217,7 +217,10 @@ generation in `systems` and `tombstones`, as defence in depth.
   Everything a poll committed before it is deleted with the rest; a poll committing after it
   finds no system at its generation and is refused. At that commit the store refuses the
   generation's appends (`SystemGone`) on the writer thread, and the hook removes the system from
-  the Registry. The adapter then removes its `live_status` and `live_applications` entries.
+  the Registry, and **the same hook** removes the deleted generation's `live_status`,
+  `live_metrics` and `live_applications` entries, by generation, one lock at a time (0010 §9);
+  nothing removes entries by id after the transaction, since a re-registration may already
+  have committed a new generation's (RFC 0008 §3).
 - **Immediately:** appends of the generation are refused, queries return nothing.
 - **In-flight polls and late writers.** Every alert record and every `LiveStatus` carries its
   system's generation; a poll's alert transaction, a late info fill or rename, and a status
@@ -348,19 +351,21 @@ of the intake as `last_seen_active`. Where a rule below says "poll", it means ei
   When an insert would exceed a cap, the transaction evicts:
   - per system: the system's record with the oldest `last_seen_active` among those not reported
     by this poll;
-  - in total: the oldest `alerts_seen` entry that **can't belong to an incident still firing**:
-    its `last_seen_active` is older than **2 hours or twice its system's poll interval,
-    whichever is longer**; for a mail system, older than the **receipt window** (7 days), since
-    a relay outage or a lost outbox can delay a still-firing incident's refresh by hours, and
-    0017 treats that as normal. A still-firing incident is refreshed at least once per coalescing
+  - in total: the **first `alerts_seen` entry**, which is keyed by `evictable_at`, the moment
+    the record **can't belong to an incident still firing**: `last_seen_active` plus its
+    **class bound**, which is **2 hours or twice its system's poll interval, whichever is
+    longer**, and for a mail system the **receipt window** (7 days), since a relay outage or a
+    lost outbox can delay a still-firing incident's refresh by hours, and 0017 treats that as
+    normal. The entry is re-keyed when `last_seen_active` is refreshed and when a `PUT` changes
+    the system's interval, in the same transaction. The first entry is the only candidate, so a
+    victim is found or refused in one read, and old mail records can't hide an evictable polled
+    record behind them. A still-firing incident is refreshed at least once per coalescing
     window (1 h) of polls, so its `last_seen_active` is never older than the window plus one
     interval; twice either bound leaves a margin.
 
   If no candidate qualifies, the new record is refused, counted, and logged once per system per
-  hour. **The victim search is bounded**: once a transaction finds no victim, it refuses every
-  further new record of that transaction without searching again, and each search reads at
-  most 1,000 `alerts_seen` entries before giving up; so a full table of recent mail records
-  costs one bounded search per transaction, not one per alert.
+  hour. Because the key is `evictable_at`, a search is one read; a transaction that found no
+  victim refuses its further new records without reading again.
 - `GET /api/alerts?limit=` defaults to 100, and a larger `limit` is **clamped** to 1,000.
   `count_active_alerts` counts `alerts_listed` entries with `acknowledged = 0`, kept as a
   counter in `meta/hub/unacknowledged`, updated in the same transactions.
@@ -412,20 +417,30 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
      **stale** (counted as 0017's `Stale`), skip the report. The floor is the cutoff of the
      latest receipt prune and **never decreases** (each prune writes `max(previous, cutoff)` in
      the same transaction as its deletions), so a pruned receipt's replay can never pass as new,
-     even when the retention clock steps back after a corrected forward fault;
+     even when the retention clock steps back after a corrected forward fault. The one thing
+     that lowers it is `HUB_CLOCK_REWIND` (0010 §2), to `min(floor, rewound retention clock −
+     window)`: otherwise a floor raised during a long forward fault would refuse every current
+     report as stale until real time passed it. The cost, a replay of a receipt pruned during the
+     fault and still inside the window, is taken once; `/api/storage` shows the floor;
   then the writes: register a `Mail { enabled: true }` system if absent (a new generation);
-  insert the receipt; the alert records (§5); and for a `Newest` report, `mail_newest/<key>`
-  and, **if it is the system's choice by `newest_of_scan`** among its accepted `Newest`
-  reports (known only once every report's refusals are, so staged **at the end of `f`**, once
-  per system) and current (0010 §2), its newest snapshot's points, staged at hub now (`CatalogTxn::append`, 0010 §2 *Mail points*), so
-  two reports of one system in a scan never stamp the same second.
-  A skipped report writes and stages nothing. **After the commit**, the live metrics, the info
-  fill and the round (`append_round`) run once per system, for the same `newest_of_scan`
-  choice, and `mail_newest` is written for it alone, so an older report later in the scan never replaces what is shown. Every message of the scan is deleted after the
+  insert the receipt; the alert records (§5). **Then, at the end of `f`, once per system**, for
+  the system's choice by `newest_of_scan` among its accepted `Newest` reports (known only once
+  every report's refusals are): `mail_newest/<key>` is written for that choice alone, and, **if
+  the choice is current** (0010 §2), its newest snapshot's points are staged at hub now
+  (`CatalogTxn::append`), so two reports of one system in a scan never stamp the same second.
+  Step 3's `Recency` read sees only the previous scan's `mail_newest`, which is what it must
+  compare against. A skipped report writes and stages nothing. **After the commit**, the info
+  fill and the status (`Online`, `last_contact`) run once per system for the same choice, and
+  the live metrics and the round (`append_round`) only if the choice is current; so an older
+  report later in the scan never replaces what is shown, and a backlog's choice never shows a
+  stale round. Every message of the scan is deleted after the
   commit holding the scan, accepted or refused, as 0017 deletes every handled message; a
   fail-stop before it leaves them for the next scan.
 - **Pruning** runs from 0010's retention pass through its `Store::on_retention_pass` hook
-  (0010 §9), after the pass has committed its retention clock: receipts whose `created_at` is older than the
+  (0010 §9), after the pass has committed its retention clock, which loops the hook while it
+  answers `More` under the pass's usual bound (so a prune never exceeds one transaction's
+  50,000 entries, and at 10,000 mail systems on the default interval, 20,000 new rows per pass,
+  it keeps up with margin): receipts whose `created_at` is older than the
   receipt window (7 days) on the **retention clock** are removed, with their
   `mail_receipts_by_time` entries, in its bounded transactions, **except each system's newest
   current receipt** (the one `mail_newest` names), as 0017 keeps it, and raises
@@ -604,17 +619,22 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   - the overdue sweep over `mail_newest`: on time, overdue, no entry (overdue), disabled
     (skipped); an overdue mark sets `last_error = "mail overdue"`, and the next report clears it;
   - a report committed between the overdue sweep's read and its write leaves the system online
-    (`overdue.rs::a_report_stored_since_the_read_isnt_marked_overdue`, ported);
+    (`overdue.rs::a_report_stored_since_the_read_isnt_marked_overdue`, its guarantee kept, its
+    `last_seen` assertion released above);
   - a retention pass pruning between the scan's freshness check and its transaction: the
     replay of a deleted system's report is refused as stale, nothing registered; **the same
     after the retention clock steps back an hour behind a prune**: the floor holds;
   - `newest_of_scan` and `stale_before` as tables (ties on `created_at` across runs and within
-    one; the floor's edge); with the global table full of recent mail records, 256 reports of
-    64 alerts each search for a victim once;
+    one; the floor's edge); the global cap full of 1,001 mail records seen a day ago and one
+    polled record seen 3 hours ago: the polled record is the victim, in one read; a refreshed
+    record and a changed interval move the entry's key; after a forward fault, a prune, the
+    correction and a rewind, a current report is accepted;
   - the prune keeps each system's newest current receipt
     (`db/mail.rs::the_prune_keeps_the_newest_current_receipt`, ported);
-  - two `Newest` reports of one system in one scan, in both orders: the shown metrics, info and
-    round are the later-created report's;
+  - two `Newest` reports of one system in one scan, in both orders, and with equal `created_at`
+    across two runs: points, metrics, info, round and `mail_newest` all come from the one
+    `newest_of_scan` choice; a non-current choice writes `mail_newest` and the status but no
+    point and no round;
   - a mail report's newest sample fills the system's info and default name;
   - a mail system's acknowledged incident unseen for 3 hours survives the global cap; unseen for
     7 days + 1 s it is a victim;
@@ -623,12 +643,19 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
     test-contract guard with `--authority user` when implemented (the owner's decisions of
     2026-10-03), and quoted in the change summary:
     - *newest snapshot only, at hub time*: `db/mail.rs::a_first_report_registers_its_system_and_stores_everything`,
-      `mail_intake/ingest.rs::a_first_report_registers_and_stores_its_system`, and the backfill
-      points tests;
+      `mail_intake/ingest.rs::a_first_report_registers_and_stores_its_system`,
+      `db/mail.rs::a_backfill_report_adds_points_but_leaves_the_status`,
+      `mail_intake/ingest.rs::a_backfill_report_leaves_the_live_metrics`, and
+      `mail_intake/scan.rs::a_backlog_is_stored_whole` (its count holds; its doc and name change
+      to "a backlog's reports are all accepted");
     - *expiry removed* (points are stamped at hub now): `db/mail.rs::a_point_past_its_retention_is_left_out_and_counted`,
       and the `expired` field asserted in `db/mail.rs` and `mail_intake/ingest.rs`
       (`MailStored::Stored`, `Ingested::Stored`);
-    - *`last_seen` and overdue on hub time*: the `last_seen` and overdue tests of `overdue.rs`;
+    - *`last_seen` and overdue on hub time*: `overdue.rs::an_overdue_mail_system_is_marked_offline`
+      (`last_seen == CREATED` becomes `received_at`) and
+      `overdue.rs::a_report_stored_since_the_read_isnt_marked_overdue` (ported for its guarantee,
+      but its `last_seen == CREATED + 60` assertion becomes `received_at`, so it is released
+      too);
     - *no SQL*: `overdue.rs::a_mail_row_with_no_receipt_is_overdue_once` (its row can't be
       re-created by hand; its `last_error` assertion is kept by the row above);
     - *fail-stop instead of rollback*: `db/mail.rs::a_failure_partway_leaves_nothing_and_a_retry_stores_once`
@@ -810,18 +837,16 @@ overdue mark is a transaction applied by the commit hook (0010 §10). A second p
 amendment ran before the simplification and its report never reached the session; the next pass
 covers both.
 
-**Open after the final pass of 2026-10-03** (not yet resolved; the next session starts here).
-The session's rounds stopped converging: each pass found new CONFIRMED defects in the previous
-pass's fixes, so these are recorded instead of patched once more:
+`rfc-adversary`, final pass of 2026-10-03, resolved in one round with 0008's and 0010's:
 
-| Finding | Verdict | Suggested fix |
+| Finding | Verdict | Resolution |
 |---|---|---|
-| the bounded victim search reads the oldest `alerts_seen` entries, which under the 7-day mail rule are the unevictable ones: every new alert fleet-wide refused | CONFIRMED | key the eviction index by `evictable_at` (last seen + class bound), re-keyed on refresh and interval change; a mixed-class row |
-| `mail_prune_floor` isn't reset by `HUB_CLOCK_REWIND`: after a long forward fault every current report is refused as stale until real time catches up | CONFIRMED | include the floor in the rewind (`min(floor, rewound retention clock − window)`), show it in `/api/storage` |
-| three answers to when and for which report `mail_newest` is written; two orders for `newest_of_scan` | CONFIRMED | write it inside `f` only when a report beats the current entry under one order |
-| the currency gate's scope differs from 0010 §2 | CONFIRMED | as 0010's open finding |
-| two release items name categories, not tests; one "ported" test changes its `last_seen` assertion; `scan.rs::a_backlog_is_stored_whole` changes meaning | CONFIRMED (low) | name each `file::test` under its decision |
-| `on_retention_pass` can't signal more work; the receipt prune's throughput at 10,000 mail systems | PLAUSIBLE | return `More`/`Done`; state the throughput |
+| the bounded victim search read the oldest, unevictable, mail entries and refused every new alert | CONFIRMED | `alerts_seen` keyed by `evictable_at`; one read per search; re-keyed on refresh and interval change; a mixed-class row (§1, §5) |
+| `mail_prune_floor` wasn't lowered by the rewind | CONFIRMED | the rewind sets it to `min(floor, rewound clock − window)`; shown in `/api/storage`; a row (§7; 0010 §2) |
+| three answers to when `mail_newest` is written; two orders | CONFIRMED | once per system at the end of `f` for the `newest_of_scan` choice; one order (§7) |
+| the currency gate's scope | CONFIRMED | status, `mail_newest`, info and alerts never gated; points, round and live metrics gated (§7; 0010 §2) |
+| releases naming categories; a "ported" test whose assertion changes; `a_backlog_is_stored_whole` | CONFIRMED (low) | each named `file::test` (Testing) |
+| `on_retention_pass` couldn't signal more work; prune throughput | PLAUSIBLE | `More`/`Done` looped under the bound; the throughput stated (§7) |
 
 **Still open**: whether one timer per polled system scales to 10,000 polled systems (it is one
 tokio timer each, which is cheap, but the performance test checks it).

@@ -182,13 +182,28 @@ adapter only feeds it.
   and poll alike: it takes the Registry's read lock, checks the current generation equals the
   frame's, report's or poll's, and only then takes the live-metrics write lock, inside it.
   `LiveMetrics::following` ignores a previous entry of another generation. Eviction compares the
-  generation. **The same fence covers `live_applications` and `LiveStatus`**: `SystemApplications`
-  carries the generation; `append_round`'s `on_stored` releases the admission lock, then takes
-  the Registry read lock, checks the generation, and only then takes `live_applications` (never
-  `entry().or_default()` for an id the Registry doesn't hold at that generation); a `LiveStatus`
-  write for an id with no entry is dropped, since entries are created only by the registration
-  hook (0010 §10). So a fill or a round racing a delete can't leave an orphan for any source,
-  and a stale end evicts nothing. **The lock order** is 0010 §9's, which lists every path that
+  generation. **The same fence covers `live_applications` and `LiveStatus`.** `SystemApplications`
+  carries the generation, and `append_round`'s `on_stored` (RFC 0009 §5, Implemented; amended
+  here) splits in two:
+  - **record**, still under the admission lock: `recent.remember(round)` and the spent pace are
+    written into the `Arc<Mutex<ApplicationAdmission>>` itself, which therefore holds `recent`
+    and the paces, so `decide` and the record stay one step and two overlapping polls, or a
+    poll and a push, can't both store one round (RFC 0009's guarantee, pinned by
+    `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`);
+  - **show**, after the admission is released: the Registry read lock, the generation check, and
+    **while still holding it** the `live_applications` write lock, to set `shown`; the Registry
+    guard is held across the insert, so a delete's hook can't run between the check and the
+    insert.
+  The admission is obtained the same way: `append_round` takes the Registry read lock, checks the
+  generation, and under it clones or **creates the entry at that generation** (replacing one of
+  another generation, whose `recent` would otherwise mark a re-registered agent's re-sent round a
+  duplicate); it never calls `entry().or_default()` for an id the Registry doesn't hold.
+  `collector/application_poll.rs::log_refused_round`'s hourly throttle moves into the poll task's
+  own state, so it creates no `live_applications` entry. A `LiveStatus` write for an id with no
+  entry is dropped, since entries are created only by the registration hook, which replaces an
+  entry of another generation; the delete's hook removes only the deleted generation's entries,
+  and nothing removes entries by id after the transaction (0011 §3, amended). So a fill or a
+  round racing a delete can't leave an orphan for any source, and a stale end evicts nothing. **The lock order** is 0010 §9's, which lists every path that
   holds two hub locks; the commit hook takes only the Registry's write lock while holding any.
   No test can show it; review must. The delete evicts after its
   commit hook. **An end always removes its own presence entry** when its connection number
@@ -279,6 +294,9 @@ re-creations.
 - **Ingestion:** `Refusal::RegistryFull`, and store errors mapped to RFC 0007's
   `Refusal::RegistryUnavailable` (`RegistryFailure::Store`); `Registration::Reserved` mapped to RFC 0017's
   `Refusal::TransportMismatch`; the handshake order stated in §4.
+  **Registration never aborts**: a step-2 refusal is `Ok((refusal, Answer::AtOnce))`, so its
+  `transact` is instantiated with `TransactError<Infallible>` (0010 §9) and `RegistryFailure` has
+  no abort arm to invent.
 - **Glossary:**
   - **push system** (RFC 0016's term): its source becomes `Source::Push` (RFC 0011);
   - **push registry limit**: the most push systems the hub will auto-register; mail systems
@@ -359,9 +377,7 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - `LiveMetrics::following` with a previous entry of another generation: nothing carried over;
   - with points appended and the record already committed (handshake seam), a step-2
     `AlreadyRegistered` is answered before the next group commit;
-  - a delete between a round's `append` and its `on_stored` (a round seam) leaves no
-    `live_applications` entry, and a later registration of the id stores its agent's re-sent
-    round; a late `Online` status write after a delete creates no entry.
+  - **Registration-time rows that need seams** are under *Registration* below.
 - **Call-site follow-through** (released with authority author, quoted in the change summary):
   the `presence.rs`, `push/sweep.rs` and `push/ingest.rs` tests in `HEAD` whose calls gain the
   generation argument keep every expectation.
@@ -377,8 +393,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     both orders**: mail first → one mail record, the push answer `Reserved(Mail)` from step 2;
     push first → one push record, the mail report `TransportMismatch`;
   - a limit of 1 with one push system present refuses an unseen id from the step-1 read: **the
-    writer gate sees no submitted transaction**, nothing is written, and it returns `AlreadyRegistered {
-    generation }` with the stored generation for the known id;
+    gate's submission count stays at zero** and nothing is written;
+  - a known push id answers `AlreadyRegistered { generation }` with the stored generation, from
+    step 1, with no submission;
   - two handshakes for different new ids racing for the last slot, both submitted behind the
     gate before either runs: exactly one `Registered`, and a hook in `f` asserting the second
     `f` read the first one's increment (the check-then-insert regression would read the same
@@ -396,8 +413,21 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     append and the fill) leaves no live-metrics entry; the same for a mail report's and a poll's
     fill; a later registration of the id by another source starts without the old entry;
   - a deleted id with an open connection leaves no presence entry after that connection ends;
-  - a refusal (`RegistryFull`, `Reserved` from step 2) is answered while a `Batched` write is
-    pending, before the next commit; an `AlreadyRegistered` from step 2 waits for it;
+  - two rounds of one system through a **round seam** placed after the admission is released
+    (between *record* and *show*): the second is `Duplicate` or `TooSoon`, never stored twice;
+    `overlapping_polls_of_one_system_share_one_pace` stays deterministic;
+  - a delete through a seam **inside *show***, between the generation check and the insert: the
+    delete's hook waits for the Registry guard, and no orphan entry exists afterwards;
+  - a delete between a round's `append` and *show*: no `live_applications` entry; a later
+    registration of the id stores its agent's re-sent round (a fresh admission at the new
+    generation); a refused poll round across a delete creates no entry;
+  - a late `Online` status write after a delete creates no entry; a delete followed by a
+    re-registration committed before the delete's caller resumes keeps generation 2's
+    `LiveStatus`;
+  - a refusal (`RegistryFull`, `Reserved` from step 2) is answered while a `Batched` **catalog**
+    write (a system-info fill) is pending, before the next commit; an `AlreadyRegistered` from
+    step 2 waits for it; the gate counts submitted transactions, and every wait on an answer has
+    a timeout, so a cheat that routes a refusal through step 2 fails rather than hangs;
   - two handshakes for one new id behind the gate with an injected commit failure: neither is
     accepted, both answer `registry unavailable`;
   - a sweep pass with `up_for` past `RECONNECT_GRACE`, between a new id's registration commit
@@ -434,6 +464,11 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   in `state.rs`'s `AppState` comments) becomes 0010 §9's order.
 - `rfcs/0016-current-push-connection.md` (Implemented) gains a header note: "§2 and §4 amended by
   RFC 0008 (generation-fenced currency, sweep grace from registration)".
+- `rfcs/0009-spring-boot-application-telemetry.md` (Implemented) gains a header note: "§5's
+  `on_stored` is split by RFC 0008 §3 into *record* (under the admission) and *show* (under the
+  Registry)"; its guarantee is unchanged.
+- RFC 0011 §3's eviction sentence (by id, after the transaction) becomes the delete hook's, by
+  generation.
 - § Domain model, glossary: **push handshake**'s refusals become rejection, timeout, registry
   unavailable, registry full and transport mismatch; **current connection** fenced by
   generation.
@@ -585,20 +620,22 @@ Came closest and survived: generation fencing between a stale and a re-registere
 Came closest and survived: the Registry lagging redb between a commit and its hook (`transact`
 answers after the hook, and the next frame heals the window).
 
-**Open after the final pass of 2026-10-03** (not yet resolved; the next session starts here).
-The session's rounds stopped converging: each pass found new CONFIRMED defects in the previous
-pass's fixes, so these are recorded instead of patched once more:
+`rfc-adversary`, sixth pass. Every finding was acted on, in the single round of 2026-10-03
+that closed the session's open findings across 0008, 0010 and 0011:
 
-| Finding | Verdict | Suggested fix |
+| Finding | Verdict | Resolution |
 |---|---|---|
-| releasing the admission lock before `on_stored` lets overlapping polls store one round twice and overrun the pace (breaks RFC 0009's guarantee and `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`) | CONFIRMED | split `on_stored`: record round and pace under the admission lock; show under Registry read → `live_applications` after; amend RFC 0009 |
-| the Registry read lock must be held across the `live_applications` insert, which 0010 §9 doesn't say | CONFIRMED | state it in 0010 §9; a seam inside `on_stored` |
-| `append_round` cloning the admission and `log_refused_round` create `live_applications` entries unchecked | CONFIRMED | create only under a generation check, replacing an entry of another generation |
-| 0011 §3 still evicts by id after the transaction, which can wipe a re-registered generation's status | CONFIRMED | evict in the delete's hook only, by generation; the registration hook replaces another generation's entry |
-| `Abort` is undefined; registration's refusals and `TransactError::Aborted` have no arm | CONFIRMED (low) | registration never aborts (`Ok((refusal, AtOnce))`); a generic `TransactError<A>` |
-| the writer gate can't count submissions; a merged and a contradictory test row | PLAUSIBLE | a submission counter with timeouts; split and reword the rows |
+| releasing the admission lock before `on_stored` let overlapping polls store one round twice | CONFIRMED (medium) | `on_stored` split: *record* under the admission (which now holds `recent` and the paces), *show* under the Registry; RFC 0009 noted (§3, Impact) |
+| the Registry guard must be held across the `live_applications` insert | CONFIRMED | stated; a seam inside *show* (§3, Testing; 0010 §9) |
+| `append_round`'s admission clone and `log_refused_round` created entries unchecked | CONFIRMED | the admission created at the checked generation, replacing another's; the throttle in the poll task (§3) |
+| 0011 §3 evicted by id after the transaction, wiping a re-registered generation | CONFIRMED | the delete hook evicts by generation only; the registration hook replaces (§3; 0011 §3) |
+| `Abort` undefined; no arm for `TransactError::Aborted` in registration | CONFIRMED (low) | registration never aborts, `TransactError<Infallible>`; `Abort` defined in 0010 §9 (§4) |
+| the writer gate couldn't count submissions; merged and contradictory rows; a misfiled row | PLAUSIBLE | a submission counter and timeouts; rows split and reworded; the round rows under Registration (Testing) |
 
-**Still open**: the CONFIRMED findings in the table above.
+Came closest and survived: the at-once `AlreadyRegistered` (only the id's own uncommitted
+`Register` can produce one, and that is a catalog write, so the wait applies).
+
+**Still open**: nothing CONFIRMED. One pass reviews this round before the RFC is accepted.
 
 **Split into RFC 0016 (2026-09-29).** §5 and §7 moved to RFC 0016, with the findings above
 that concerned them (the stale connection, the offline backstop, the agent's id). RFC 0016 also
