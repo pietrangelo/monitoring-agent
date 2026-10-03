@@ -124,7 +124,10 @@ mod tests {
         let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
         let (aad, rest) = sealed.split_at(aad_len);
         let (nonce, ciphertext) = rest.split_at(24);
-        let payload = Payload { msg: ciphertext, aad };
+        let payload = Payload {
+            msg: ciphertext,
+            aad,
+        };
         cipher.decrypt(XNonce::from_slice(nonce), payload).ok()
     }
 
@@ -139,7 +142,11 @@ mod tests {
             ("31 bytes", b64(&[1; 31]), Err(MailKeyError::WrongLength)),
             ("33 bytes", b64(&[1; 33]), Err(MailKeyError::WrongLength)),
             ("empty", String::new(), Err(MailKeyError::WrongLength)),
-            ("not base64", "not base64!".to_string(), Err(MailKeyError::NotBase64)),
+            (
+                "not base64",
+                "not base64!".to_string(),
+                Err(MailKeyError::NotBase64),
+            ),
         ];
         for (name, value, expected) in cases {
             let got = MailKey::from_base64(&value).map(|key| assert_eq!(key.0, [1; 32]));
@@ -164,7 +171,11 @@ mod tests {
         for at in 0..aad_len {
             let mut altered = sealed.clone();
             altered[at] ^= 1;
-            assert_eq!(open(&altered, aad_len, KEY), None, "header byte {at} altered");
+            assert_eq!(
+                open(&altered, aad_len, KEY),
+                None,
+                "header byte {at} altered"
+            );
         }
         assert_eq!(open(&sealed, aad_len, [8; 32]), None, "another key");
     }
@@ -184,5 +195,19 @@ mod tests {
         assert!(body.iter().all(|line| line.len() <= 76), "{body:?}");
         assert!(body[..body.len() - 1].iter().all(|line| line.len() == 76));
         assert_eq!(STANDARD.decode(body.concat()).unwrap(), sealed);
+    }
+
+    /// RFC 0017 §3: the v1 golden report, sealed for `web-01` under the key `system-hub
+    /// mail-key web-01` derives from a master key of 32 bytes of 1 (an independent HKDF
+    /// vector), with a nonce of 24 bytes of 9. The hub's tests open these same bytes.
+    #[test]
+    fn the_golden_report_seals_as_the_sealed_golden() {
+        const SEALED: &[u8] = include_bytes!("../../testdata/mail-report-v1.sealed");
+        const REPORT: &[u8] = include_bytes!("../../testdata/mail-report-v1.msgpack");
+        let key = MailKey::from_base64("K3+RuHlQ1b7woYSIjUBPpdWhGwNhkfOkRjXt3LT2ufM=").unwrap();
+
+        let sealed = seal(&id("web-01"), REPORT, &key, &NONCE);
+
+        assert_eq!(sealed, SEALED);
     }
 }

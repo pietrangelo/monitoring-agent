@@ -28,7 +28,7 @@ use crate::collectors::{SnapshotReceiver, monotonic_now};
 use crate::models::SystemSnapshot;
 use crate::snapshot::{PublishedSnapshot, SnapshotFreshness, SnapshotSeq};
 
-mod application_frame;
+pub(crate) mod application_frame;
 pub mod identity;
 
 /// Payload pushed to the hub every interval.

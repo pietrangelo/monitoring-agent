@@ -29,7 +29,7 @@ const KIND: &str = "applications.v1";
 /// An application frame, encoded positionally: the field *order* is the contract, pinned by
 /// `testdata/application-frame-v1.msgpack`.
 #[derive(Debug, Serialize)]
-struct ApplicationFrame {
+pub(crate) struct ApplicationFrame {
     kind: &'static str,
     run: String,
     seq: u64,
