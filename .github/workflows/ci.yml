@@ -1,5 +1,5 @@
 # The gate CLAUDE.md sets for every change: fmt, clippy, tests and a release build in each
-# crate, and the hub dashboard's XSS smoke test.
+# crate, the hub dashboard's XSS smoke test, and the test-contract guard's own tests.
 name: CI
 
 on:
@@ -73,3 +73,15 @@ jobs:
       - run: node system-hub/dashboard-tests/xss.mjs
         env:
           CHROME_BIN: /usr/bin/google-chrome
+
+  test-contract-guard:
+    name: test-contract guard tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Standard-library Python only; the tests drive the real hook script in throwaway git
+      # repositories, so they need git and a python3 on PATH, which the runner image has.
+      - run: python3 .claude/hooks/test_tdd_guard.py

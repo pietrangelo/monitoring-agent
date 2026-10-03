@@ -187,9 +187,9 @@ All production code is written test-first, in a closed loop per behaviour:
    compiles and returns a wrong value (`Default::default()`, an empty `Vec`, the wrong
    variant) — not `todo!()`, whose panic proves nothing about behaviour. Then launch the
    `red-test-adversary` subagent on the test. `DECORATION` (a cheat implementation passed) →
-   release the test (see § Tests are the contract), rewrite it and run the adversary again.
-   `WEAK-RED` (fails on compilation or a panic rather than an assertion) → add the stub and
-   re-run. The run that proved the red also froze the test: from here on it is the contract.
+   rewrite the test and run the adversary again. `WEAK-RED` (fails on compilation or a
+   panic rather than an assertion) → add the stub and re-run. `EVIDENCE` grades the test:
+   from here on it is the contract (see § Tests are the contract).
 3. **Minimal green.** Write the least code that satisfies the test: no tidying nearby code,
    no speculative generality, and **no edit to the test**. If green seems to need a change to
    the test, the test or the contract is wrong, and that is decided in phase 1, out loud,
@@ -207,56 +207,71 @@ loops. Weakening the test is not a third attempt.
 
 ### Tests are the contract: the test-contract guard
 
-A test that has been run is a contract, and the implementation changes to meet it, never the
-other way round. "Make the test pass" is never satisfied by changing an expectation, dropping
-a table row, loosening an assertion, adding `#[ignore]`, renaming or deleting the test, or
-weakening a fixture. This holds for red tests in phases 3–4, for characterisation tests, and
-for tests that already exist in `HEAD`.
+A graded test is a contract, and the implementation changes to meet it, never the other way
+round. "Make the test pass" is never satisfied by changing an expectation, dropping a table
+row, loosening an assertion, adding `#[ignore]`/`#[should_panic]`/`#[cfg(…)]`, renaming or
+deleting the test, or weakening a fixture or shadowing the function under test from the test
+module. This holds for red tests in phases 3–4, for characterisation tests, and for every test
+that already exists in `HEAD`.
 
 The rule is enforced mechanically by `.claude/hooks/tdd_guard.py`, wired through
-`.claude/settings.json` (RFC 0018). What it does:
+`.claude/settings.json` (RFC 0018). A test is **under contract** once it has been graded:
+`red-test-adversary` returned `EVIDENCE` on it (recorded automatically from the subagent's
+report, or declared for an in-process check), or it is already in `HEAD`. A draft nobody has
+graded is still the author's: it can be fixed freely until the adversary has read it, and the
+commit gate makes sure the adversary does.
 
-- Every `cargo test` / `xss.mjs` run **freezes** each test function in the tree (a hash of
-  its source with whitespace removed, so `cargo fmt` is not a change). The ledger lives in
+- Every `cargo test` / `xss.mjs` run **freezes** each test function in the tree: a digest of
+  its source with whitespace removed outside string literals (so `cargo fmt` is not a change,
+  but an expected `"1.5 GB"` becoming `"1.5GB"` is). The ledger lives in
   `.claude/tdd-state/` (gitignored, local to the checkout).
-- An Edit/Write that changes, renames, deletes or ignores a frozen test is **refused**. So is
-  removing a line of fixture or helper code in a `#[cfg(test)]` region or an integration-test
-  file, removing a line of `system-hub/dashboard-tests/xss.mjs` or of the guard's own tests,
-  or adding a line to `xss.mjs` that could skip its checks. Adding tests, rows, helpers and
-  checks is free. A bare `#[ignore]` is refused anywhere; `#[ignore = "why"]` on a new test
-  is not.
-- A shell command that writes a `.rs`/`.mjs` file in place (`sed -i`, `tee`, `>`, `cp`
-  over it) is refused: use Edit/Write, where the guard can read the change.
-- `git commit` is refused while any test function differs from `HEAD` without a release,
-  while a new test has never been run, while a new or rewritten test has not been attacked
-  by `red-test-adversary`, or while production code changed and `rosette-auditor` has not
-  run since the last edit. This is the backstop for edits that slipped past the hooks.
+- An Edit/Write that changes, renames, deletes or ignores a test under contract is
+  **refused**, as is removing fixture or helper code around the tests (the rest of a
+  `#[cfg(test)]` region or an integration-test file, `system-hub/dashboard-tests/xss.mjs`,
+  the guard's own tests) once the file is in `HEAD`, or adding helper code that could
+  neutralise the tests (`#[cfg(…)]`, `#[should_panic]`, `#[ignore]`, `macro_rules!`, a `fn`
+  or `use` taking a production function's name, `process.exit(0)` in `xss.mjs`). Adding
+  tests, helpers and checks is free; adding a *row* to a test under contract is a change to
+  it and needs a release (below). A bare `#[ignore]` is refused anywhere; `#[ignore = "why"]`
+  on a draft is not.
+- A shell command that writes a `.rs`/`.mjs` file **of the repository** in place (`sed -i`,
+  `tee`, `>`, `cp`/`mv`/`rm` over it) is refused: use Edit/Write, where the guard can read
+  the change. The adversaries' sandbox outside the repository is unaffected.
+- `git commit` is refused while any test differs from `HEAD` (in the index or the worktree)
+  without a release, while a test file in `HEAD` is gone without a release, while a new or
+  rewritten test has never been run or has no `EVIDENCE` record, or while a `.rs` file
+  changed and no `rosette-auditor` record (or `trivial` declaration) is newer than the last
+  edit. This is the backstop for edits that slipped past the hooks.
 
-When the contract itself is wrong, say so and **release** the test, which is logged:
+When the contract itself must change, say so and **release** the test, which is logged:
 
 ```sh
-python3 .claude/hooks/tdd_guard.py release <file> [<test> ...] --reason '<why>' --authority adversary|user
+python3 .claude/hooks/tdd_guard.py release <file> [<test> ...] --reason '<why>' --authority adversary|user|author
 ```
 
-- `--authority adversary`: `red-test-adversary` returned `DECORATION` or `WEAK-RED`, or named
-  a missing row; quote the verdict in the reason.
-- `--authority user`: the user asked for the change to the contract, in their words. A
-  release is never the implementer's own call: if nothing in the conversation authorises it,
-  stop and ask.
-- A release opens only the named tests (or, with no test named, the whole file's test
-  surface), until the next commit consumes it. The rewritten test is frozen again by its
-  next run and needs the adversary again.
+- `--authority adversary`: `red-test-adversary` returned `DECORATION` or `WEAK-RED`, or
+  named a missing row; quote the verdict in the reason.
+- `--authority user`: the user asked for the change to the contract, in their words.
+- `--authority author`: a strengthening only — a new row (the bug-fix reproduction in an
+  existing table), a new assertion, or the call-site follow-through of a signature change
+  the DDD rules required. Never a changed expectation, never a removed row: that needs one of
+  the two authorities above, and if nothing in the conversation gives it, stop and ask.
+- A release opens only the named tests (or, with no test named, the whole file's surface)
+  until the next commit consumes it. The rewritten test is re-frozen by its next run, loses
+  its grade, and needs the adversary again.
 - Every release is quoted in the change summary, from `.claude/tdd-state/releases.log`.
 
-The adversaries leave records the commit gate reads. A subagent run of `red-test-adversary`
-or `rosette-auditor` is recorded automatically. The in-process check allowed at medium
-effort is recorded explicitly, and the record is a declaration, so it carries the verdict
-and the closest attack:
+The adversaries leave records the commit gate reads. A subagent run is recorded from its
+report's `VERDICT:` line: only `EVIDENCE` grades a test, `DECORATION`/`WEAK-RED` ungrade it;
+`HOLDS`/`AT-RISK` record the audit, `VIOLATED` clears it; a report with no verdict records
+nothing. The in-process checks allowed at medium effort are declarations and carry the same
+verdicts, plus the closest attack, so a declaration is a claim someone can check:
 
 ```sh
-python3 .claude/hooks/tdd_guard.py attacked --in-process --verdict EVIDENCE --closest '<the cheat that came closest>'
+python3 .claude/hooks/tdd_guard.py attacked --in-process --verdict EVIDENCE --closest '<the cheat that came closest>' [--tests file::name ...]
 python3 .claude/hooks/tdd_guard.py audited  --in-process --verdict HOLDS
-python3 .claude/hooks/tdd_guard.py status   # what is frozen, pending or released
+python3 .claude/hooks/tdd_guard.py trivial  --reason '<comment, fmt, log wording: no behaviour>'   # a trivial .rs change, in place of an audit
+python3 .claude/hooks/tdd_guard.py status   # what is frozen, ungraded or released
 ```
 
 The guard protects against the author's own shortcuts, not against a determined attacker:
@@ -264,18 +279,8 @@ deleting the ledger, editing the hook, or using a tool it doesn't see are all po
 each of them is a deliberate act that must be reported as such. Never edit
 `.claude/hooks/tdd_guard.py` or `.claude/settings.json` as part of a change to the Rust
 crates; the guard changes in a commit of its own, with its tests
-(`python3 .claude/hooks/test_tdd_guard.py`) green and a mutation check in the summary.
-
-Cases where red-first works differently:
-
-- **Bug fixes** start with a test that reproduces the bug and fails _because of_ the bug.
-- **Characterisation tests** (backfilling tests for existing untested behaviour) pass on the
-  first run by design: they pin current behaviour, so red-first doesn't apply. Instead,
-  `red-test-adversary` attacks them in mutation mode: it breaks the behaviour in a temp copy
-  and checks the test goes red. If you find surprising behaviour, report it; don't "fix" it
-  inside the characterisation test, and don't describe it as intended in the docs.
-- **Pure refactors** need no new red test. The existing tests are the contract and must be
-  green before and after.
+(`python3 .claude/hooks/test_tdd_guard.py`, also run by CI) green and a mutation check in
+the summary.
 
 ### Adversarial review
 
@@ -463,7 +468,7 @@ For any non-trivial change, before reporting it as done:
    status.
 2. Backfill characterisation tests for untested existing behaviour in the files you'll touch.
 3. For each behaviour: write the red test, prove it red, and have `red-test-adversary` attack
-   it (TDD phases 1–2). The run froze the test; a rewrite after `DECORATION`/`WEAK-RED` goes
+   it (TDD phases 1–2). `EVIDENCE` puts the test under contract; a later rewrite goes
    through a logged release first.
 4. Implement minimally, then refactor against the Rosette and the DDD rules, following the
    Rust conventions above (TDD phases 3–4). The tests don't change in these phases.
