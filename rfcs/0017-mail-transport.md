@@ -2,12 +2,14 @@
 
 - Status: Draft
 - Author: Claude (pairing with pietrangelomasalaMD)
-- Date: 2026-10-03 (revised the same day for one `rfc-adversary` pass; see Review)
+- Date: 2026-10-03 (revised the same day for three `rfc-adversary` passes; see Review)
 - Affects: both. `system-agent` gains a third way to reach a hub (`mail/`, an SMTP client and
   the `MAIL_*` variables). `system-hub` gains a mail intake (`mail_intake/`, a Maildir reader
-  and the `HUB_MAIL_*` variables), one table (`mail_receipts`), an overdue sweep, and a
+  and the `HUB_MAIL_*` variables), two tables (`mail_receipts`, `mail_tombstones`), an overdue sweep, and a
   `mail-key` subcommand. The push handshake gains one refusal (`transport mismatch`, §6).
   No endpoint, push frame or poll response changes.
+- **Owner's decision (2026-10-03):** the hub reads a Maildir. An SMTP server inside the
+  hub and an IMAP client in the hub were offered and declined (see Alternatives).
 - Depends on:
   - RFC 0005 (Implemented): the `SystemId` rule, which the sealed report's header carries.
   - RFC 0007 (Implemented): the snapshot rule and `snapshot_intake::store_snapshot`, which
