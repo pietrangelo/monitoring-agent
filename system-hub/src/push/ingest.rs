@@ -23,9 +23,8 @@ use std::time::Instant;
 use crate::db::{Registration, SnapshotStored};
 use crate::models::{SystemId, SystemInfo, SystemStatus};
 use crate::presence::{ConnectionLease, Ending, LeaseHandle};
-use crate::registry::{
-    LastSeen, MemoryCapacity, UptimeDisplay, memory_capacity_refresh, needs_system_info,
-};
+use crate::registry::{LastSeen, MemoryCapacity, UptimeDisplay};
+use crate::registry_fill::{ReportedInfo, fill_registry};
 use crate::snapshot::{
     LeftOutLog, ReportedDisk, ReportedSnapshot, SnapshotTime, SnapshotTimeOutOfRange,
 };
@@ -94,19 +93,7 @@ pub(super) struct SnapshotFrame {
     reported: ReportedSnapshot,
     time: SnapshotTime,
     last_seen: LastSeen,
-    info: PushedInfo,
-}
-
-/// What a snapshot frame reports of its system, for the registry fill.
-#[derive(Debug)]
-struct PushedInfo {
-    hostname: String,
-    os_name: String,
-    kernel: String,
-    cpu_model: String,
-    cpu_cores: usize,
-    /// `None` when the frame's capacity breaks `MemoryCapacity::reported`'s bounds.
-    memory: Option<MemoryCapacity>,
+    info: ReportedInfo,
 }
 
 impl TryFrom<PushPayload> for SnapshotFrame {
@@ -146,7 +133,7 @@ impl TryFrom<PushPayload> for SnapshotFrame {
         };
         let memory =
             MemoryCapacity::reported(Some(&memory_total_display), Some(memory_total_bytes));
-        let info = PushedInfo {
+        let info = ReportedInfo {
             hostname,
             os_name,
             kernel,
@@ -243,49 +230,9 @@ pub(super) fn ingest_frame(
     let now = Instant::now();
     let stored = snapshot_intake::store_snapshot(app, system_id, reported, time, last_seen, now)?;
     if let SnapshotStored::Stored(_) = stored {
-        update_registry(app, system_id, &info);
+        fill_registry(app, system_id, &info, "Push");
     }
     Ok(stored)
-}
-
-/// Fills in system info while its hostname or OS is missing, refreshes its memory capacity,
-/// and replaces a default name with the frame's hostname. The status went into the store.
-fn update_registry(app: &AppState, system_id: &SystemId, info: &PushedInfo) {
-    let id = system_id.as_str();
-    let sys = match app.db.get_system(id) {
-        Ok(Some(sys)) => sys,
-        Ok(None) => return,
-        Err(err) => {
-            // A row no read can map (RFC 0007 §4): its snapshot is stored, its fill skipped.
-            tracing::debug!("Push from {id:?}: skipping the registry fill: {err}");
-            return;
-        }
-    };
-    if needs_system_info(&sys)
-        && let Err(err) = app.db.update_system_info(
-            id,
-            Some(&info.os_name),
-            Some(&info.hostname),
-            Some(&info.kernel),
-            Some(&info.cpu_model),
-            Some(info.cpu_cores),
-        )
-    {
-        tracing::warn!("Push from {id:?}: couldn't record the system info: {err}");
-    }
-    if let Some(capacity) =
-        memory_capacity_refresh(MemoryCapacity::stored(&sys).as_ref(), info.memory.clone())
-        && let Err(err) = app.db.update_memory_capacity(id, &capacity)
-    {
-        tracing::warn!("Push from {id:?}: couldn't refresh the memory capacity: {err}");
-    }
-    if system_id.is_default_name(&sys.name)
-        && let Err(err) =
-            app.db
-                .update_system_config(id, Some(&info.hostname), None, None, None, None)
-    {
-        tracing::warn!("Push from {id:?}: couldn't rename the system to its hostname: {err}");
-    }
 }
 
 /// Ends a push connection (RFC 0016 §2): only the current connection's end marks its system

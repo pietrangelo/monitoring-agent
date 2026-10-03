@@ -203,6 +203,9 @@ pub fn needs_system_info(system: &SystemInfo) -> bool {
 /// The url push registration writes, which makes a system a push system (RFC 0016 §1).
 pub const PUSH_URL: &str = "push://";
 
+/// The url mail registration writes, which makes a system a mail system (RFC 0017 §1).
+pub const MAIL_URL: &str = "mail://";
+
 /// Where a system's snapshots come from (RFC 0016 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemSource {

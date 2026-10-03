@@ -399,36 +399,36 @@ pub(crate) mod tests {
     /// A report as a test writes it, with `rmp_serde::to_vec_named`: the golden pins the
     /// agent's encoding, so the variants only need the same shape.
     #[derive(Serialize, Clone)]
-    struct TestReport {
-        kind: String,
-        run: String,
-        seq: u64,
-        created_at: u64,
-        interval_secs: u64,
-        reason: String,
-        snapshots: Vec<TestSnapshot>,
-        alerts: Vec<TestAlert>,
-        round: Option<()>,
+    pub(crate) struct TestReport {
+        pub(crate) kind: String,
+        pub(crate) run: String,
+        pub(crate) seq: u64,
+        pub(crate) created_at: u64,
+        pub(crate) interval_secs: u64,
+        pub(crate) reason: String,
+        pub(crate) snapshots: Vec<TestSnapshot>,
+        pub(crate) alerts: Vec<TestAlert>,
+        pub(crate) round: Option<()>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        later_field: Option<u64>,
+        pub(crate) later_field: Option<u64>,
     }
 
     #[derive(Serialize, Clone)]
-    struct TestSnapshot {
-        collected_at: u64,
-        info: Option<()>,
-        cpu_percent: f32,
-        memory_percent: f32,
-        memory_used_bytes: u64,
-        memory_total_bytes: u64,
-        memory_total_display: String,
-        swap_percent: f32,
-        load_one: f64,
-        load_five: f64,
-        load_fifteen: f64,
-        uptime_seconds: u64,
-        uptime_display: String,
-        disks: Vec<()>,
+    pub(crate) struct TestSnapshot {
+        pub(crate) collected_at: u64,
+        pub(crate) info: Option<()>,
+        pub(crate) cpu_percent: f32,
+        pub(crate) memory_percent: f32,
+        pub(crate) memory_used_bytes: u64,
+        pub(crate) memory_total_bytes: u64,
+        pub(crate) memory_total_display: String,
+        pub(crate) swap_percent: f32,
+        pub(crate) load_one: f64,
+        pub(crate) load_five: f64,
+        pub(crate) load_fifteen: f64,
+        pub(crate) uptime_seconds: u64,
+        pub(crate) uptime_display: String,
+        pub(crate) disks: Vec<()>,
     }
 
     #[derive(Serialize, Clone)]
@@ -441,9 +441,9 @@ pub(crate) mod tests {
         fired_at: String,
     }
 
-    const CREATED: u64 = 1_700_000_300;
+    pub(crate) const CREATED: u64 = 1_700_000_300;
 
-    fn sample(collected_at: u64) -> TestSnapshot {
+    pub(crate) fn sample(collected_at: u64) -> TestSnapshot {
         TestSnapshot {
             collected_at,
             info: None,
@@ -488,7 +488,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn with(change: impl FnOnce(&mut TestReport)) -> Vec<u8> {
+    pub(crate) fn with(change: impl FnOnce(&mut TestReport)) -> Vec<u8> {
         let mut report = base();
         change(&mut report);
         rmp_serde::to_vec_named(&report).unwrap()

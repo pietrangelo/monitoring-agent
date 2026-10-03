@@ -26,6 +26,7 @@ mod models;
 mod presence;
 mod push;
 mod registry;
+mod registry_fill;
 mod retention;
 mod round_intake;
 mod routes;
