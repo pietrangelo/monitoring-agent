@@ -192,17 +192,20 @@ impl HubClock {
   `/api/storage` and in the hourly `error`). At open it then, in one transaction: deletes
   every chunk whose span starts after the system clock (the misdated future), discards open
   chunks that start after it, resets `last_issued` to the system clock and every series' last
-  timestamp to the system clock, applies `min(x, system clock)` to every other persisted hub
+  timestamp to `min(last, system clock)`, applies `min(x, system clock)` to every other persisted hub
   time (0011's receipts' and `MailNewest`'s `received_at`, `last_seen_active`, the flushed
   `LiveStatus` times, alert records' `stored_at` and their `alerts_listed` keys, tombstones'
   times, each series record's last span per tier, the `alerts_seen` keys, and
   `meta/retention_clock`, and 0011's `mail_prune_floor`, set to `min(floor, rewound retention
   clock − receipt window)`), in each tier's **current span** rewrites every series' chunks and
   tail without the points and buckets after the system clock (at most three spans per active
-  series), **reopens into the tail a closed bucket that straddles the system clock** (so the
-  next point can't open a second accumulator with the same start), and **deletes every
-  `points_log` entry** (the rewritten tails are flushed in the same transaction, so nothing in
-  the log is still needed and no future-stamped point can be replayed), so no misdated bucket
+  series), **reopens into the tail a closed bucket that straddles the system clock**, rebuilding
+  its accumulators from the surviving raw points of its interval (raw retention is at least an
+  hour bucket; a closed bucket holds no sum to subtract from), so the next point can't open a
+  second accumulator with the same start and the rollup invariant still holds, **flushes every
+  tail** (one full rotation, seconds at open) and **deletes every `points_log` entry** (every
+  logged point is then in a tail or a chunk, so no future-stamped point can be replayed and no
+  log-only point is lost), so no misdated bucket
   stays behind an older one; it logs the counts at `warn`. **The rewind runs after recovery's
   replay** (§6 step 6), on a head that already holds every logged point.  A value that doesn't match is logged at `error` and ignored.
 
@@ -244,16 +247,18 @@ So a mail report is ingested like a push snapshot:
 /// Persisted in `meta/retention_clock` by each retention pass.
 pub fn retention_now(previous: u64, hub_now: u64, system_now: u64, since: Elapsed) -> u64 {
     // At most twice as fast as the monotonic clock says time passed, and never past either
-    // clock. Only the first pass after open, which has no `Instant` to measure from, takes one
-    // pass of slack instead; a running hub never adds it.
-    let allowed = match since { Elapsed::SinceOpen => PASS_INTERVAL_SECS, Elapsed::Measured(d) => 2 * d.as_secs() };
+    // clock. The first pass after open has no `Instant` to measure from and advances nothing.
+    let allowed = match since { Elapsed::SinceOpen => 0, Elapsed::Measured(d) => 2 * d.as_secs() };
     hub_now.min(system_now).min(previous + allowed)
 }
 ```
 
 - `since` is the `Instant` time since the previous pass. At open there is no `Instant`
-  continuity, so the first pass passes `SinceOpen`: one pass of slack, once. (The earlier
-  formula added the slack on every pass, which allowed 3× real time at the pass interval.)
+  continuity, so the first pass after open passes `SinceOpen` and **advances nothing**; the
+  second, ten minutes later, is `Measured`. A hub off for two weeks still catches up at 2× from
+  its second pass. (Two earlier formulas granted a pass of slack: on every pass, which allowed 3×
+  at the pass interval, then once per open, which a restart loop under a forward fault turned
+  into 60× real time.)
 - **A forward clock fault** (the system clock jumps a year ahead): hub time follows at once, but
   the retention clock advances at most twice as fast as real time. If the fault is corrected ten
   minutes later, retention has run at most twenty minutes ahead of real time, and **nothing
@@ -474,13 +479,18 @@ pub struct PendingShortening { next: TierSetting, delay: Duration }
   bytes, and the pass logs a `warn` hint once a day when they pass that threshold. Measured
   cost: about 3 s per GB of file (§1), so the README gives the expected pause.
 
-**Storage cap.** `HUB_STORAGE_LIMIT` bounds the store's **file length** (`hub.redb`'s size on
-disk, what `ENOSPC` depends on; redb grows the file in regions and trims it only at a clean close,
-§1, so the length can exceed the allocated bytes by the measured slack). `/api/storage` shows
-both, and the reclaimable difference. Unset, it defaults to 80% of the size of the
-volume holding `HUB_DATA_DIR` (`statvfs`), re-read at every pass; `none` disables it. While the
-store is over the cap, each pass deletes the oldest raw span, then the oldest minute span, never
-hour chunks, the open span or tails, logging each at `warn`. If the cap can't be met from those
+**Storage cap.** `HUB_STORAGE_LIMIT` is the most `hub.redb` may take on disk. The file's
+**length** is what `ENOSPC` depends on, but it never drops while the hub runs (redb reuses freed
+pages and trims the file only through `compact()`, §1), so a rule on the length would delete
+history every pass without effect. The pass therefore acts on **allocated bytes** (redb's
+allocated pages × page size, what a compaction would keep) against the cap divided by the
+**region slack**, the measured ratio of file length to allocated bytes (1.7 at §1's measurement;
+the pass re-measures it from the file as `length / allocated`, floored at 1): while allocated
+bytes exceed `cap / slack`, each pass deletes the oldest raw span, then the oldest minute span,
+never hour chunks, the open span or tails, logging each at `warn`, and stops as soon as they
+don't. `/api/storage` shows the cap, the length, the allocated bytes and the slack. Unset, the
+cap defaults to 80% of the size of the volume holding `HUB_DATA_DIR` (`statvfs`), re-read at
+every pass; `none` disables it. If the cap can't be met from those
 tiers, that's logged at `error` once per hour, and ingestion goes on.
 
 ### 6. The writer thread, the group commit and durability
@@ -515,8 +525,10 @@ send it requests over a bounded channel and wait for its answer:
 A full channel makes callers wait on the blocking pool, which slows a push connection instead of
 growing memory.
 
-**The group commit.** Every `HUB_COMMIT_INTERVAL` (default **1 s**), or at once when a catalog
-transaction marked `Durable` is waiting, the writer commits **one redb write transaction** with
+**The group commit.** Every `HUB_COMMIT_INTERVAL` (default **1 s**), **unconditionally** (a
+commit holding only `meta/clock` still runs, so a pending `notify` is always delivered within
+one interval, however quiet the hub), or at once when a catalog transaction marked `Durable` is
+waiting, the writer commits **one redb write transaction** with
 `Durability::Immediate`, 2-phase commit and quick-repair. It holds, atomically:
 - the interval's points, as one `points_log` entry;
 - every chunk sealed in the interval (inserted into `chunks`, and removed from its tail);
@@ -649,11 +661,12 @@ The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's,
 0015's, and `HUB_STATIC_DIR` the prerequisite's.
 
 **Opening, in order**, in `main`, after configuration and before any other state:
-1. the **floor check** (§6): `statvfs` on `HUB_DATA_DIR` or, when it doesn't exist yet, its
-   nearest existing ancestor; below the floor the hub exits before creating anything;
-2. the data-directory checks below;
-3. **compaction**, when `HUB_STORE_COMPACT=1` asks for it (§5), on the file opened for it
-   alone, then the floor check again, since compaction may be what frees the space;
+1. the data-directory checks below (they create nothing when a check fails);
+2. **compaction**, when `HUB_STORE_COMPACT=1` asks for it and `hub.redb` exists (§5), on the
+   file opened for it alone: it runs **before** the floor check, since a data volume full of
+   reclaimable `hub.redb` is the case it exists for;
+3. the **floor check** (§6): `statvfs` on `HUB_DATA_DIR`; below the floor the hub exits before
+   creating or opening anything else;
 4. create `HUB_DATA_DIR/hub.redb` if absent with mode 0600 (`OpenOptionsExt::mode`), and open
    it through `Builder::create_file`, so redb's file never takes the umask's mode;
 5. redb's file lock: a second hub on the same directory gets `DatabaseAlreadyOpen` and refuses
@@ -661,7 +674,7 @@ The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's,
    this, so two hubs can't both generate a key.
 
 **Data-directory safety** (A05), with no `unsafe` (`rustix`'s safe `process` and `fs` APIs for
-`geteuid`, `getegid`, `getgroups` and `statvfs`), run before step 4, so no file is created in a
+`geteuid`, `getegid`, `getgroups` and `statvfs`), run first, so no file is created in a
 directory that fails:
 - `HUB_DATA_DIR` is created with mode 0700 if absent;
 - the hub's groups are its effective gid and its supplementary groups;
@@ -691,7 +704,7 @@ impl Store {
     /// Runs `f` inside the writer's transaction. A transaction that wrote is answered after the
     /// commit that holds it and the commit hook (`Durable` forces that commit at once); a
     /// write-free one as its `Answer` says (§6). `Abort` is answered at once.
-    pub fn transact<T: Send>(&self, class: Commit, f: impl FnOnce(&mut CatalogTxn) -> Result<(T, Answer), Abort<A>> + Send) -> Result<T, TransactError<A>>;
+    pub fn transact<T: Send, A: Send>(&self, class: Commit, f: impl FnOnce(&mut CatalogTxn) -> Result<(T, Answer), Abort<A>> + Send) -> Result<T, TransactError<A>>;
     /// A redb read transaction over the catalog tables (MVCC: never waits for the writer).
     pub fn read_catalog<T>(&self, f: impl FnOnce(&CatalogRead) -> T) -> Result<T, StoreError>;
     /// Called on the writer thread after each commit, in commit order, with that commit's
@@ -816,9 +829,11 @@ tier names, and is an open read like the rest of the hub API.
 - **`append_round(system, generation, round, decide, on_stored)`** replaces RFC 0009's
   `Database::store_round`. It clones the system's `Arc<Mutex<ApplicationAdmission>>` out of
   `live_applications`, **drops the map guard**, locks the admission, calls `decide` (the pure
-  `admit`), then `append`, then `on_stored`. A report that accepted **no** point makes the
-  round `NotStored(reason)`: `on_stored` isn't called, so the round isn't recorded in
-  `RecentRounds`. A partly accepted round is `Stored` with its rejections counted.
+  `admit`), then `append`, then *record* and *show* (RFC 0008 §3). A round **with points** of
+  which **none** was accepted makes the round `NotStored(reason)`: *record* isn't called, so the
+  round isn't recorded in `RecentRounds`. A partly accepted round is `Stored` with its rejections
+  counted, and so is an **empty round** (an agent whose last application was removed sends one),
+  which is recorded and replaces `shown`, as today.
 - **Volatile system status stays in memory**, typed, and is written into `meta/hub/live_status`
   by the rotating flush (a slice sized by elapsed time, like tails), so a restart recovers it:
 
@@ -1126,8 +1141,11 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
 - **Disk full**: a fault-injecting backend failing a commit with `ENOSPC` fails the store stop,
   with the scan's message names logged at `error`; an open below the floor exits with its
   distinct status, naming the volume, and creates nothing (the check runs on the nearest existing
-  ancestor); at the floor it opens; a file grown past the cap by region slack is trimmed by the
-  cap's deletes before the volume fills (an injected small volume).
+  ancestor); at the floor it opens; `HUB_STORE_COMPACT=1` with a data volume below the floor
+  compacts first and then opens; the cap's deletes start when allocated bytes pass `cap /
+  slack` and **stop** as soon as they are under it, with the file length unchanged (an injected
+  slack of 1.7); a retention pass right after open advances the retention clock by nothing, and
+  a restart loop of 100 opens under a +1 year fault moves it by nothing.
 - **Mail status**: the overdue sweep on `received_at` (on time, overdue, exactly at the bound);
   an agent clock 2 days slow stays `Online`; **a report committed between the sweep's read and
   its mark keeps the system `Online`** (a two-thread test through the writer gate); after a
@@ -1140,7 +1158,9 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   `since` is 1 minute before the kill), and `received_at` for mail; freshness on the system
   clock while hub time is held a year ahead (reports accepted, none marked overdue);
   `HUB_CLOCK_REWIND` brings every persisted hub time, the mail prune floor and every tail
-  bucket back to the system clock, a +2-day fault leaves no bucket after the system clock in
+  bucket back to the system clock (a series' last timestamp only down, never up), the
+  straddling bucket's counts equal a recomputation from raw, a series whose last points were
+  only in the log and whose tail sat in the previous span keeps them, a +2-day fault leaves no bucket after the system clock in
   any tier's current span, the bucket straddling the clock is reopened, and **a `SIGKILL` right
   after the rewind, before any tail rotation, reopens with no point after the system clock**
   (the log was emptied); a fault and rewind inside one hour give one hour bucket.
@@ -1452,6 +1472,21 @@ mark as one write-free transaction delivered through `notify`.
 | `now(&self)` couldn't advance `HubClock` | PLAUSIBLE | the writer stamps one hub time per transaction before `f`, persisted with the commit (§9) |
 | the retention clock's formula allowed 3× | CONFIRMED (text) | the slack only on the first pass after open (§2) |
 | `Abort` undefined (0008's pass) | CONFIRMED (low) | `Abort<A>`, `TransactError<A>` (§9) |
+
+`rfc-adversary`, verification of that round. Three of its resolutions didn't hold and were
+re-made:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| a cap on the file length, which never drops while running, deleted raw and minute history every pass for ever | CONFIRMED | the pass acts on allocated bytes against `cap / region slack`, re-measured; stops as soon as under; a row (§5) |
+| one pass of slack at every open, times a restart loop under a forward fault, voided the 2× bound | CONFIRMED | the first pass after open advances nothing (§2) |
+| the floor check before compaction made compaction unreachable when needed | CONFIRMED | directory checks, then compaction, then the floor (§8) |
+| 0011 §7 still had the caller set the mail status after the commit | CONFIRMED (minor) | the hook sets it (0011 §7) |
+| `transact` used `A` undeclared | CONFIRMED (minor) | declared (§9) |
+| the reopened straddling bucket had no sum to rebuild from | PLAUSIBLE | rebuilt from the surviving raw points (§2) |
+| emptying the log could lose a series' log-only points in a previous span's tail | PLAUSIBLE | every tail flushed in the rewind transaction (§2) |
+| a quiet hub might never commit, so a `notify` would never be delivered | PLAUSIBLE (low) | the interval commit is unconditional (§6) |
+| a series' last timestamp reset up to the system clock | noted | `min(last, system clock)` (§2) |
 
 **Still open**, carried into the next `rfc-adversary` pass: whether the rotating tail flush plus
 the log meets the stated open time at the scale target (to be measured), and whether redb's

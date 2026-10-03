@@ -185,11 +185,17 @@ adapter only feeds it.
   generation. **The same fence covers `live_applications` and `LiveStatus`.** `SystemApplications`
   carries the generation, and `append_round`'s `on_stored` (RFC 0009 §5, Implemented; amended
   here) splits in two:
-  - **record**, still under the admission lock: `recent.remember(round)` and the spent pace are
-    written into the `Arc<Mutex<ApplicationAdmission>>` itself, which therefore holds `recent`
-    and the paces, so `decide` and the record stay one step and two overlapping polls, or a
-    poll and a push, can't both store one round (RFC 0009's guarantee, pinned by
-    `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`);
+  - **record**, still under the admission lock: `recent.remember(round)` and the spent **poll**
+    pace are written into the `Arc<Mutex<ApplicationAdmission>>` itself, which therefore holds
+    `recent` and the system's poll pace (a push connection's pace stays in its `ConnectionState`
+    and is returned by *record*, as `store_round` returns `after` today, so a second connection
+    for one id can't spend the honest one's tokens), so `decide` and the record stay one step
+    and two overlapping polls, or a poll and a push, can't both store one round (RFC 0009's
+    guarantee, pinned by `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`).
+    *Record* returns an **ordinal** (a counter in the admission, incremented per recorded
+    round), and `SystemApplications::shown` carries it: *show* replaces `shown` only with a
+    higher ordinal, so two overlapping polls whose *show* steps run out of order can't show the
+    older round. An **empty round** is recorded and shown like any other (0010 §10);
   - **show**, after the admission is released: the Registry read lock, the generation check, and
     **while still holding it** the `live_applications` write lock, to set `shown`; the Registry
     guard is held across the insert, so a delete's hook can't run between the check and the
@@ -198,15 +204,20 @@ adapter only feeds it.
   generation, and under it clones or **creates the entry at that generation** (replacing one of
   another generation, whose `recent` would otherwise mark a re-registered agent's re-sent round a
   duplicate); it never calls `entry().or_default()` for an id the Registry doesn't hold.
-  `collector/application_poll.rs::log_refused_round`'s hourly throttle moves into the poll task's
-  own state, so it creates no `live_applications` entry. A `LiveStatus` write for an id with no
+  `collector/application_poll.rs::log_refused_round`'s hourly throttle moves out of
+  `live_applications`: `poll_every`'s loop (the one long-lived poller; a `poll_system` task lives
+  one tick) owns a `HashMap<SystemId, Instant>` of warned-at instants, pruned each tick to the
+  tick's `polled_systems` (so it is bounded by the registry and drops deleted ids) and handed to
+  each task behind an `Arc<Mutex<_>>`; it creates no `live_applications` entry.
+  `forget_shown_round` clears `shown` by id and creates nothing; a stale poll clearing a
+  re-registered id's `shown` is restored by the next poll. A `LiveStatus` write for an id with no
   entry is dropped, since entries are created only by the registration hook, which replaces an
   entry of another generation; the delete's hook removes only the deleted generation's entries,
   and nothing removes entries by id after the transaction (0011 §3, amended). So a fill or a
   round racing a delete can't leave an orphan for any source, and a stale end evicts nothing. **The lock order** is 0010 §9's, which lists every path that
   holds two hub locks; the commit hook takes only the Registry's write lock while holding any.
-  No test can show it; review must. The delete evicts after its
-  commit hook. **An end always removes its own presence entry** when its connection number
+  No test can show it; review must. The delete's hook evicts, by generation;
+  `routes/api.rs::delete_system`'s eviction by id after the delete goes. **An end always removes its own presence entry** when its connection number
   matches, whatever the generation; only its side effects (the offline write, the eviction) are
   generation-gated, so a deleted id leaves no dead entry. A connection whose append answered
   `SystemGone` ends with no side effect beyond that.
@@ -415,7 +426,10 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   - a deleted id with an open connection leaves no presence entry after that connection ends;
   - two rounds of one system through a **round seam** placed after the admission is released
     (between *record* and *show*): the second is `Duplicate` or `TooSoon`, never stored twice;
-    `overlapping_polls_of_one_system_share_one_pace` stays deterministic;
+    `overlapping_polls_of_one_system_share_one_pace` stays deterministic (its empty rounds are
+    `Stored`, as today); two rounds whose *show* steps run in reverse order through the seam
+    leave `shown` on the newer; an empty round is `Stored` and replaces `shown`; a refused
+    round on two consecutive ticks logs one `warn` and one `debug`;
   - a delete through a seam **inside *show***, between the generation check and the insert: the
     delete's hook waits for the Registry guard, and no orphan entry exists afterwards;
   - a delete between a round's `append` and *show*: no `live_applications` entry; a later
@@ -466,7 +480,8 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
   RFC 0008 (generation-fenced currency, sweep grace from registration)".
 - `rfcs/0009-spring-boot-application-telemetry.md` (Implemented) gains a header note: "§5's
   `on_stored` is split by RFC 0008 §3 into *record* (under the admission) and *show* (under the
-  Registry)"; its guarantee is unchanged.
+  Registry), and §8's delete-then-evict order is superseded by the generation fence"; its
+  guarantee is unchanged. `routes/api.rs::delete_system`'s eviction by id is removed.
 - RFC 0011 §3's eviction sentence (by id, after the transaction) becomes the delete hook's, by
   generation.
 - § Domain model, glossary: **push handshake**'s refusals become rejection, timeout, registry
@@ -635,7 +650,18 @@ that closed the session's open findings across 0008, 0010 and 0011:
 Came closest and survived: the at-once `AlreadyRegistered` (only the id's own uncommitted
 `Register` can produce one, and that is a catalog write, so the wait applies).
 
-**Still open**: nothing CONFIRMED. One pass reviews this round before the RFC is accepted.
+`rfc-adversary`, seventh pass. Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| 0010 §10's "no point accepted → `NotStored`" dropped empty rounds, which the pinned tests send and an agent sends when its last application goes | CONFIRMED (medium) | a round *with points* none accepted is `NotStored`; an empty round is `Stored` and shown (0010 §10; Testing) |
+| *show* out from under the admission let an older round overwrite `shown` | CONFIRMED | *record* returns an ordinal; *show* replaces only a lower one; a row (§3) |
+| the throttle "in the poll task" lived one tick | CONFIRMED (low) | in `poll_every`'s loop, keyed by id, pruned to the tick's systems (§3) |
+| `transact` used `A` undeclared | CONFIRMED (low) | `transact<T: Send, A: Send>` (0010 §9) |
+| "the paces" could mean the push pace in the admission | PLAUSIBLE (low) | the poll pace only; the push pace stays per connection (§3) |
+| inventory: line 208, `delete_system`'s eviction, 0009 §8, `forget_shown_round` | PLAUSIBLE (low) | reworded and listed (§3, Impact) |
+
+**Still open**: nothing CONFIRMED.
 
 **Split into RFC 0016 (2026-09-29).** §5 and §7 moved to RFC 0016, with the findings above
 that concerned them (the stale connection, the offline backstop, the agent's id). RFC 0016 also

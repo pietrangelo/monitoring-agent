@@ -429,9 +429,10 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   the choice is current** (0010 §2), its newest snapshot's points are staged at hub now
   (`CatalogTxn::append`), so two reports of one system in a scan never stamp the same second.
   Step 3's `Recency` read sees only the previous scan's `mail_newest`, which is what it must
-  compare against. A skipped report writes and stages nothing. **After the commit**, the info
-  fill and the status (`Online`, `last_contact`) run once per system for the same choice, and
-  the live metrics and the round (`append_round`) only if the choice is current; so an older
+  compare against. A skipped report writes and stages nothing. The status (`Online`,
+  `last_contact`) is set **by the commit hook** for the same choice (0010 §10), never by the
+  caller. **After the commit**, the caller runs the info fill once per system for the choice,
+  and the live metrics and the round (`append_round`) only if the choice is current; so an older
   report later in the scan never replaces what is shown, and a backlog's choice never shows a
   stale round. Every message of the scan is deleted after the
   commit holding the scan, accepted or refused, as 0017 deletes every handled message; a
