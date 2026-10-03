@@ -165,7 +165,7 @@ fn resolve_system_id() -> Result<identity::AgentId, StartupError> {
         .map_err(StartupError::PushId)?;
     let resolved = identity::resolve_push_id(id_file.as_ref(), &identity::IdSources::system())
         .map_err(StartupError::PushId)?;
-    announce_push_id(resolved.resolution);
+    announce_system_id(resolved.resolution);
     Ok(resolved.id)
 }
 
@@ -206,13 +206,13 @@ struct PushTarget {
 }
 
 /// Logs where the push system id came from, and warns when it lives for this process only.
-fn announce_push_id(resolution: identity::Resolution) {
+fn announce_system_id(resolution: identity::Resolution) {
     use identity::{IdSource, Resolution};
-    tracing::info!("Push system id resolved: {resolution:?}");
+    tracing::info!("System id resolved: {resolution:?}");
     if resolution == Resolution::Resolved(IdSource::Random) {
         tracing::warn!(
-            "The push system id is a random UUID that lives for this process only; set {} \
-             to keep it",
+            "The system id is a random UUID that lives for this process only; set {} to keep \
+             it",
             identity::ID_FILE_VARIABLE
         );
     }

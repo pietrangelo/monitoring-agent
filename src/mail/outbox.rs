@@ -94,6 +94,11 @@ impl<M> Outbox<M> {
         }
     }
 
+    /// Whether any message was dropped since the last count was taken.
+    pub fn has_dropped(&self) -> bool {
+        self.dropped > 0
+    }
+
     /// How many messages were dropped since the last call.
     pub fn take_dropped(&mut self) -> u64 {
         std::mem::take(&mut self.dropped)

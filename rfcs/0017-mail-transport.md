@@ -1,6 +1,6 @@
 # RFC 0017: Mail Transport: Sealed Reports over SMTP for Agents Without Internet Access
 
-- Status: Accepted
+- Status: Implemented
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-10-03 (revised the same day for four `rfc-adversary` passes; accepted after the
   fourth, see Review)
@@ -725,3 +725,18 @@ from the registration unit with no new blocking on the runtime, the migration or
 The fourth pass named the clock comparison as the only blocker to `Accepted`. The amendment
 adopts its proposed fix, so no fifth pass was run (CLAUDE.md: no second pass on one's own
 fixes to a finding); the RFC is `Accepted`.
+
+`rosette-auditor` on the implementation: two VIOLATED, eight AT-RISK.
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the overdue sweep wrote a blank last seen | VIOLATED | fixed: `mark_mail_overdue` writes status and error only |
+| `mail_intake/ingest.rs::store` over 50 lines | VIOLATED | fixed: split into `store`, `log_reason`, `outcome` |
+| the overdue sweep could mark a system that a report had just refreshed | AT-RISK | fixed: the marking writes only while the newest receipt is the one the sweep read, and evicts only when it wrote |
+| the agent sent inline, stalling the 2 s gathering up to the SMTP timeout | AT-RISK | fixed: a delivery task fed by a channel holds the outbox, as §5 describes |
+| drops during a quiet hour were reset unlogged | AT-RISK | fixed: counted until the next warning |
+| `LastSeen::ReportedAt(String)` and `unwrap_or_default` sentinels | AT-RISK | fixed: `ReportedAt(SnapshotTime)`, formatted when written; `SnapshotTime::unix_secs` |
+| `seal` hid a failed encryption behind an empty ciphertext | AT-RISK | fixed: `seal` returns `Result`, the client skips and logs. The HKDF `expand` of 32 bytes stays a commented `let _`: it can't fail |
+| the presence read re-parsed the interval later | AT-RISK | fixed: parsed into `MailInterval` at the edge |
+| "url isn't `mail://`" decided inside the store | AT-RISK | accepted: it is decided in the same transaction as the registration it guards, as `store_snapshot` checks the row; moving it to a closure adds nothing the transaction doesn't already give |
+| mail agents logged "Push system id resolved" | AT-RISK | fixed: "System id resolved" |

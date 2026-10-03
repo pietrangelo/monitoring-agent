@@ -60,34 +60,46 @@ impl MailKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Nonce(pub [u8; 24]);
 
+/// Why a report couldn't be sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealError {
+    /// An id over 255 bytes, which `AgentId` never holds.
+    IdTooLong,
+    /// The cipher refused the message (beyond its limit, about 256 GiB).
+    Encrypt,
+}
+
 /// The header the hub reads before it opens a report: magic, version, the id's length and the
 /// id. It is the AEAD's associated data.
-fn header(id: &AgentId) -> Vec<u8> {
+fn header(id: &AgentId) -> Result<Vec<u8>, SealError> {
     let id = id.as_str().as_bytes();
-    // `AgentId` holds at most 255 bytes, so its length is one byte.
-    let id_len = u8::try_from(id.len()).unwrap_or(u8::MAX);
+    let id_len = u8::try_from(id.len()).map_err(|_| SealError::IdTooLong)?;
     let mut header = Vec::with_capacity(MAGIC.len() + 2 + id.len());
     header.extend_from_slice(MAGIC);
     header.extend_from_slice(&[VERSION, id_len]);
     header.extend_from_slice(id);
-    header
+    Ok(header)
 }
 
 /// Seals `report` (the MessagePack report) for `id` under `key`.
-pub fn seal(id: &AgentId, report: &[u8], key: &MailKey, nonce: &Nonce) -> Vec<u8> {
-    let mut sealed = header(id);
+pub fn seal(
+    id: &AgentId,
+    report: &[u8],
+    key: &MailKey,
+    nonce: &Nonce,
+) -> Result<Vec<u8>, SealError> {
+    let mut sealed = header(id)?;
     let cipher = XChaCha20Poly1305::new(&key.0.into());
     let payload = Payload {
         msg: report,
         aad: &sealed,
     };
-    // Encryption fails only for a message beyond the cipher's limit (about 256 GiB).
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce.0), payload)
-        .unwrap_or_default();
+        .map_err(|_| SealError::Encrypt)?;
     sealed.extend_from_slice(&nonce.0);
     sealed.extend_from_slice(&ciphertext);
-    sealed
+    Ok(sealed)
 }
 
 /// The armoured text a message body carries.
@@ -160,7 +172,7 @@ mod tests {
     #[test]
     fn a_sealed_report_carries_its_header_and_opens_only_unaltered_under_its_key() {
         let report = b"a report";
-        let sealed = seal(&id("web-01"), report, &key(), &NONCE);
+        let sealed = seal(&id("web-01"), report, &key(), &NONCE).unwrap();
 
         let mut expected_head = b"SAMR\x01\x06web-01".to_vec();
         expected_head.extend_from_slice(&NONCE.0);
@@ -206,7 +218,7 @@ mod tests {
         const REPORT: &[u8] = include_bytes!("../../testdata/mail-report-v1.msgpack");
         let key = MailKey::from_base64("K3+RuHlQ1b7woYSIjUBPpdWhGwNhkfOkRjXt3LT2ufM=").unwrap();
 
-        let sealed = seal(&id("web-01"), REPORT, &key, &NONCE);
+        let sealed = seal(&id("web-01"), REPORT, &key, &NONCE).unwrap();
 
         assert_eq!(sealed, SEALED);
     }

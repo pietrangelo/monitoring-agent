@@ -21,7 +21,9 @@
 //! so nothing blocks the runtime.
 
 use std::sync::Arc;
+
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
@@ -41,6 +43,8 @@ use crate::state::AppState;
 const TICK: Duration = Duration::from_secs(2);
 /// How long one SMTP session may take.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often dropped reports may be logged at `warn`.
+const DROPPED_WARNING_EVERY: Duration = Duration::from_secs(3600);
 
 type Transport = AsyncSmtpTransport<Tokio1Executor>;
 
@@ -133,7 +137,13 @@ fn sealed_message(target: &MailTarget, report: &MailReport) -> Option<Message> {
         }
     };
     let nonce = random_nonce();
-    let sealed = seal::seal(&target.system_id, &plaintext, &target.settings.key, &nonce);
+    let sealed = match seal::seal(&target.system_id, &plaintext, &target.settings.key, &nonce) {
+        Ok(sealed) => sealed,
+        Err(err) => {
+            tracing::warn!("Skipping a mail report that failed to seal: {err:?}");
+            return None;
+        }
+    };
     let to = &target.settings.to;
     match message(
         &target.from,
@@ -176,43 +186,84 @@ pub fn spawn_mail_client(app: Arc<AppState>, target: MailTarget) {
     tokio::spawn(async move { run(app, target, transport).await });
 }
 
-/// What the client keeps between ticks.
+/// What the gathering task keeps between ticks.
 struct Client {
     batch: MailBatch,
     pace: IncidentPace,
-    outbox: Outbox<Message>,
     next_report: Instant,
-    next_send: Instant,
-    dropped_warned_at: Option<Instant>,
+    /// Hands each sealed message to the delivery task, so a slow relay never stalls gathering.
+    outgoing: mpsc::UnboundedSender<Message>,
 }
 
 async fn run(app: Arc<AppState>, target: MailTarget, transport: Transport) {
     let interval = target.settings.interval.as_duration();
-    let now = Instant::now();
+    let (outgoing, incoming) = mpsc::unbounded_channel();
+    tokio::spawn(deliver(incoming, transport, interval));
     let mut client = Client {
         batch: MailBatch::new(app.run, target.settings.sample_interval),
         pace: IncidentPace::default(),
-        outbox: Outbox::default(),
-        next_report: now + interval,
-        next_send: now,
-        dropped_warned_at: None,
+        next_report: Instant::now() + interval,
+        outgoing,
     };
     let mut ticks = tokio::time::interval(TICK);
     loop {
         ticks.tick().await;
-        let now = Instant::now();
         let new_incident = gather(&app, &mut client.batch);
-        if let Some(reason) = client.due(now, interval, new_incident) {
+        if let Some(reason) = client.due(Instant::now(), interval, new_incident) {
             client.close(&app, &target, reason);
         }
-        if now >= client.next_send && client.outbox.front().is_some() {
-            client.send_front(&transport, interval).await;
-        }
-        client.log_dropped(now);
     }
 }
 
-/// Offers the published snapshot, when fresh, and notes the active alerts.
+/// The delivery task: queues what the gathering task closes in the outbox, and sends its
+/// front whenever the backoff allows. Ends when the gathering task does.
+async fn deliver(
+    mut incoming: mpsc::UnboundedReceiver<Message>,
+    transport: Transport,
+    max: Duration,
+) {
+    let mut outbox = Outbox::default();
+    let mut wait = Duration::ZERO;
+    let mut warned_at = None;
+    loop {
+        let has_front = outbox.front().is_some();
+        tokio::select! {
+            biased;
+            received = incoming.recv() => match received {
+                Some(message) => outbox.push(message),
+                None => return,
+            },
+            () = tokio::time::sleep(wait), if has_front => {
+                if let Some(message) = outbox.front().cloned() {
+                    wait = outbox.after(send(&transport, message).await, max);
+                }
+            }
+        }
+        warned_at = log_dropped(&mut outbox, warned_at, Instant::now());
+    }
+}
+
+/// Logs the reports the outbox dropped, at most hourly; drops during a quiet hour are kept
+/// for the next warning.
+fn log_dropped(
+    outbox: &mut Outbox<Message>,
+    warned_at: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    let quiet =
+        warned_at.is_some_and(|at| now.saturating_duration_since(at) < DROPPED_WARNING_EVERY);
+    if quiet || !outbox.has_dropped() {
+        return warned_at;
+    }
+    tracing::warn!(
+        "The mail outbox dropped {} report(s)",
+        outbox.take_dropped()
+    );
+    Some(now)
+}
+
+/// Offers the published snapshot, when fresh, and notes the active alerts. Returns whether an
+/// incident became active.
 fn gather(app: &AppState, batch: &mut MailBatch) -> bool {
     if let Ok(snapshot) = app.fresh_snapshot() {
         batch.offer(MailedSnapshot::from(snapshot.as_ref()), snapshot.read_at);
@@ -237,7 +288,7 @@ impl Client {
         (new_incident && self.pace.allows(now)).then_some(ReportReason::Incident)
     }
 
-    /// Closes the batch into a report and queues its message.
+    /// Closes the batch into a report and hands its message to the delivery task.
     fn close(&mut self, app: &AppState, target: &MailTarget, reason: ReportReason) {
         let round = app
             .rounds
@@ -251,27 +302,8 @@ impl Client {
         if let Some(report) = self.batch.close(interval, reason, created_at, round)
             && let Some(message) = sealed_message(target, &report)
         {
-            self.outbox.push(message);
-        }
-    }
-
-    async fn send_front(&mut self, transport: &Transport, interval: Duration) {
-        let Some(message) = self.outbox.front().cloned() else {
-            return;
-        };
-        let result = send(transport, message).await;
-        self.next_send = Instant::now() + self.outbox.after(result, interval);
-    }
-
-    /// Logs reports the outbox dropped, at most hourly.
-    fn log_dropped(&mut self, now: Instant) {
-        let dropped = self.outbox.take_dropped();
-        let quiet = self
-            .dropped_warned_at
-            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(3600));
-        if dropped > 0 && !quiet {
-            tracing::warn!("The mail outbox dropped {dropped} report(s)");
-            self.dropped_warned_at = Some(now);
+            // The delivery task lives as long as this one; a closed channel means it panicked.
+            let _ = self.outgoing.send(message);
         }
     }
 }
@@ -399,5 +431,31 @@ mod tests {
             host: String::new(),
             port,
         };
+    }
+
+    /// RFC 0017 §5: the delivery task sends what the gathering task hands it, on its own, so
+    /// the gathering loop never waits on the relay.
+    #[tokio::test]
+    async fn the_delivery_task_sends_what_it_is_handed() {
+        let (port, served) = relay("250 queued\r\n").await;
+        let transport = transport(&settings(port), None).unwrap();
+        let (outgoing, incoming) = mpsc::unbounded_channel();
+        let delivering = tokio::spawn(deliver(incoming, transport, Duration::from_secs(300)));
+
+        outgoing.send(a_message()).unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(10), served).await;
+
+        assert!(
+            data.as_ref()
+                .is_ok_and(|data| data.as_ref().is_ok_and(|d| d.contains(seal::ARMOUR_BEGIN))),
+            "the relay got the report: {data:?}"
+        );
+        drop(outgoing);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), delivering)
+                .await
+                .is_ok(),
+            "it ends"
+        );
     }
 }
