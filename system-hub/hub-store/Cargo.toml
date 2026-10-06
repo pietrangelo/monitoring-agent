@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Pietrangelo Masala
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+[package]
+name = "hub-store"
+version = "0.1.0"
+edition = "2024"
+description = "The hub's embedded store: tiered time series and the catalog, on redb (RFC 0010)"
+publish = false
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[dependencies]
+crc32c = "0.6"
+redb = "4.3.0"

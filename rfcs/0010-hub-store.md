@@ -404,25 +404,36 @@ CRC-32C of its own (§5).
   one a small entry. In a block file each chunk costs one 22-byte index entry, about 0.1 B per
   raw point, 0.4 B per minute bucket and 0.9 B per hour bucket (§5's footprint).
 
-**Budgets per kind**, asserted by the size-budget test, from deterministic generators that
-model timestamps as well as values (host series every 2 s plus U(0, 0.3) s of jitter;
-application series every 15 s plus a round of U(0.05, 1.0) s):
+**Budgets per kind**, asserted by the size-budget test (`hub-store/tests/size_budget.rs`), from
+deterministic generators that model timestamps as well as values (host series every 2 s plus
+U(0, 0.3) s of jitter; application series every 15 s plus a round of U(0.05, 1.0) s), over a
+day of points sealed as the store seals them (full chunks, span boundaries). **Measured** by
+implementation step 1 (2026-10-06); the ceilings the test asserts are the measured values plus
+10%:
 
-| Kind (value generator) | Raw, bytes per point | Rollup, bytes per bucket |
+| Kind (value generator) | Raw, bytes per point: measured (ceiling) | Rollup, bytes per bucket: measured (ceiling) |
 |---|---|---|
-| `Percent`, noisy (CPU: random walk, σ = 3 points per step) | ≤ 2.8 | ≤ 7.5 |
-| `Percent`, slow (memory, disk: σ = 0.05, occasional steps) | ≤ 0.9 | ≤ 3 |
-| `Load` | ≤ 1.6 | ≤ 5 |
-| `Bytes` (heap: sawtooth, GC drops of 10–60%) | ≤ 3.9 | ≤ 10.5 |
-| `Rate`, `Millis` (log-normal around a level) | ≤ 3.9 | ≤ 10.5 |
-| `Count` | ≤ 1.2 | ≤ 3 |
-| `Monotonic` (uptime; deltas jitter with the timestamps) | ≤ 1.5 | ≤ 3 |
-| **Weighted by the scale-target mix** (host: 8 series at 2 s; application: 11 at 15 s) | **≤ 1.8** | **≤ 6.5** |
+| `Percent`, noisy (CPU: random walk, σ = 3 points per step) | 2.04 (2.25) | 7.23 (7.96) |
+| `Percent`, slow (memory, disk: σ = 0.05, occasional steps) | 1.10 (1.22) | 4.51 (4.96) |
+| `Load` (a smooth walk, σ = 0.02 per step) | 1.00 (1.10) | 4.25 (4.67) |
+| `Bytes` (heap: sawtooth, GC drops of 10–60%) | 2.43 (2.67) | 8.40 (9.25) |
+| `Rate` (log-normal around a level) | 3.00 (3.31) | 9.64 (10.61) |
+| `Millis` (log-normal around a level) | 2.14 (2.35) | 7.18 (7.91) |
+| `Count` (a count changing by one, 10% of the steps) | 0.38 (0.42) | 2.19 (2.42) |
+| `Monotonic` (uptime; deltas jitter with the timestamps) | 0.30 (0.34) | 5.30 (5.84) |
+| **Weighted by the scale-target mix** (host: 8 series at 2 s; five applications of 11 series at 15 s) | **1.25 (1.38)** | **4.99 (5.49)** |
+
+- The draft's a-priori ceilings were 1.8 B per point and 6.5 B per bucket for the mix. Two rows
+  measured above their draft ceiling: slow `Percent` (σ = 0.05 % is five stored units a step,
+  so most steps take the 8-bit value code) and `Monotonic` rollups (a bucket's average moves
+  with the clock, and rollups code the average as a delta, not a delta of deltas). The weighted
+  mix is under the draft's on both counts, and §5's footprint uses the measured ceilings.
+- A rollup bucket is the minute or hour buckets of a day together, weighted by their counts.
 
 These are *encoded* sizes. On disk each is multiplied by its layout's overhead (§1's spike:
-1.03× in a block file, ≈ 1.7× in redb's hot part), which the footprint (§5) includes. The first implementation step
-measures every number from the generators and records it here and in `docs/ARCHITECTURE.md`;
-the test then asserts the measured value plus 10%.
+1.03× in a block file, ≈ 1.7× in redb's hot part), which the footprint (§5) includes. The
+on-disk factors for a day of the mix (the hot part through redb's `stats()`, block files from
+their lengths) are measured when steps 2 and 2b land.
 
 ### 5. Tables, tiers and retention
 
@@ -494,18 +505,18 @@ trailer: summary offset u64 · CRC-32C of header and summary · magic
   read at open. A query reads one index block (≤ 22 KiB), checks it, and reads the chunks it
   names.
 
-**Footprint at the scale target with the defaults** (codec ceilings × 1.03 for block files, the
-spike's ≈ 1.7× for the hot part; step 1 replaces them with measured values):
+**Footprint at the scale target with the defaults** (the measured codec ceilings of §4 × 1.03
+for block files, the spike's ≈ 1.7× for the hot part):
 
 | Tier | Per day | Kept | On disk |
 |---|---|---|---|
-| Raw (6.6 B points × 1.8 B × 1.03, plus ≈ 0.1 B of index) | ≈ 12.9 GB | 24 h + 1 h | ≈ 13 GB |
-| Minute (630k series × 1,440 × (6.5 B × 1.03 + 0.4 B)) | ≈ 6.4 GB | 14 d + 1 h | ≈ 90 GB |
-| Hour (630k × 24 × (6.5 B × 1.03 + 0.9 B)) | ≈ 0.12 GB | 30 d + 1 d | ≈ 4 GB |
+| Raw (6.6 B points × 1.38 B × 1.03, plus ≈ 0.1 B of index) | ≈ 10.0 GB | 24 h + 1 h | ≈ 10.4 GB |
+| Minute (630k series × 1,440 × (5.49 B × 1.03 + 0.4 B)) | ≈ 5.5 GB | 14 d + 1 h | ≈ 77 GB |
+| Hour (630k × 24 × (5.49 B × 1.03 + 0.9 B)) | ≈ 0.10 GB | 30 d + 1 d | ≈ 3.1 GB |
 | `hub.redb`: two hot spans per tier at ≈ 1.7×, tails, points log, series table, catalog | | | ≈ 6 GB |
-| **Total** | **≈ 19.5 GB of new data a day** | | **≈ 113 GB**, against ≈ 180 GB with every closed span in redb at the measured 1.7×, and ≈ 330 GB for *one day* of raw rows in SQLite |
+| **Total** | **≈ 15.6 GB of new data a day** | | **≈ 97 GB**, against ≈ 155 GB with every closed span in redb at the measured 1.7×, and ≈ 330 GB for *one day* of raw rows in SQLite |
 
-At 100 systems (and their applications) the same policy needs about 1.1 GB. The minute tier
+At 100 systems (and their applications) the same policy needs about 1 GB. The minute tier
 still dominates, and an operator short of disk shortens `minute=` first.
 
 - **Rollups are computed at ingest.** Each series has two accumulators (current minute and hour:
@@ -853,7 +864,7 @@ under 30 s at the scale target, under 1 s at 100 systems.
 | sealed chunks (raw, minute, hour), into redb | ~20 GB |
 | block files: each closed span written once, plus rewrites | ~20 GB |
 | deletions (page rewrites of retention and purge) | ~5 GB |
-| **Total** | **≈ 145 GB/day logical**, against ≈ 19.5 GB/day of new data kept (§5) |
+| **Total** | **≈ 145 GB/day logical**, against ≈ 15.6 GB/day of new data kept (§5) |
 
 Copy-on-write rewrites branch pages on each commit; the performance test measures physical
 writes and records them. §1's spike measured 36 to 59 B written per point, dominated by these
@@ -1204,7 +1215,8 @@ tier names, and is an open read like the rest of the hub API.
 - **Ingestion**: `append_snapshot`, `append_round`, and `store_mail_scan` (RFC 0017's intake on
   the store, one transaction per scan, one point per series per system per scan, at hub time).
 - **Glossary**:
-  - added: series, series table, active series, interned series, reactivation, generation, value
+  - added: system key (a system id's bytes as the store's key part, not a synonym for system
+    id), series, series table, active series, interned series, reactivation, generation, value
     kind, value scale, domain range, tier (raw, minute, hour), rollup, span, chunk, tail, points
     log, group commit, commit interval, writer thread, hub time, clock hold, clock rewind,
     retention clock, retention policy, override, tier setting (global or fixed), pending

@@ -6,14 +6,16 @@ rule and tell the user why, rather than silently skipping it.
 
 ## Project overview
 
-Two independent Rust binaries, **not** a Cargo workspace (each has its own `Cargo.toml` /
+Two independent Rust binaries, **not** one Cargo workspace (each has its own `Cargo.toml` /
 `Cargo.lock`):
 
 - **`system-agent`** (repo root, `src/`) — runs on every monitored host, exposes a REST/SSE/WS
   API over local system metrics (CPU, memory, disk, network, processes, packages, services,
   containers, ports), and can push snapshots to a hub over WebSocket + MessagePack.
 - **`system-hub`** (`system-hub/`) — aggregates data from many agents (HTTP poll or WS push),
-  persists it to SQLite, and serves a fleet dashboard.
+  persists it, and serves a fleet dashboard. `system-hub/` is a Cargo workspace of its own
+  with two members: the hub and its store crate, `system-hub/hub-store/` (RFC 0010), sharing
+  one `Cargo.lock`.
 
 Both are Axum services. Full endpoint/protocol reference lives in `README.md` — keep it in
 sync when endpoints change, but architectural _reasoning_ belongs in `docs/ARCHITECTURE.md`
@@ -50,6 +52,8 @@ sync when endpoints change, but architectural _reasoning_ belongs in `docs/ARCHI
   ```
   A change is not done until these pass in every crate it touched. If `system-hub` and the
   root crate are both affected, run the full sequence in both directories (`cd system-hub`).
+  In `system-hub/`, a workspace, clippy, test and build run with `--workspace`, so the store
+  crate (`hub-store`) is gated with the hub.
 - A change that touches the hub dashboard (`system-hub/static/index.html`) or its XSS smoke
   test (`system-hub/dashboard-tests/`) also runs, from the repo root:
   ```sh

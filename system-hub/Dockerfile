@@ -20,6 +20,8 @@ FROM rust:1-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The hub's workspace member: its store crate (RFC 0010 §1).
+COPY hub-store ./hub-store
 RUN cargo build --release
 
 FROM debian:bookworm-slim
