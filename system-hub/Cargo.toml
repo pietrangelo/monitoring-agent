@@ -5,6 +5,11 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
+# The hub is a workspace of two members: the hub binary and its store (RFC 0010 §1). The
+# agent at the repository root stays an independent crate.
+[workspace]
+members = ["hub-store"]
+
 [package]
 name = "system-hub"
 version = "0.1.0"

@@ -266,6 +266,48 @@ Aggregates data from many `system-agent` instances. Responsibilities:
   filled from the image only when it is created and would otherwise pin the dashboard to the
   volume's first image. `main.rs::app` assembles the served router, so a test can reach it.
 
+### `hub-store` (`system-hub/hub-store/`)
+
+The hub's store crate (RFC 0010), a member of the hub's Cargo workspace (`system-hub/` is a
+workspace of two members sharing one `Cargo.lock`; the agent stays an independent crate). It is
+being built in RFC 0010's implementation steps and **is not yet used by the hub**, which still
+persists to SQLite (see Storage). Synchronous, with no async dependency and
+`#![forbid(unsafe_code)]`. Today it holds the pure core of the series format:
+
+- `value.rs`: `ValueKind` (percent, load, count, monotonic, bytes, rate, millis), each with
+  its value scale, its domain range and its `Encoding` (delta, or delta of deltas for
+  monotonic counters); `Scaled`, a value in its kind's stored unit (`round(v / scale)`),
+  unconstructible outside the domain; `OutOfDomain`.
+- `name.rs`: `MetricName` (1 to 261 bytes of UTF-8, no control character), `SystemKey` (1 to
+  255 bytes), `Generation`; `InvalidName`.
+- `tier.rs`: `Tier` (raw, minute, hour), `RollupTier`, `SpanStart`: spans of 1 h (raw,
+  minute) and 1 day (hour), and the grace after which a span closes.
+- `codec/`: the chunk codec, versioned by a leading format byte and total on any input. A raw
+  chunk (`RawChunk`, format `0x01`) holds at most 240 points or 1 KiB: a header (count, first
+  timestamp, first value) then, per point, the timestamp's delta of deltas (`0` | `10`+3 |
+  `110`+7 | `1110`+12 | `1111`+32 bits) and the value's zigzagged step (`0` | `10`+6 | `110`+13
+  | `1110`+20 | `11110`+32 | `11111`+64 bits). A rollup chunk (`RollupChunk`, format `0x02`)
+  holds one span of buckets (60 minute or 24 hour buckets): per bucket its index's delta of
+  deltas (one bit when consecutive), its average's step, `avg − min`, `max − avg` and its
+  count. Both reopen from their bytes, which is how a tail will be persisted.
+- `rollup.rs`: `Accumulator`, a series' open bucket, summed in `i128`; its average rounds
+  half away from zero.
+
+Measured encoded sizes (`hub-store/tests/size_budget.rs`, seeded generators over a day of
+points; the test asserts these plus 10%):
+
+| Kind (generator) | Bytes per raw point | Bytes per rollup bucket |
+|---|---|---|
+| percent, noisy (CPU) | 2.04 | 7.23 |
+| percent, slow (memory, disk) | 1.10 | 4.51 |
+| load | 1.00 | 4.25 |
+| bytes (heap sawtooth) | 2.43 | 8.40 |
+| rate | 3.00 | 9.64 |
+| millis | 2.14 | 7.18 |
+| count | 0.38 | 2.19 |
+| monotonic (uptime) | 0.30 | 5.30 |
+| **scale-target mix** (8 host series at 2 s, 5 × 11 application series at 15 s) | **1.25** | **4.99** |
+
 ## Data flow
 
 ![Data flow: in the agent, one background collector reads the system and its cgroup off the runtime and publishes the snapshot that history, alerts, the routes and the push client read; the hub's poller reads the agent's /api/system over HTTP, the agent's push client sends MessagePack frames to the hub's push receiver, and both write the hub's live cache and SQLite store](images/data-flow.svg)
@@ -301,6 +343,7 @@ match those rules (listed under Open architectural questions below).
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`, `MAX_DISPLAY_BYTES`, `UptimeDisplay`, `LastSeen`, `StatusUpdate` / `after_snapshot`, `PollInterval`, `needs_system_info`, `SystemSource`, `PUSH_URL`, `polled_systems`); `presence.rs` (`PushPresence`, `ConnectionNumber`, `ConnectionLease`, `LeaseHandle`, `Ending`, `Sweep`, `OfflineReason`, `RECONNECT_GRACE`) | `db/mod.rs` `systems` table (`insert_system_if_absent` / `Registration`, `update_system_status` for the offline markings), `db/sources.rs` (`system_sources` / `SourceRow`, `reset_status`), `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll: `PolledAnswer` / `PolledInfo`, the parsed answer and the system info the registry fill reads; `PollFailure`; `MAX_SYSTEM_BODY`; `collector/capped_body.rs`: `read_capped`, `CappedBodyError`), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` (with `RegistryUnavailable` / `RegistryFailure`) / `Answer`, the handshake and idle deadlines, the oversize linger; `push/ingest.rs`: hub-side `PushPayload`, `SnapshotFrame` / `PushedInfo`, `SnapshotRefusal`, `register_and_accept`, `register_if_new`, `ingest_frame`, `update_registry`, `end_connection`; `push/connection.rs`: `ConnectionState` (a connection's decode budget, pace and counts), `Tally`, `Occurrence`, `warn_first`, `DecodeBudget`, `DECODE_BURST`); `snapshot_intake.rs` stores one snapshot for either mode (`store_snapshot`: the rule, the store, the live metrics entry); `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `log_refused_round`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits`, `PushConfig` (with `decode_refill`) and the production timings, `DECODE_REFILL` among them) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`AlertRecord`, `HubSummary`); `snapshot.rs` (`ReportedSnapshot`, `ReportedDisk`, `Snapshot`, `Scalar`, `MountPoint`, `SnapshotTime`, `LeftOut`, `snapshot_rule`, `MAX_DISKS`, `MAX_MOUNT_POINT_BYTES`, `LeftOutLog`, `left_out_log`, `snapshot_retention`, `LiveMetrics`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db/history.rs` `metrics` / `metric_retention` tables (`store_snapshot` / `SnapshotStored`, `store_round`, the pruning), `db/mod.rs` `alerts` table, `state.rs` (`live_metrics`, `evict_live_metrics`, `live_applications`, `summary`), `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`; `routes/sse.rs`: the publisher, `Summary`, `SummaryFailure`, and the wire DTOs `SummaryDto` / `LiveMetricsDto`) | stored time series, alert history, retention, each system's live metrics, and each system's shown scrape round |
+| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`) | none yet (RFC 0010 adds redb and block files) | how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
 
 Two pure modules belong to no context and have no domain term of their own:
 `token_bucket.rs` (`TokenBucket`, `Refill`, `Empty`), the bucket arithmetic both `SourcePace`
@@ -447,6 +490,16 @@ mixed-version fleet must keep working):
 | **round id** | identifies a scrape round: the **agent run** and a sequence counting the run's rounds from 1, never rewinding. The hub parses the run as a UUID and compares ids only for equality | `RoundId` (both crates), `RoundSequence` |
 | **health change** | an application becoming unreachable, or recovering; a change among reported healths (up to down) is not one. The agent logs each: `warn` naming the scrape failure, `info` on recovery | `HealthChange`, `health_change` |
 | **application restart** | any counter of an application going down, uptime included, between two scrapes. It resets every counter: the scrape that sees it becomes the new baseline and reports no rates | `ScrapeHistory::advance` |
+| **value kind** | how a metric's values are stored (RFC 0010 §3): percent, load, count, monotonic, bytes, rate or millis, each with a value scale, a domain range and an encoding. A series' kind is fixed at its first point | `ValueKind` (`hub-store`) |
+| **value scale** | the natural value one stored unit stands for (0.01 % for percent, 1 KiB for bytes); a value is stored as `round(v / scale)`, exact down to the scale | `ValueKind::scale`, `Scaled` |
+| **domain range** | the values a kind accepts, from 0 to its top (1,000 % for percent, 2⁶⁰ bytes for bytes); a value outside it, or not finite, is refused | `ValueKind::max_natural`, `OutOfDomain` |
+| **tier** | one resolution of a series' history: raw points, 1-minute rollups or 1-hour rollups | `Tier`, `RollupTier` |
+| **span** | the stretch of time a tier's chunks never cross: 1 h for raw and minute, 1 day for hour | `SpanStart`, `Tier::span_of` |
+| **chunk** | one series' encoded points (raw: at most 240 or 1 KiB) or buckets (a span's worth) in one tier, versioned by its format byte | `RawChunk`, `RollupChunk` |
+| **system key** | a system id's bytes as the store keys a series by them (1 to 255 bytes); not a new name for a system, only the system id in Fleet Storage's own type, which knows no other hub term | `SystemKey` (`hub-store`) |
+| **generation** | one registration of a system (RFC 0011): a system deleted and registered again gets a new generation, so its old series never mix with the new ones | `Generation` (`hub-store`) |
+| **hub time** | the one clock every metric point will be stamped with in the store, in whole seconds, which never runs backwards (RFC 0010 §2); spans and chunk timestamps are in hub time | `SpanStart`, `RawPoint::ts` |
+| **rollup** | one closed bucket of a series in a rollup tier: the average, minimum, maximum and count of its points | `Bucket`, `Accumulator` |
 
 ## Trust boundaries & auth
 

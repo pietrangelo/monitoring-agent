@@ -32,12 +32,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two independent crates, not a workspace: each runs the gate in its own directory.
+        # Two independent crates, not one workspace: each runs the gate in its own directory.
+        # The hub's directory is a workspace of its own (the hub and its store, RFC 0010 §1),
+        # gated with --workspace.
         include:
           - crate: system-agent
             dir: .
+            scope: ""
           - crate: system-hub
             dir: system-hub
+            scope: --workspace
     defaults:
       run:
         working-directory: ${{ matrix.dir }}
@@ -56,9 +60,9 @@ jobs:
       - run: cargo fmt --all -- --check
       # --locked: a manifest change that didn't commit its Cargo.lock fails here instead of
       # passing on versions the lockfile doesn't record.
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked
-      - run: cargo build --locked --release
+      - run: cargo clippy --locked ${{ matrix.scope }} --all-targets --all-features -- -D warnings
+      - run: cargo test --locked ${{ matrix.scope }}
+      - run: cargo build --locked ${{ matrix.scope }} --release
 
   hub-dashboard-xss:
     name: hub dashboard XSS smoke test
