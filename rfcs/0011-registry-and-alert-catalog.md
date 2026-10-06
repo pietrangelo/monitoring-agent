@@ -238,15 +238,16 @@ generation in `systems` and `tombstones`, as defence in depth.
   cursor after a restart. Its chunks in **block files** are dead at once (never read) and their
   bytes leave the disk only when the file is rewritten (its dead bytes reach 25%) or unlinked
   (its span passes the tier's longest effective retention: by default a day for raw, 14 days
-  for minute, 400 days for hour). This delay is the author's proposal, for the owner to decide
+  for minute, 400 days for hour). No file written after the delete holds its chunks: the
+  handoff and every rewrite skip tombstoned generations. This delay is the author's proposal, for the owner to decide
   (0010 Review). The README's "Remove system + all data" becomes "removes the system; its data
   is unreadable at once; recent data is removed from the store within about 10 minutes, older
   data when its storage block is rewritten or expires (up to the hour tier's retention), and
   `/api/storage` shows the bytes still waiting (freed pages may keep old bytes until reused, or
   until the file is compacted)".
 - A tombstone is dropped once the purge has finished for its generation, it is at least one
-  raw-retention period old, **and no block file's `blocks` row lists its generation** (0010 §5),
-  so a dead chunk is recognised as dead for as long as its bytes exist.
+  raw-retention period old, **and 0010's `block_generations` table names its generation in no
+  file** (0010 §5), so a dead chunk is recognised as dead for as long as its bytes exist.
 - Who may delete is 0012's decision: the admin token.
 
 ### 4. Sealed tokens and the key

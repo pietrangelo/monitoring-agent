@@ -58,6 +58,12 @@ The owner chose to keep the store *dedicated to the hub* (its codec, tiers, roll
 and catalog are ours) and to put its bytes in **redb**. Atomic, crash-safe transactions then
 come from redb, and this RFC only has to state what goes into each one.
 
+**Block files came back, smaller** (owner's decision, 2026-10-06). A measured spike (§1) showed
+that closed spans cost ≈ 1.7× their payload in redb and that the space retention frees there
+never returns to the volume. Closed spans now leave redb as immutable files, written once and
+deleted whole; everything a commit changes stays in redb, where the own engine had failed, and
+one redb transaction decides on which side of the handoff a span lives (§5, §6).
+
 **Decisions carried by this RFC:**
 
 | Question | Decision | By |
@@ -213,7 +219,12 @@ impl HubClock {
   one-shot: it acts only when its value equals the `last_issued` the store holds (shown in
   `/api/storage` and in the hourly `error`). At open it then, in one transaction: deletes
   every chunk whose span starts after the system clock (the misdated future) and the `blocks` rows
-  of such spans (their files unlinked after the commit, as retention does), discards open
+  of such spans (their files queued in `pending_unlinks` and unlinked after the commit, §5),
+  **brings back into `chunks` the handed-off span that holds the system clock**, in each tier
+  (it copies the file's chunks into `chunks`, deletes the row and queues the file in
+  `pending_unlinks`: at most one file per tier, ≈ 0.6 GB read at open at the scale target), so
+  the rules below act on it as on a span never handed off and its next handoff writes a new
+  file, never over the old one (§6), discards open
   chunks that start after it, resets `last_issued` to the system clock and every series' last
   timestamp to `min(last, system clock)`, applies `min(x, system clock)` to every other persisted hub
   time (0011's receipts' and `MailNewest`'s `received_at`, `last_seen_active`, the flushed
@@ -374,14 +385,15 @@ min    : avg − min, bit-packed unsigned        max : max − avg, bit-packed u
 count  : points in the bucket, varint
 ```
 
-No CRC of our own: redb checksums every page (§1).
+In `hub.redb`, redb's page checksums cover chunks (§1); in a block file, every chunk carries a
+CRC-32C of its own (§5).
 
 - The `10 + 3` timestamp step exists because hub-time stamping makes gaps jitter by a second or
   two. The `11110 + 32` value step keeps a large delta (a 512 MiB heap swing) at 37 bits.
-- **Why these chunk sizes.** A redb entry costs about 30 bytes, and a value over about a third of
-  a page takes a whole page (§1's measurement). Chunks of up to 1 KiB keep the space overhead
-  at about 1.2×, while spreading each entry's cost over many points (about 0.2 B per raw point,
-  0.75 B per minute bucket, 1.9 B per hour bucket).
+- **Why these chunk sizes.** While hot, a chunk is one redb entry (about 30 bytes of cost, and a
+  value over about a third of a page takes a whole page, §1); chunks of up to 1 KiB keep each
+  one a small entry. In a block file each chunk costs one 22-byte index entry, about 0.1 B per
+  raw point, 0.4 B per minute bucket and 0.9 B per hour bucket (§5's footprint).
 
 **Budgets per kind**, asserted by the size-budget test, from deterministic generators that
 model timestamps as well as values (host series every 2 s plus U(0, 0.3) s of jitter;
@@ -408,8 +420,10 @@ the test then asserts the measured value plus 10%.
 **Two places on disk**, both in `HUB_DATA_DIR`:
 - **`hub.redb`**, one redb file: the catalog and the **hot** part of the series, everything a
   commit changes;
-- **`blocks/<tier>/<span start>.blk`**: one **immutable block file** per closed span per tier,
-  written once (§6 *Span handoff*), read with `pread`, and deleted whole by retention.
+- **`blocks/<tier>/<span start>[.r<n>].blk`**: one **immutable block file** per closed span per
+  tier, written once (§6 *Span handoff*), read with `pread`, and deleted whole by retention.
+  Its name is derived from its row's typed key and rewrite number `n`, never stored as a
+  string.
 
 | Table | Key → value | Written by |
 |---|---|---|
@@ -419,7 +433,9 @@ the test then asserts the measured value plus 10%.
 | `points_log` | batch sequence `u64` → the points of one group commit (series id, timestamp, scaled value) | every group commit; truncated as tails are flushed |
 | `tails` | `(tier u8, SeriesId)` → the series' open chunk and accumulators, and its last timestamp | the rotating tail flush (§6) |
 | `chunks` | `(tier u8, span start u64, SeriesId, seq u16)` → a sealed chunk **of a span not yet handed off** | when a chunk seals; emptied for a span by its handoff (§6) |
-| `blocks` | `(tier u8, span start u64)` → `BlockRecord`: format, file name, length, chunk count, dead bytes | the handoff, a rewrite, retention |
+| `blocks` | `(tier u8, span start u64)` → `BlockRecord`: format, rewrite number `u32`, length, chunk count, tombstoned bytes | the handoff, a rewrite, retention, a tombstone |
+| `block_generations` | `(Generation, tier u8, span start u64)` → `()`: which files hold a generation's chunks | the handoff, a rewrite, a retirement |
+| `pending_unlinks` | `(tier u8, span start u64, rewrite u32)` → `()`: retired files not yet unlinked | a retirement, a rewrite's swap, the rewind; emptied after each unlink |
 | 0011's catalog tables | systems, alert records and their indexes, tombstones | catalog transactions |
 | `retention` | len-prefixed system key → override and pending shortening (store-owned: the store enforces it) | 0012's routes, through catalog transactions |
 
@@ -440,27 +456,34 @@ is written once and never changed, so its own protocol is short (§6).
 A chunk never crosses a span: a point in a new span seals the open chunk first. A minute chunk
 holds at most 60 buckets and an hour chunk 24 (§4), so a rollup tier has one chunk per series per
 span. The spans are shorter than the previous revision's (1 day and 30 days for the rollups) so
-the hot part stays small: at most two spans per tier are in redb at once, the open one and the
-one before it until its handoff.
+the hot part stays small: while handoffs succeed, at most two spans per tier are in redb at
+once, the open one and the one before it until its handoff; a failing handoff's backlog is
+bounded at three spans per tier (§6).
 
 **Block file format** (versioned by its format byte; `crc32c`, a small pure-Rust crate, is the
 one dependency it adds):
 
 ```text
 header : magic "HUBBLK" · format u8 · tier u8 · span start u64 · chunk count u32 · index offset u64
-data   : the span's sealed chunks, ordered by (SeriesId, seq)
-index  : per chunk (SeriesId u32, seq u16, offset u64, length u32, CRC-32C u32), sorted
-trailer: CRC-32C of header and index · magic
+data   : the span's live chunks, ordered by (SeriesId, seq)
+index  : per chunk (SeriesId u32, seq u16, offset u64, length u32, CRC-32C u32), sorted,
+         in index blocks of 1,024 entries
+summary: per index block (first SeriesId u32, offset u64, CRC-32C u32 of the index block)
+trailer: summary offset u64 · CRC-32C of header and summary · magic
 ```
 
 - Written by one sequential write, then never modified; read with `FileExt::read_exact_at`
   (no memory mapping, so no `unsafe`).
-- **Every chunk read is checked against its CRC.** A mismatch fails that span of that query with
-  `StoreError::Corrupt`, counted in `/api/storage` and logged at `error` once per file per hour;
-  it never fails the store. redb's checksums cover the hot part, CRC-32C covers block files
+- **A chunk's CRC-32C covers (tier, span start, `SeriesId`, seq) and its bytes**, so an index
+  entry with a flipped series id fails the check instead of serving another series' chunk.
+  **Every index block and every chunk read is checked against its CRC.** A mismatch fails that
+  span of that query with `StoreError::Corrupt`, counted in `/api/storage` and logged at `error`
+  once per file per hour; it never fails the store. redb's checksums cover the hot part, CRC-32C covers block files
   against bit rot; neither protects against someone who can write `HUB_DATA_DIR` (A08).
-- **In memory, each file keeps a sparse index**: the first `SeriesId` of every 1,024-entry index
-  block. A query reads one index block (≤ 22 KiB) and the chunks it names.
+- **In memory, each file keeps its summary** (the sparse index: 16 B per 1,024 chunks, about
+  1–2k entries per file), read and checked at open with the header; the full index is never
+  read at open. A query reads one index block (≤ 22 KiB), checks it, and reads the chunks it
+  names.
 
 **Footprint at the scale target with the defaults** (codec ceilings × 1.03 for block files, the
 spike's ≈ 1.7× for the hot part; step 1 replaces them with measured values):
@@ -519,38 +542,57 @@ pub struct PendingShortening { next: TierSetting, delay: Duration }
   measured 3 µs per entry), so ingestion commits keep flowing between them. It:
   1. computes `retention_now` (§2) and persists it;
   2. re-reads the volume size for the storage cap;
-  3. **unlinks the block files whose every chunk is dead** (below): it deletes the `blocks` row
-     in a transaction first, then the file, so a crash in between leaves only an orphan file,
-     removed at the next open (§6);
-  4. **rewrites at most one block file** (below);
-  5. purges deleted generations from the hot part: their chunks in `chunks`, their tails and
+  3. deletes the **dead chunks still in `chunks`** (a span not yet handed off, or held back by
+     a failing handoff, §6), in the bounded transactions;
+  4. **retires the block files whose every chunk is dead** (below): one transaction deletes the
+     file's `blocks` row and its `block_generations` entries and inserts it into
+     `pending_unlinks`; after that commit the block writer thread evicts and closes the file's
+     cached handle, unlinks the file and deletes the `pending_unlinks` entry. A crash in
+     between leaves the entry, and the open finishes the unlink (§6);
+  5. asks the block writer thread for **at most one rewrite** (below); the rewrite runs there,
+     and only its row swap goes through the writer;
+  6. purges deleted generations from the hot part: their chunks in `chunks`, their tails and
      their log entries, recording progress in `meta/purge/cursor` so a restart resumes it;
-  6. runs series GC: a series with no chunk left in `chunks` or in any live block file and no
-     tail is removed from `series` and `series_key`;
-  7. calls `on_retention_pass` (§9) at most 10 times, stopping at `Done`.
-- **Live and dead chunks.** A chunk of a block file is **dead** when its series' generation is
-  tombstoned (0011 §3), or its span ended before `retention_now` minus its system's effective
-  retention for that tier (the global policy, or the system's override). One pure function over
-  (span, series → system and generation, `Policies`, tombstones) decides it, and the `blocks`
-  row keeps each file's dead bytes. **Queries never return a dead chunk**, so what a policy has
-  expired or a delete has removed is unreadable at once, wherever its bytes still are.
-- **A file is unlinked when every chunk in it is dead**: with no overrides, when its span passes
+  7. runs series GC: a series with no chunk in `chunks`, no tail and, in each tier, no `blocks`
+     row for a span at or before the series' last span in that tier is removed from `series`
+     and `series_key`, so a file never holds a `SeriesId` the table can't map;
+  8. calls `on_retention_pass` (§9) at most 10 times, stopping at `Done`.
+- **Live and dead chunks.** A chunk, in `chunks` or in a block file, is **dead** when its series'
+  generation is tombstoned (0011 §3), when its `SeriesId` maps to no series (defence in depth),
+  or when its span ended before `retention_now` minus its system's effective retention for that
+  tier (the global policy, or the system's override). One pure function of the domain core,
+  `chunk_liveness(tier, span, series → (system, generation), &Policies, &Tombstones,
+  retention_now) -> Liveness`, decides it. **Queries never return a dead chunk**: a query reads
+  `Policies`, the tombstones and `meta/retention_clock` in the same redb read transaction as the
+  rows it reads (all three are persisted, so the snapshot is consistent and no lock is added,
+  §9). What a delete removed is unreadable at once. What a policy expired is unreadable while
+  that policy holds; lengthening a policy makes expired chunks still on disk readable again
+  (retention is a storage rule; erasure is a deletion's promise, below).
+- **Tombstoned bytes.** The `blocks` row keeps the bytes of tombstoned generations' chunks only:
+  computed by the block writer when it writes a file, and when a tombstone commits (one index
+  pass over each file that `block_generations` lists for the generation). Expiry by retention
+  is never stored; it follows from span and policy when needed.
+- **The handoff and every rewrite write only live chunks**, so a file never receives a chunk of
+  a generation already tombstoned, or one already expired.
+- **A file is retired when every chunk in it is dead**: with no overrides, when its span passes
   its tier's global retention, the whole span at once.
-- **Rewrite.** A file that still holds live chunks is rewritten without its dead ones (a new file
-  written as a handoff writes one, then one transaction that swaps the `blocks` row, then the old
-  file unlinked) when **(a)** its dead bytes reach 25% of its length, or **(b)** its span is past
-  the tier's global retention and only longer overrides keep it, so one system with `raw=30d`
-  keeps a small file of its own chunks, not every system's raw data for 30 days. At most one
-  rewrite per pass, the most overdue file first; a rewrite reads one file and writes less.
+- **Rewrite.** A file that still holds live chunks is rewritten without its dead ones (§6: a new
+  file under the next rewrite number, a row swap that queues the old file in `pending_unlinks`)
+  when **(a)** its tombstoned bytes reach 25% of its length, or **(b)** its span is past the
+  tier's global retention and only longer overrides keep it, so one system with `raw=30d` keeps a
+  small file of its own chunks, not every system's raw data for 30 days. At most one rewrite per
+  pass, the most overdue file first; a rewrite reads one file and writes less, on the block
+  writer thread.
 - **Erasure of deleted systems.** A deleted system's data is unreadable at once (0011). Its chunks
-  in redb, its tails and its log entries are removed within one retention pass, as before. In
-  block files, its chunks are dead and their bytes are removed **when the file is rewritten or
-  unlinked**: once dead bytes reach 25% of a file, and at the latest when the file's span passes
-  its tier's longest effective retention (by default a day for raw, 14 days for minute, 400 days
-  for hour). *This weakens the previous revision's "removed from the store within one pass"*
-  (author's proposal, for the owner to decide, Review); 0011 §3 and the README say so, and
-  `/api/storage` shows the dead bytes still on disk. 0011's tombstone of the generation is kept
-  until no block file holds its chunks.
+  in redb, its tails and its log entries are removed within one retention pass, as before, and
+  no file written after the delete holds its chunks. In the files written before it, its chunks
+  are dead and their bytes are removed **when the file is rewritten or retired**: once
+  tombstoned bytes reach 25% of a file, and at the latest when the file's span passes its tier's
+  longest effective retention (by default a day for raw, 14 days for minute, 400 days for hour).
+  *This weakens the previous revision's "removed from the store within one pass"* (author's
+  proposal, for the owner to decide, Review); 0011 §3 and the README say so, and `/api/storage`
+  shows the tombstoned bytes still on disk. 0011's tombstone of the generation is kept until
+  `block_generations` names it in no file.
 - **Compaction** applies to `hub.redb` only, now the hot part: a few GB at the scale target, so
   the pause is seconds. The hub compacts **at start, before serving**, only when asked
   (`HUB_STORE_COMPACT=1`, not one-shot: it compacts only when reclaimable space is over 1 GiB and
@@ -558,12 +600,15 @@ pub struct PendingShortening { next: TierSetting, delay: Duration }
   once a day when they pass that threshold.
 
 **Storage cap.** `HUB_STORAGE_LIMIT` bounds the bytes the store takes on disk: `hub.redb`'s
-length plus every block file's length. Block files are what grows, and deleting one frees its
-bytes at once, so the rule acts on the real total and stops as soon as it is met: while the total
-exceeds the cap, each pass unlinks the oldest raw block file, then the oldest minute block file,
-never an hour file, the hot part or a tail, logging each at `warn`. Between passes the total can
-exceed the cap by at most ten minutes of ingest. `hub.redb`'s length is bounded by the hot part
-(two spans per tier); it never drops while the hub runs, and the cap counts it as it is. Unset,
+length plus every block file's length. Block files are what grows, and retiring one frees its
+bytes once it is unlinked, right after the commit (its cached handle is closed first; a query
+still reading it holds the bytes until that query ends), so the rule acts on the real total and
+stops as soon as it is met: while the total exceeds the cap, each pass retires the oldest raw
+block file, then the oldest minute block file, never an hour file, the hot part or a tail,
+logging each at `warn`. Between passes the total can exceed the cap by at most ten minutes of
+ingest. `hub.redb`'s length is bounded by the hot part (two spans per tier, plus a handoff
+backlog of at most three, §6); it never drops while the hub runs, and the cap counts it as it
+is. Unset,
 the cap defaults to 80% of the size of the volume holding `HUB_DATA_DIR` (`statvfs`), re-read
 at every pass; `none` disables it. If the cap can't be met from raw and minute files, that's
 logged at `error` once per hour, and ingestion goes on. (This replaces the previous revision's
@@ -626,14 +671,22 @@ group commit.
 1. redb opens the file; with quick-repair on every commit, an unclean shutdown costs
    milliseconds (§1).
 2. Load `meta`, the in-memory Registry (0011), the tombstones and `Policies`.
-2a. **Reconcile the block files** with the `blocks` table: a `.tmp` file is deleted; a `.blk`
-   file with no row is deleted (its span's chunks are still in `chunks`: the crash came before
-   the handoff's commit); a row whose file is missing, or whose header and index fail their
-   CRC, refuses startup with an `error` naming the file, unless the one-shot
-   **`HUB_STORE_FORGET_BLOCK=<tier>/<span start>`** names it, in which case the row is deleted
-   and the span's history is lost, logged at `warn` (only external damage can cause it, and
-   silently dropping a span of history is worse than a stop). Then each file's sparse index is
-   loaded.
+2a. **Reconcile the block files** with the `blocks` table (every `.tmp` file was already deleted
+   before the floor check, §8):
+   - every file in `pending_unlinks` is unlinked if still present, and its entry deleted;
+   - a `.blk` file with no row is deleted only when that is provably safe: its span's chunks
+     are in `chunks` (a handoff that crashed before its commit), or a row for its span holds a
+     lower rewrite number (a rewrite that crashed before its swap). Any other row-less file
+     means `hub.redb` is older than `blocks/` (one restored without the other): the hub **refuses
+     to start**, naming the file, since deleting it would lose history the store no longer
+     knows. The operator restores both together (Impact, backups) or moves the file aside;
+   - a row whose file is missing, or whose header or summary fails its CRC, **opens with that
+     file unreadable**: every query of its span answers `StoreError::Corrupt`, counted in
+     `/api/storage` and logged at `error` once per file per hour, and retention and the cap
+     retire it as any other file. One flipped bit never stops the hub. The one-shot
+     **`HUB_STORE_FORGET_BLOCK=<tier>/<span start>`** deletes its row at open, logged at `warn`,
+     to clear the error before then.
+   Then each file's summary is loaded.
 3. Load `tails` into the head: each active series' open chunks, accumulators and last
    timestamp.
 4. Replay `points_log` in sequence order, applying each point only to a series whose last
@@ -651,25 +704,36 @@ atomic redb transaction. Between redb and the block files there is one ordering,
 **Span handoff.** A closed span moves from `chunks` to a block file once, by this protocol:
 1. A span S of tier T **closes** once hub time is past S's end plus the tier's grace: one bucket
    length (raw 60 s, minute 1 min, hour 1 h) plus one sweep interval, so the sweep has closed
-   every bucket in S. Hub time never runs backwards (§2), so no point can still land in S.
+   every bucket in S. Hub time never runs backwards while the hub runs (§2), so no point can
+   still land in S. The one exception, `HUB_CLOCK_REWIND`, runs at open before any handoff and
+   first brings the handed-off span holding the system clock back into `chunks` (§2).
 2. At its next commit the writer **seals every tail chunk still open in S** (quiet series), so all
    of S is in `chunks`, and S's chunks never change again.
 3. A **block writer thread** (not the writer: a raw file is ≈ 0.55 GB at the scale target, and
    writing it would stall commits) reads S's chunks in a redb read transaction taken after that
-   commit (MVCC), writes `blocks/T/S.blk.tmp` in one sequential write with mode 0600, `fsync`s
-   it, renames it to `S.blk`, and `fsync`s the directory.
-4. It then submits one catalog transaction: insert the `blocks` row and delete S's chunks from
-   `chunks`, in one commit. From that commit on, queries read S from the file.
+   commit (MVCC), writes S's **live** chunks (§5) to `blocks/T/S.blk.tmp` in one sequential write
+   with mode 0600, `fsync`s it, renames it to `S.blk` **without replacing**
+   (`renameat2(RENAME_NOREPLACE)` through `rustix`; where the filesystem lacks it, `link` then
+   `unlink` of the temporary, which also fails on an existing name), and `fsync`s the directory.
+   An existing name is a block-write failure (below), never overwritten.
+4. It then submits one catalog transaction: insert the `blocks` row and S's `block_generations`
+   entries and delete S's chunks from `chunks`, in one commit. From that commit on, queries read
+   S from the file.
 
 **The invariant:** a span's chunks are in exactly one of `chunks` or the file a `blocks` row
 names, and the file is durable before the row exists. A crash at any step leaves either the
 chunks in redb and at most an orphan file (deleted at open), or the row and its durable file.
-A span whose handoff didn't complete is handed off again after open. A **rewrite** (§5) uses the
-same steps with a new file name (`S.r<n>.blk`) and a row swap, the old file unlinked after the
-commit. **A failure writing a block file** (`ENOSPC`, `EIO` on the file) is not a fail-stop:
-redb is untouched, so the block writer deletes the temporary file, logs at `error` (at most
-hourly), counts it in `/api/storage`, and retries at the next pass; S stays in redb meanwhile,
-served from there, and the storage cap still counts it.
+A span whose handoff didn't complete is handed off again after open. A **rewrite** (§5) runs on
+the block writer thread with the same steps, under the next rewrite number (`S.r<n>.blk`), and a
+row swap that also replaces S's `block_generations` entries and queues the old file in
+`pending_unlinks`. **A failure writing a block file** (`ENOSPC`, `EIO` on the file, an existing
+name) is not a fail-stop at first: redb is untouched, so the block writer deletes the temporary
+file, logs at `error` (at most hourly), counts it in `/api/storage`, and retries at the next
+pass; S stays in redb meanwhile, served from there, expired by step 3 of the pass like any
+chunk, and counted by the storage cap. **The backlog is bounded**: when more than three spans of
+any tier are past their close and not handed off, the store **fails stop** with an error naming
+the block-write failure, since `hub.redb` would otherwise grow without bound and never shrink
+while the hub runs (§5); the next open retries. `/api/storage` shows the backlog per tier.
 
 **Failure handling.**
 - **A panic on the writer thread** leaves the in-memory head possibly ahead of what redb
@@ -718,13 +782,19 @@ second is lost), just not clean.
 | accumulators (`i128`), last timestamp, map and key | ~250 B | 160 MB | 250 MB |
 | redb page cache (`HUB_STORE_CACHE`) | — | 256 MB | 256 MB |
 | the point buffer of one commit interval (~1 MB at 76k points/s), and the writer channel | — | ~10 MB | ~10 MB |
-| block files: sparse indexes (≈ 760 files, ≈ 1k entries each) and an LRU of 256 open handles | — | ≈ 10 MB | ≈ 15 MB |
+| block files: summaries (≈ 760 files, ≈ 1–2k entries of 16 B each) and an LRU of 256 open handles | — | ≈ 10 MB | ≈ 15 MB |
 | **Total** | | **≈ 0.76 GB** | **≈ 1 GB** |
 
 Quiet interned series and every sealed chunk live on disk, not in memory: in redb until their
-span's handoff, in a block file after it. Open file handles are an LRU of 256, below the common
-1,024 descriptor limit; a query holds its file's handle while it reads, so a file unlinked by
-retention meanwhile stays readable to it (POSIX keeps an open file's data until the last close). Mail series follow the same rule as any other. A mail scan
+span's handoff, in a block file after it. Open file handles are an LRU of 256, keyed by file
+name (tier, span, rewrite number); retiring a file evicts and closes its handle before the
+unlink. A query holds its file's handle while it reads, so a file retired meanwhile stays
+readable to it (POSIX keeps an open file's data until the last close); a query over 400 days
+opens its files one at a time. **Descriptors:** the scale target's ≈ 10,000 push connections
+need a raised limit anyway, so the README and `docker-compose.yml` set `nofile` to 65,536, and
+the open logs at `warn` when `RLIMIT_NOFILE` is below 4,096 plus `HUB_MAX_PUSH_SYSTEMS`.
+`EMFILE` on a query's open is `StoreError::Io` for that query; on the block writer, a
+block-write failure (§6). Mail series follow the same rule as any other. A mail scan
 holds at most 256 decoded reports at once (each sealed report ≤ 512 KiB, RFC 0017): ≤ 128 MiB
 transient, typically a few MiB. At 100 systems the
 total is about 270 MB, almost all of it the page cache, which the README says can be lowered.
@@ -732,8 +802,10 @@ The performance test measures resident memory at the scale target, and it must l
 of this table, or the table is corrected.
 
 **Open time** at the scale target: loading the tails (≈ 630k × 0.6 KB ≈ 0.4 GB: the open chunks
-and accumulators of the table above) and replaying at most 15 minutes of `points_log` (≈ 70M
-points), both measured by the performance test. Target:
+and accumulators of the table above), replaying at most 15 minutes of `points_log` (≈ 70M
+points), and reading each block file's header and summary (≈ 760 files, ≤ 30 KB each, ≈ 25 MB;
+never the full indexes, which are checked one index block at a time as queries read them), all
+measured by the performance test. Target:
 under 30 s at the scale target, under 1 s at 100 systems.
 
 **Write volume** at the scale target, per day, before redb's copy-on-write amplification:
@@ -745,7 +817,7 @@ under 30 s at the scale target, under 1 s at 100 systems.
 | sealed chunks (raw, minute, hour), into redb | ~20 GB |
 | block files: each closed span written once, plus rewrites | ~20 GB |
 | deletions (page rewrites of retention and purge) | ~5 GB |
-| **Total** | **≈ 145 GB/day logical**, against ≈ 23 GB/day of new data kept |
+| **Total** | **≈ 145 GB/day logical**, against ≈ 19.5 GB/day of new data kept (§5) |
 
 Copy-on-write rewrites branch pages on each commit; the performance test measures physical
 writes and records them. §1's spike measured 36 to 59 B written per point, dominated by these
@@ -780,17 +852,26 @@ The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's,
 2. **compaction**, when `HUB_STORE_COMPACT=1` asks for it and `hub.redb` exists (§5), on the
    file opened for it alone: it runs **before** the floor check, since a data volume full of
    reclaimable `hub.redb` is the case it exists for;
-3. the **floor check** (§6): `statvfs` on `HUB_DATA_DIR`; below the floor the hub exits before
-   creating or opening anything else;
-4. create `HUB_DATA_DIR/hub.redb` if absent with mode 0600 (`OpenOptionsExt::mode`), and open
-   it through `Builder::create_file`, so redb's file never takes the umask's mode. **A new file
+3. **cleanup of a crash's leftovers**, also before the floor check, since a crash in the middle
+   of a raw handoff or rewrite can leave ≈ 0.55 GB that would otherwise hold the volume below the
+   floor: every `*.tmp` under `blocks/` is deleted (no row ever names one); then, when
+   `hub.redb` exists, it is opened (redb's file lock first: a second hub on the same directory
+   gets `DatabaseAlreadyOpen` and refuses to start, naming the file) and the block files are
+   reconciled (§6 step 2a). A redb open that fails for lack of space exits as the floor check
+   does;
+4. the **floor check** (§6): `statvfs` on `HUB_DATA_DIR`; below the floor the hub exits before
+   creating anything. The storage cap's retirements run at the first retention pass, after this
+   check: with the default cap the store is at most 80% of the volume, so a volume below the
+   floor is full of something else, which the store must not delete to make room (the owner's
+   no-degraded-mode decision, §6);
+5. when `hub.redb` is absent, create it with mode 0600 (`OpenOptionsExt::mode`) and open it
+   through `Builder::create_file`, so redb's file never takes the umask's mode. **A new file
    is created only when the system clock is past the binary's build date** (a compile-time
    constant); otherwise the hub exits naming the clock, so a host that boots before NTP (no
    real-time clock) can't create a retention clock decades in the past (§2). An existing file
-   keeps its persisted clocks. `blocks/` and its tier directories are created with mode 0700;
-5. redb's file lock: a second hub on the same directory gets `DatabaseAlreadyOpen` and refuses
-   to start, naming the file. Everything 0011 writes beside it (the generated key) happens after
-   this, so two hubs can't both generate a key.
+   keeps its persisted clocks. `blocks/` and its tier directories are created with mode 0700.
+   Everything 0011 writes beside the store (the generated key) happens after redb's lock is
+   held, so two hubs can't both generate a key.
 
 **Data-directory safety** (A05), with no `unsafe` (`rustix`'s safe `process` and `fs` APIs for
 `geteuid`, `getegid`, `getgroups` and `statvfs`), run first, so no file is created in a
@@ -807,6 +888,10 @@ directory that fails:
   unless it has the sticky bit (OpenSSH's `StrictModes` rule), except that the **immediate
   parent** may have the `fsGroup` shape above. A Kubernetes `emptyDir` (0777, no sticky bit) is
   refused as an ancestor, and the README shows the supported volume setups;
+- `blocks/` and its tier directories pass the same checks as `HUB_DATA_DIR` (not a symlink,
+  owned by the hub's euid, not group- or world-writable unless in the `fsGroup` shape), so
+  neither a link to another volume (where the cap's `statvfs` would measure the wrong one) nor a
+  writable directory is followed; block files are opened with `O_NOFOLLOW`;
 - `.gitignore` and `system-hub/.dockerignore` gain `system-hub-data/` and `*.key`.
 
 ### 9. Store API
@@ -873,7 +958,7 @@ pub struct Limit(u16);                       // 0 ..= 10,000; 0 returns nothing,
 
 pub struct AppendReport { at: u64, accepted: u16, rejected: Vec<(MetricName, Rejected)> }
 pub enum Rejected { NotAfterLast, SeriesCapReached, KindMismatch, OutOfDomain, InvalidName, SystemGone }
-pub enum StoreError { Closed, Failed, Io(IoKind), Corrupt(BlockRef) }   // Corrupt: a block chunk failed its CRC
+pub enum StoreError { Closed, Failed, Io(IoKind), Corrupt(BlockRef) }   // Corrupt: a block file missing, or a chunk or index block failed its CRC
 /// What `transact` answers when it doesn't return `T`: `f`'s abort (answered at once, nothing
 /// written), or the store's error.
 pub enum TransactError<A> { Aborted(Abort<A>), Store(StoreError) }
@@ -884,7 +969,13 @@ pub enum TransactError<A> { Aborted(Abort<A>), Store(StoreError) }
   only thread that touches the head, so there is no window between the catalog and the store.
 - **Queries** read committed chunks in a redb read transaction, and copy the series' unsealed
   points from the head under that series' shard lock (16 shards, taken only by the writer and
-  by queries, never nested), then merge. A query never waits for a commit.
+  by queries, never nested), then merge. A query never waits for a commit. The same read
+  transaction gives it the `blocks` rows, `Policies`, the tombstones and the retention clock
+  that filter dead chunks (§5), so no hub lock is added. A span in a block file is read through
+  the handle LRU after its row: a rewrite or a retirement can unlink the file in between, and
+  the open then fails with `ENOENT`; the query retries once in a fresh read transaction (which
+  sees the swapped row, or none), and a second `ENOENT` for a row it still sees is a missing
+  file (`Corrupt`).
 - **Lock order, in full** (with 0008 §3, 0011 and §10). The hub's locks, in their one order:
   **presence → Registry → `live_status` | `live_metrics` → admission → `live_applications` →
   head shard**. `live_status` and `live_metrics` are never nested in each other. Rules:
@@ -910,7 +1001,7 @@ pub enum TransactError<A> { Aborted(Abort<A>), Store(StoreError) }
   No test can show a lock order; review must.
 
 **`/api/storage`** is owned by this RFC. It answers `StoreStats` as JSON: bytes on disk per
-tier and in total (block files and `hub.redb`), block files per tier and their dead bytes,
+tier and in total (block files and `hub.redb`), block files per tier and their tombstoned bytes, the handoff backlog per tier, unreadable files,
 `hub.redb`'s length and reclaimable bytes, block-write failures and corrupt chunks, the cap and its source, the volume size
 and free space, the open-time floor; active and interned series and the caps; points per
 second, the commit interval, the last commit's duration; hub time, system time, `last_issued`,
@@ -1074,8 +1165,9 @@ tier names, and is an open read like the rest of the hub API.
     log, group commit, commit interval, writer thread, hub time, clock hold, clock rewind,
     retention clock, retention policy, override, tier setting (global or fixed), pending
     shortening, storage cap, the open-time floor, compaction, series cap, container
-    mount, last contact (hub time, for every source), hot part, block file, span handoff, live
-    and dead chunk, rewrite;
+    mount, last contact (hub time, for every source), hot part, block file, block summary, span
+    handoff, handoff backlog, live and dead chunk, tombstoned bytes, rewrite, retirement,
+    unreadable block file;
   - changed: **retention** (per tier, globally and per system; no longer per metric), **metric
     point** (stamped in hub time), **system status** (the typed `LiveStatus`), **last seen**
     (the last successful contact; for a mail system, when the hub accepted its newest report),
@@ -1098,7 +1190,9 @@ tier names, and is an open read like the rest of the hub API.
 - **Our own engine** (the first three drafts): a per-shard WAL, incremental checkpoints, head and
   head-index files, immutable block files, a recovery order, a clock file with pending steps,
   faults, suspension and resume. Three `rfc-adversary` passes each found data loss, duplication
-  or a history wipe in it (Review). Rejected by the owner for redb.
+  or a history wipe in it (Review). Rejected by the owner for redb. §5's block files keep only
+  the part of it that never changes after a commit, with redb's transaction ordering the
+  handoff.
 - **Other embedded engines.** `sled` (its own docs describe it as beta, and it keeps large
   in-memory structures), `fjall` (an LSM tree: good write amplification, but compaction runs
   in background threads we'd have to bound, and deletes are tombstones until compacted),
@@ -1115,7 +1209,7 @@ tier names, and is an open read like the rest of the hub API.
   it is where those drafts lost or duplicated data; redb keeps it.
 - **A block file per system, or per shard of systems.** Erasing a deleted system would rewrite
   only its own files, but at 10,000 systems × ≈ 760 spans that is millions of files, and small
-  fleets would get thousands of tiny ones. Rewriting a shared file at 25% dead bytes bounds the
+  fleets would get thousands of tiny ones. Rewriting a shared file at 25% tombstoned bytes bounds the
   waste instead.
 - **Series-first keys** (`(tier, series, span)`). Measured 1.8–2× space for random inserts.
 - **Keeping tails only in memory, flushing them at shutdown.** A crash would lose up to a span
@@ -1165,7 +1259,9 @@ tier names, and is an open read like the rest of the hub API.
   - atomic transactions with a stated content, and fail-stop on a writer panic or I/O error;
   - a per-system interned-series cap, so one system can't starve the rest.
 - **A05 Security Misconfiguration:** directory, ancestor, ownership, group and symlink checks
-  before any file is created; `hub.redb` and block files created 0600 in 0700 directories; redb's
+  before any file is created, on `HUB_DATA_DIR`, `blocks/` and its tier directories; block files
+  opened with `O_NOFOLLOW` and named from typed keys; `hub.redb` and block files created 0600 in
+  0700 directories; redb's
   file lock; fail-closed configuration; one-shot `HUB_CLOCK_REWIND` and `HUB_STORE_FORGET_BLOCK`;
   no new store created before the binary's build date; the data directory and key ignored by git and
   Docker.
@@ -1175,12 +1271,16 @@ tier names, and is an open read like the rest of the hub API.
 - **A07:** N/A here (0012).
 - **A08 Software & Data Integrity Failures:** redb's checksummed pages and atomic commits, with
   **2-phase commit** because agent-controlled data reaches the file (§1's cited attack on
-  1-phase commits); block files carry a CRC-32C per chunk and over header and index, so bit rot
-  fails one span of one query, never the store; our codec's and the block format's version bytes
+  1-phase commits); block files carry a CRC-32C per chunk (over its key and bytes), per index
+  block and over header and summary, so bit rot fails one span of one query, never the store: a
+  damaged or missing file opens unreadable; a block file is never renamed over an existing
+  one; our codec's and the block format's version bytes
   refuse an unknown version; decoders are total. Neither checksum resists someone who can write
   `HUB_DATA_DIR`, which the directory checks guard.
 - **A09 Logging & Monitoring Failures:** clock holds, rewinds, retention-clock lag, cap and
-  series-cap refusals, fail-stops and compaction hints are logged and
+  series-cap refusals, the cap's retirements, block-write failures and the handoff backlog,
+  corrupt and missing block files, `HUB_STORE_FORGET_BLOCK`, fail-stops and compaction hints are
+  logged and
   counted in `/api/storage`. No log line carries a token or a value.
 - **A10 SSRF:** N/A. The store makes no network requests.
 
@@ -1197,7 +1297,7 @@ tier names, and is an open read like the rest of the hub API.
 - **API5–API7:** N/A here.
 - **API8:** see A05.
 - **API9:** `/metrics` gains `resolution` and `until`; `/history` keeps `since`; the clamp and
-  the new `last_seen` are documented; `GET /api/storage` is new; nine variables go into the
+  the new `last_seen` are documented; `GET /api/storage` is new; §8's ten variables go into the
   README.
 - **API10:** values checked against their kind's domain at the edge. No agent-chosen time stamps a
   point: push and mail points alike are stamped at hub time; a mailed `created_at` only decides
@@ -1214,8 +1314,8 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   delta-of-delta for `Monotonic`; arbitrary bytes never panic nor allocate past a bound; an
   unknown format byte refused.
 - **Size budget**: seeded per-kind generators with timestamp models, each asserted against its
-  ceiling, and the weighted totals; plus the on-disk factor measured through redb's `stats()`
-  for a day of the mix.
+  ceiling, and the weighted totals; plus the on-disk factors for a day of the mix: the hot
+  part's through redb's `stats()`, block files' from their lengths.
 - **Value kinds and names**: every kind's scale, rounding and domain edges; non-finite values;
   `KindMismatch`; a 261- and a 262-byte metric name; a control character in a name
   (`InvalidName`), at the edge and in the store.
@@ -1261,26 +1361,46 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   - a child process killed at every step of a handoff (after the temporary write, after the
     rename, after the directory `fsync`, after the commit): at reopen, each span's chunks are in
     exactly one of `chunks` or a file, queries return every point once, and orphans and
-    temporary files are gone; the same for a rewrite;
+    temporary files are gone; the same for a rewrite, and for a retirement between its commit
+    and the unlink (the `pending_unlinks` entry finishes it);
+  - a row-less file that no rule explains (`hub.redb` from an older backup) refuses startup
+    naming it, and nothing is deleted;
+  - an orphan `.tmp` of 0.55 GB that holds free space below the floor is deleted before the
+    floor check, and the hub starts;
+  - the handoff never replaces a file: an existing `S.blk` makes it a block-write failure;
   - a quiet series' open tail in a closing span is sealed and handed off;
-  - a row whose file is missing, or whose index fails its CRC, refuses startup naming the file;
-    `HUB_STORE_FORGET_BLOCK` naming it drops that span and the store opens;
-  - a chunk whose bytes are flipped fails that span of the query with `Corrupt`, counted, while
-    other spans and other series answer;
+  - a row whose file is missing, or whose header or summary fails its CRC, opens with that span
+    unreadable (`Corrupt` per query, counted; other spans answer); `HUB_STORE_FORGET_BLOCK`
+    naming it deletes the row;
+  - a chunk whose bytes are flipped, an index block with a flipped byte, and an index entry whose
+    `SeriesId` is flipped to another existing series each fail that span of the query with
+    `Corrupt`, counted, and never serve another series' chunk, while other spans and other
+    series answer;
   - the format: header, index and trailer round-trip; an unknown format byte refuses the file;
     the sparse index finds the first and the last series and one absent;
-  - a query reading a file while retention unlinks it completes; 300 files under an LRU of 256
-    handles answer;
+  - a query reading a file while retention unlinks it completes; a query whose row is read
+    before a rewrite's swap or a retirement and whose open follows the unlink retries once and
+    answers from the new file, or nothing; 300 files under an LRU of 256 handles answer;
   - a block-write failure (an injected `ENOSPC` on the file) leaves the span in redb, served, and
-    retried at the next pass; the store keeps running.
-- **Retention on files**: a span past every system's retention is unlinked whole; a deleted
-  system's chunks are unreadable at once; a file whose dead bytes reach 25% is rewritten without
-  them, and one at 24% is not; a system with `raw=30d` past the global 24 h keeps a rewritten
-  file of its own chunks; one rewrite per pass; series GC keeps a series with chunks in a live
-  file; the tombstone is kept until no file holds its generation.
-- **Storage cap on files**: over the cap, the oldest raw then minute files are unlinked and the
-  total drops at once; deletes stop as soon as it is under; hour files are never unlinked by
-  the cap.
+    retried at the next pass; the store keeps running; failing for 2 days, the span's chunks in
+    `chunks` expire on time (pass step 3), and a fourth span in the backlog fails the store
+    stop;
+  - with `raw=1h`, a raw span already expired at its close is deleted from `chunks`, not handed
+    off;
+  - the open reads only headers and summaries: with synthetic files for 400 days of hour spans,
+    14 days of minute and 25 h of raw, open time stays within §7's target.
+- **Retention on files**: `chunk_liveness` as a table (live, expired at the boundary and one
+  second past, tombstoned, an unmapped `SeriesId`, an override longer and shorter); a span past
+  every system's retention is retired whole; a deleted system's chunks are unreadable at once;
+  a file whose tombstoned bytes reach 25% is rewritten without them, and one at 24% is not; a
+  handoff and a rewrite after a delete write none of its chunks; a system with `raw=30d` past
+  the global 24 h keeps a rewritten file of its own chunks; one rewrite per pass, on the block
+  writer thread; series GC keeps a series while a file at or before its last span exists; the
+  tombstone is kept until `block_generations` names it in no file; lengthening a policy makes
+  expired chunks still on disk readable again, and a delete's never.
+- **Storage cap on files**: over the cap, the oldest raw then minute files are retired, and
+  free space by `statvfs` rises once the cached handle is closed (the LRU holding it); deletes
+  stop as soon as the total is under; hour files are never retired by the cap.
 - **First open**: a system clock before the build date refuses to create `hub.redb`; an
   existing file opens whatever the clock.
 - **Retention**: global expiry exactly at each boundary; a longer and a shorter override; a
@@ -1339,7 +1459,10 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   only in the log and whose tail sat in the previous span keeps them, a +2-day fault leaves no bucket after the system clock in
   any tier's current span, the bucket straddling the clock is reopened, and **a `SIGKILL` right
   after the rewind, before any tail rotation, reopens with no point after the system clock**
-  (the log was emptied); a fault and rewind inside one hour give one hour bucket.
+  (the log was emptied); a fault and rewind inside one hour give one hour bucket; **a +2-day
+  fault with the spans holding the system clock already handed off, then the rewind**: those
+  spans are back in `chunks` and their files retired, the next handoff writes a new file and
+  replaces none, and the counts equal a recomputation from raw.
 - **Storage cap**: the `80%` default from an injected volume size, re-read when it grows;
   deletion order; the cap unmet; `none`.
 - **Compaction**: `HUB_STORE_COMPACT=1` compacts only above the threshold; the reclaimable
@@ -1364,7 +1487,8 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
 - **Performance** (an `#[ignore]`d test at the scale target, run and recorded in the change
   summary): ingest ≥ 100k points/s through the writer; a 24 h raw query of one series < 5 ms;
   the longest commit; open time; resident memory within 20% of §7; physical writes per day
-  extrapolated from an hour; footprint per tier after a simulated day.
+  extrapolated from an hour; footprint per tier after a simulated day; open time with 400 days
+  of synthetic block files.
 
 ## Impact on `docs/ARCHITECTURE.md`
 
@@ -1383,7 +1507,9 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   ARCHITECTURE § Trust boundaries (mail) and § Open questions say the same.
 - **Domain model**: the Fleet Storage context; Fleet History and Fleet Registry rows; the
   glossary per Domain impact.
-- **Trust boundaries**: the data directory (checks, modes, redb's lock).
+- **Trust boundaries**: the data directory, `blocks/` and its tier directories (checks, modes,
+  `O_NOFOLLOW`, redb's lock); block files trusted as far as redb's pages are (CRCs against bit
+  rot, not against a writer of `HUB_DATA_DIR`).
 - **Storage**: rewritten: `hub.redb` and its tables, the block files and their format, the span
   handoff and its reconciliation, live and dead chunks and rewrites, tiers and spans, the group
   commit and durability window, the points log and rotating tail flush, retention and the
@@ -1393,8 +1519,10 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
 - **Open questions**:
   - closes: retention inside `insert_metric`, non-pruned stale series, blocking SQLite calls on
     runtime workers, the per-frame cache refresh;
-  - adds: points aren't tamper-evident; no online backup API (a copy needs the hub stopped, or
-    redb's read-only open of a copy); freed pages keep old bytes until reused or compacted; a
+  - adds: points aren't tamper-evident; no online backup API (a copy takes `hub.redb` and
+    `blocks/` together with the hub stopped: the open refuses a `blocks/` newer than `hub.redb`);
+    a deleted system's chunks stay in block files until their rewrite or retirement (§5, the
+    owner's decision); freed pages keep old bytes until reused or compacted; a
     Docker `data-root` outside `/var/lib/docker` isn't recognised as container storage; the
     poller's fixed 30 s tick (0011).
 
@@ -1454,11 +1582,11 @@ of those passes to what holds now:
 | Finding (pass) | Verdict | Now |
 |---|---|---|
 | open chunks lived only in memory; restarts lost raw and rollup data (1) | CONFIRMED | **resolved**: tails flushed on rotation, the points log covers the gap, both in atomic commits (§6) |
-| recovery duplicated sealed chunks; span close left block and head both claiming a span; `fsync` order (1, 2, 3) | CONFIRMED | **moot**: no head files, blocks or checkpoints; a seal inserts the chunk and updates the tail in one redb transaction; replay skips points not after a series' last timestamp (§6) |
+| recovery duplicated sealed chunks; span close left block and head both claiming a span; `fsync` order (1, 2, 3) | CONFIRMED | **moot**: no head files, blocks or checkpoints; a seal inserts the chunk and updates the tail in one redb transaction; replay skips points not after a series' last timestamp (§6) *Reopened by the block-file amendment: block files and a span handoff exist again; its order and reconciliation are §6.* |
 | `HubClock = max(system, last)` wiped history on a forward step and stopped ingestion on a backward one (1) | CONFIRMED | **resolved differently**: hub time keeps that rule, but retention acts only on the guarded retention clock, which can't outrun real time by more than 2× nor pass the system clock (§2) |
 | catalog `fsync` per frame (1) | CONFIRMED | **resolved**: volatile status in memory, flushed on rotation; the registry written on configuration changes; `Batched` catalog work rides the group commit (§6, §10) |
-| deletion, `SystemGone` and lingering data (1) | CONFIRMED | **resolved**: `tombstone` in the delete transaction, effective at that commit on the writer thread; the purge removes the data within one pass (§5, §9) |
-| head memory, index cache and open time (1, 2, 3) | CONFIRMED | **resolved**: memory holds active series' open chunks only; closed chunks and quiet series live in redb; budgets restated (§7) |
+| deletion, `SystemGone` and lingering data (1) | CONFIRMED | **resolved**: `tombstone` in the delete transaction, effective at that commit on the writer thread; the purge removes the data within one pass (§5, §9) *Reopened by the block-file amendment: data in block files is erased at rewrite or retirement (§5, owner's decision pending).* |
+| head memory, index cache and open time (1, 2, 3) | CONFIRMED | **resolved**: memory holds active series' open chunks only; closed chunks and quiet series live in redb; budgets restated (§7) *Reopened by the block-file amendment: closed chunks live in block files; open reads summaries only (§5, §7).* |
 | one `head.chunks` shared by shards; multi-shard appends vs per-shard checkpoints (2) | CONFIRMED | **moot**: one writer thread, one transaction per commit |
 | span close replay dropped rollup contributions; late-stamped points (2) | CONFIRMED | **moot**: the writer stamps and applies in one order; a sweep at open re-closes past buckets identically (§5, §6) |
 | the retention guard tripped on normal steps; suspension not persisted; a fresh store started suspended (2) | CONFIRMED | **moot**: no suspension; the retention clock is persisted and needs no confirmation (§2) |
@@ -1473,15 +1601,15 @@ of those passes to what holds now:
 | tests couldn't fail on ordering attacks (2) | CONFIRMED | **moot** for our own ordering (redb's transactions); crash tests target our invariants: exactly-once, rollup recomputation, purge (Testing plan) |
 | a forward step not in a checkpoint vanished at restart and retention ran at the future time (3) | CONFIRMED | **moot**: the clock is committed with the points; retention can't follow a forward step faster than 2× real time (§2) |
 | §2 and §6 disagreed on the series table in checkpoints; the id counter (3) | CONFIRMED | **resolved**: the series table is two redb tables; the counter and the first point share a transaction (§2) |
-| the head index was neither checkpointed nor rebuilt (3) | CONFIRMED | **moot**: no head index; chunks are redb entries |
-| recovery re-sealed a closed span's state (3) | CONFIRMED | **moot**: no span-close protocol; a span boundary seals chunks within the writer's transaction |
+| the head index was neither checkpointed nor rebuilt (3) | CONFIRMED | **moot**: no head index; chunks are redb entries *Reopened by the block-file amendment: closed chunks are in block files with an index checked per block (§5).* |
+| recovery re-sealed a closed span's state (3) | CONFIRMED | **moot**: no span-close protocol; a span boundary seals chunks within the writer's transaction *Reopened by the block-file amendment: the span handoff is §6's protocol; the rewind brings a handed-off span back (§2).* |
 | a panic caught by the blocking pool left a torn shard (3) | CONFIRMED | **resolved**: store state changes only on the writer thread; its panic fails the store and the hub exits; redb repairs at the next start (§6) |
 | a clock fault had no way out that kept history; a persistent resume switch (3) | CONFIRMED | **resolved**: no fault state; `HUB_CLOCK_REWIND` is one-shot and echoes `last_issued` (§2, §8) |
 | counting only active series left the table unbounded (3) | CONFIRMED | **resolved**: a per-system interned cap (§2) |
 | the default cap counted only the store and couldn't free a shared volume (3) | CONFIRMED | **resolved**: the floor deletes whatever the cap says; the volume size re-read each pass (§5, §6) |
 | `last_seen` wasn't "last contact"; shutdown blanked it (3) | CONFIRMED | **resolved**: typed `LiveStatus`; shutdown touches nothing (§10) |
 | the mount rule dropped the Docker disk and every PV (3) | CONFIRMED | **resolved**: strictly-under rule; per-pod mounts dropped (author's revision), `globalmount` kept (§3) |
-| erasure "within 14 days" false for the hour span (3) | CONFIRMED | **resolved**: the purge removes a deleted system's data within one retention pass; freed-page bytes stated (§5) |
+| erasure "within 14 days" false for the hour span (3) | CONFIRMED | **resolved**: the purge removes a deleted system's data within one retention pass; freed-page bytes stated (§5) *Reopened by the block-file amendment: bytes in files written before a delete wait for rewrite or retirement (§5, owner's decision pending).* |
 | rollup ceilings impossible with the encoding; footprint understated (3) | CONFIRMED | **resolved**: ceilings from the encoding, redb's measured overhead and entry cost included; footprint restated at ≈ 200 GB (§4, §5) |
 | physical writes at small scale (3) | PLAUSIBLE | **resolved**: one group commit per interval, stated `fsync` rate, `HUB_COMMIT_INTERVAL` advice (§7) |
 | a pending shortening only in memory until a checkpoint (3) | PLAUSIBLE | **resolved**: written with its override; re-armed at every open (§5) |
@@ -1489,7 +1617,7 @@ of those passes to what holds now:
 | the compose volume hid `/app/static` (3) | CONFIRMED | **resolved**: the prerequisite shipped (`8a3a153`) |
 | `NotAfterLast` dropped snapshots of one honest connection (3) | PLAUSIBLE | **stated**, counted by cause (§2) |
 | after a resume, a later forward fault deleted everything (third pass on the split draft) | CONFIRMED | **moot**: no resume; the retention clock bound holds at all times (§2) |
-| the checkpoint was the only map from series id to key (same) | CONFIRMED | **moot**: the series table is in redb, in the same file as the chunks |
+| the checkpoint was the only map from series id to key (same) | CONFIRMED | **moot**: the series table is in redb, in the same file as the chunks *Reopened by the block-file amendment: series GC keeps a series while a file may hold it; an unmapped id is dead (§5).* |
 | the WAL had no rollover; tombstones never dropped (same) | CONFIRMED | **moot**: `points_log` entries are deleted in the commit that makes them unneeded |
 | the interned cap starved the fleet (same) | CONFIRMED | **resolved**: per-system interned cap; per-pod kubelet mounts dropped (§2, §3) |
 | a segment sealed after `ENOSPC` looked like corruption (same) | CONFIRMED | **moot**: no segments of our own |
@@ -1704,6 +1832,38 @@ amendment also carries the last verification's open findings:
 **Still open**, carried into the next `rfc-adversary` pass: whether the rotating tail flush plus
 the log meets the stated open time at the scale target (to be measured), and whether redb's
 copy-on-write amplification keeps the physical write volume near §7's logical figure.
+
+`rfc-adversary` on the block-file amendment (commit 6f8f84e). Every finding was acted on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the rewind put points into a handed-off span, and the next handoff renamed over its durable file | CONFIRMED | the rewind brings the span holding the system clock back into `chunks` and retires its file; renames never replace (`RENAME_NOREPLACE`, or `link`) (§2, §6) |
+| retention no longer expired chunks still in redb | CONFIRMED | liveness defined for every chunk; pass step 3 deletes dead chunks in `chunks`; the handoff writes live chunks only (§5) |
+| a damaged index stopped the whole hub | CONFIRMED | the file opens unreadable (`Corrupt` per query); `HUB_STORE_FORGET_BLOCK` only clears it (§6) |
+| the open read every full index (≈ 11 GB) | CONFIRMED | a per-file summary with a CRC per index block; the open reads headers and summaries only; 400-day open-time test (§5, §7, Testing) |
+| 0008's lock-free forget let an in-flight round resurrect | CONFIRMED | the ordinal is taken at `decide`, under the lock, and `Forgotten` carries one (0008 §3) |
+| the floor check ran before reconciliation | CONFIRMED | `.tmp` cleanup, the redb open and reconciliation precede the floor check; the cap's retirements don't (decision below) (§8) |
+| a query could race a rewrite or a retirement into `ENOENT` | CONFIRMED | one retry in a fresh read transaction; a second `ENOENT` is a missing file (§9) |
+| the LRU kept retired files allocated | CONFIRMED | the LRU is keyed by file name and a retirement closes the handle before the unlink; the cap test measures `statvfs` (§5, §7) |
+| a flipped `SeriesId` in an index served another series' chunk | CONFIRMED | the chunk CRC covers (tier, span, `SeriesId`, seq) and its bytes; index blocks have CRCs (§5) |
+| 0011's tombstone rule needed generations `BlockRecord` lacked; GC could unmap ids in files | CONFIRMED | `block_generations` table; GC keeps a series while a file may hold it; an unmapped id is dead (§5; 0011 §3) |
+| the handoff wrote tombstoned generations | CONFIRMED | handoff and rewrite write live chunks only (§5) |
+| a failing handoff let the hot part grow without bound | CONFIRMED | backlog bounded at three spans per tier, then fail-stop; shown in `/api/storage` (§6) |
+| stale all-redb text; reopened Review rows; missing test rows; incomplete Impact | CONFIRMED | rewritten in place; rows marked reopened; rows added; Impact extended |
+| reconciliation deleted any row-less file on a false premise; backups | PLAUSIBLE / CONFIRMED | deleted only when provably safe, otherwise refuse naming it; retirements go through `pending_unlinks`; backups take both together (§6, Impact) |
+| dead bytes stored but stale; lengthening a policy resurrects | PLAUSIBLE | **adopted**: only tombstoned bytes are stored; expiry derived at read; the resurrection stated (§5) |
+| rewrites on the writer thread | PLAUSIBLE | **adopted**: on the block writer; only the swap through the writer (§5, §6) |
+| queries need `Policies`, tombstones, the clock | PLAUSIBLE | **adopted**: read in the query's own redb transaction; no lock added (§5, §9) |
+| descriptor budget | PLAUSIBLE | **adopted**: `nofile` 65,536 in compose and README, a `warn` at open, `EMFILE` mapped (§7) |
+| `blocks/` outside the directory checks; stored file names | PLAUSIBLE (low) | **adopted**: same checks, `O_NOFOLLOW`, names from typed keys (§5, §8) |
+
+**Decided, not adopted:** the storage cap's retirements don't run before the floor check. With
+the default cap the store is at most 80% of the volume, so a volume below the floor is full of
+something else, and the owner ruled out deleting history to make room (§6, §8).
+
+Came closest and survived: crash windows inside the handoff itself (each leaves the chunks in
+redb plus an orphan, or the row plus a durable file, and MVCC serves an overlapping query from
+`chunks` until the commit).
 
 **Earlier passes, as written against the custom engine.** Section references in these tables
 point at that draft, not at this one; the redb rewrite above says what each finding is now.

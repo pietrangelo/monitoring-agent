@@ -192,11 +192,12 @@ adapter only feeds it.
     for one id can't spend the honest one's tokens), so `decide` and the record stay one step
     and two overlapping polls, or a poll and a push, can't both store one round (RFC 0009's
     guarantee, pinned by `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`).
-    *Record* returns an **ordinal** (an `AtomicU64` beside the admission's mutex in the same
-    entry, `fetch_add` per recorded round; atomic because a forget bumps it without the lock,
-    below), and `SystemApplications::shown` carries it: *show* replaces `shown` only with a
-    higher ordinal, so two overlapping polls whose *show* steps run out of order can't show the
-    older round. An **empty round** is recorded and shown like any other (0010 §10);
+    *Record* returns an **ordinal**, taken **at `decide`**, under the admission lock and before
+    `append` (an `AtomicU64` beside the admission's mutex in the same entry, `fetch_add` per
+    admitted round; atomic because a forget bumps it without the lock, below), and
+    `SystemApplications::shown` carries it: *show* replaces `shown` only with a higher ordinal,
+    so two overlapping polls whose *show* steps run out of order can't show the older round, and
+    a round whose `append` was still pending when a forget ran can't show over it. An **empty round** is recorded and shown like any other (0010 §10);
   - **show**, after the admission is released: the Registry read lock, the generation check, and
     **while still holding it** the `live_applications` write lock, to set `shown`; the Registry
     guard is held across the insert, so a delete's hook can't run between the check and the
@@ -212,7 +213,9 @@ adapter only feeds it.
   each task behind an `Arc<Mutex<_>>`; it creates no `live_applications` entry.
   `forget_shown_round` (a poll answered 404 or `null`) is recorded as an ordinal too: it bumps
   the entry's `AtomicU64` **without taking the admission lock**, which another task may hold
-  across `append`'s await on the writer, so a forget never waits on a store commit, and sets `shown` to `Forgotten { at }`, so a queued older *show* can't
+  across `append`'s await on the writer, so a forget never waits on a store commit, and sets
+  `shown` to `Forgotten { at, ordinal }` when its ordinal is higher than `shown`'s, so a queued
+  older *show*, or one whose ordinal was taken at `decide` before the forget, can't
   resurrect a round the agent said it no longer has; it creates nothing. The throttle is a value,
   `RefusalThrottle::note(id, now) -> HourlyWarning` with `prune(ids)`, table-tested on its own
   (log capture across spawned tasks is not testable), and `poll_every` owns it. A `LiveStatus` write for an id with no
@@ -438,7 +441,9 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     `overlapping_polls_of_one_system_share_one_pace` stays deterministic (its empty rounds are
     `Stored`, as today); two rounds whose *show* steps run in reverse order through the seam
     leave `shown` on the newer; an empty round is `Stored` and replaces `shown`; a forget
-    followed by a queued older *show* leaves `shown` forgotten; `RefusalThrottle` as a table
+    followed by a queued older *show* leaves `shown` forgotten; a forget that runs while a round's
+    `append` is pending (a seam inside `append`) leaves `shown` forgotten after that round's
+    *show*; `RefusalThrottle` as a table
     (first note warns, a second within the hour is quiet, at the hour warns, `prune` drops ids);
   - a delete through a seam **inside *show***, between the generation check and the insert: the
     delete's hook waits for the Registry guard, and no orphan entry exists afterwards;
@@ -684,6 +689,7 @@ Last verification (with 0010's and 0011's), the 0008 part:
 | Finding | Verdict | Resolution |
 |---|---|---|
 | a forget bumping the counter inside the admission waits on its lock, held across `append` | PLAUSIBLE (low) | the ordinal is an `AtomicU64` beside the mutex; a forget bumps it lock-free (§3) |
+| with a lock-free forget, a round recorded after its `append` took a higher ordinal and showed over the forget | CONFIRMED (0010's block-file pass) | the ordinal is taken at `decide`, before `append`; `Forgotten` carries its ordinal and both replace `shown` only upward; a test row (§3, Testing) |
 
 **Still open**: nothing CONFIRMED.
 
