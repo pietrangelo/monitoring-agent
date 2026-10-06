@@ -75,7 +75,8 @@ one redb transaction decides on which side of the handoff a span lives (§5, §6
 | History | tiered downsampling: raw points, 1-minute rollups, 1-hour rollups | owner |
 | Sequencing | RFC 0009 ships first on SQLite | owner |
 | Precision | a declared resolution per metric kind (values stored as scaled integers) | owner |
-| Default tiers | raw 24 h, 1-minute 14 days, 1-hour 400 days | owner |
+| Default tiers | raw 24 h, 1-minute 14 days, 1-hour **30 days** (so by default nothing is kept longer than 30 days; a longer hour tier is set through `HUB_RETENTION` or a system's override) | owner (30 days: 2026-10-06) |
+| Erasure of a deleted system | unreadable at once; removed from `hub.redb` within one retention pass; in block files written before the delete, removed when the file is rewritten or retired, at the latest at the tier's longest effective retention (30 days with the defaults) | owner (2026-10-06) |
 | Storage cap | on by default: 80% of the data volume's size, re-read at every retention pass; `HUB_STORAGE_LIMIT=none` disables it. *Behaviour change.* | owner |
 | Container mounts | dropped by the hub's snapshot → points rule. *Behaviour change.* | owner |
 | The static-files fix | ships first, as its own change | owner |
@@ -451,7 +452,7 @@ is written once and never changed, so its own protocol is short (§6).
 |---|---|---|---|
 | `Raw` | every accepted point | 1 h | 24 h |
 | `Minute` | 1-minute rollups | 1 h | 14 days |
-| `Hour` | 1-hour rollups | 1 day | 400 days |
+| `Hour` | 1-hour rollups | 1 day | 30 days |
 
 A chunk never crosses a span: a point in a new span seals the open chunk first. A minute chunk
 holds at most 60 buckets and an hour chunk 24 (§4), so a rollup tier has one chunk per series per
@@ -492,11 +493,11 @@ spike's ≈ 1.7× for the hot part; step 1 replaces them with measured values):
 |---|---|---|---|
 | Raw (6.6 B points × 1.8 B × 1.03, plus ≈ 0.1 B of index) | ≈ 12.9 GB | 24 h + 1 h | ≈ 13 GB |
 | Minute (630k series × 1,440 × (6.5 B × 1.03 + 0.4 B)) | ≈ 6.4 GB | 14 d + 1 h | ≈ 90 GB |
-| Hour (630k × 24 × (6.5 B × 1.03 + 0.9 B)) | ≈ 0.12 GB | 400 d + 1 d | ≈ 46 GB |
+| Hour (630k × 24 × (6.5 B × 1.03 + 0.9 B)) | ≈ 0.12 GB | 30 d + 1 d | ≈ 4 GB |
 | `hub.redb`: two hot spans per tier at ≈ 1.7×, tails, points log, series table, catalog | | | ≈ 6 GB |
-| **Total** | **≈ 19.5 GB of new data a day** | | **≈ 155 GB**, against ≈ 250 GB with every closed span in redb at the measured 1.7×, and ≈ 330 GB for *one day* of raw rows in SQLite |
+| **Total** | **≈ 19.5 GB of new data a day** | | **≈ 113 GB**, against ≈ 180 GB with every closed span in redb at the measured 1.7×, and ≈ 330 GB for *one day* of raw rows in SQLite |
 
-At 100 systems (and their applications) the same policy needs about 1.5 GB. The minute tier
+At 100 systems (and their applications) the same policy needs about 1.1 GB. The minute tier
 still dominates, and an operator short of disk shortens `minute=` first.
 
 - **Rollups are computed at ingest.** Each series has two accumulators (current minute and hour:
@@ -588,9 +589,9 @@ pub struct PendingShortening { next: TierSetting, delay: Duration }
   no file written after the delete holds its chunks. In the files written before it, its chunks
   are dead and their bytes are removed **when the file is rewritten or retired**: once
   tombstoned bytes reach 25% of a file, and at the latest when the file's span passes its tier's
-  longest effective retention (by default a day for raw, 14 days for minute, 400 days for hour).
-  *This weakens the previous revision's "removed from the store within one pass"* (author's
-  proposal, for the owner to decide, Review); 0011 §3 and the README say so, and `/api/storage`
+  longest effective retention (by default a day for raw, 14 days for minute, 30 days for hour,
+  so 30 days at most unless a policy or an override is longer). *This weakens the previous
+  revision's "removed from the store within one pass"* (owner's decision, 2026-10-06); 0011 §3 and the README say so, and `/api/storage`
   shows the tombstoned bytes still on disk. 0011's tombstone of the generation is kept until
   `block_generations` names it in no file.
 - **Compaction** applies to `hub.redb` only, now the hot part: a few GB at the scale target, so
@@ -782,7 +783,7 @@ second is lost), just not clean.
 | accumulators (`i128`), last timestamp, map and key | ~250 B | 160 MB | 250 MB |
 | redb page cache (`HUB_STORE_CACHE`) | — | 256 MB | 256 MB |
 | the point buffer of one commit interval (~1 MB at 76k points/s), and the writer channel | — | ~10 MB | ~10 MB |
-| block files: summaries (≈ 760 files, ≈ 1–2k entries of 16 B each) and an LRU of 256 open handles | — | ≈ 10 MB | ≈ 15 MB |
+| block files: summaries (≈ 390 files with the defaults, ≈ 1–2k entries of 16 B each) and an LRU of 256 open handles | — | ≈ 10 MB | ≈ 15 MB |
 | **Total** | | **≈ 0.76 GB** | **≈ 1 GB** |
 
 Quiet interned series and every sealed chunk live on disk, not in memory: in redb until their
@@ -803,7 +804,7 @@ of this table, or the table is corrected.
 
 **Open time** at the scale target: loading the tails (≈ 630k × 0.6 KB ≈ 0.4 GB: the open chunks
 and accumulators of the table above), replaying at most 15 minutes of `points_log` (≈ 70M
-points), and reading each block file's header and summary (≈ 760 files, ≤ 30 KB each, ≈ 25 MB;
+points), and reading each block file's header and summary (≈ 390 files with the defaults, ≤ 30 KB each, ≈ 15 MB;
 never the full indexes, which are checked one index block at a time as queries read them), all
 measured by the performance test. Target:
 under 30 s at the scale target, under 1 s at 100 systems.
@@ -834,7 +835,7 @@ variable, never the value:
 | Variable | Meaning | Default |
 |---|---|---|
 | `HUB_DATA_DIR` | the hub's data directory | `./system-hub-data` (inside the image's `/app` volume) |
-| `HUB_RETENTION` | global policy, e.g. `raw=24h,minute=14d,hour=400d`; omitted tiers keep their default (`events=` is 0011's) | the defaults above |
+| `HUB_RETENTION` | global policy, e.g. `raw=24h,minute=14d,hour=90d`; omitted tiers keep their default (`events=` is 0011's) | the defaults above |
 | `HUB_STORAGE_LIMIT` | cap on the bytes the store takes on disk (`hub.redb` plus block files): bytes with `k`/`M`/`G`/`T` suffixes (powers of 1024), a percentage of the volume (`80%`), or `none` | `80%` |
 | `HUB_MAX_SERIES` | active series in total | 1,000,000 |
 | `HUB_MAX_SERIES_PER_SYSTEM` | active series per system; interned series per system are ten times this | 1,500 |
@@ -1208,7 +1209,7 @@ tier names, and is an open read like the rest of the hub API.
   had). It would cut write wear (the spike's 36–59 B per point are the hot part's commits), but
   it is where those drafts lost or duplicated data; redb keeps it.
 - **A block file per system, or per shard of systems.** Erasing a deleted system would rewrite
-  only its own files, but at 10,000 systems × ≈ 760 spans that is millions of files, and small
+  only its own files, but at 10,000 systems × ≈ 390 spans that is millions of files, and small
   fleets would get thousands of tiny ones. Rewriting a shared file at 25% tombstoned bytes bounds the
   waste instead.
 - **Series-first keys** (`(tier, series, span)`). Measured 1.8–2× space for random inserts.
@@ -1387,7 +1388,7 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
     stop;
   - with `raw=1h`, a raw span already expired at its close is deleted from `chunks`, not handed
     off;
-  - the open reads only headers and summaries: with synthetic files for 400 days of hour spans,
+  - the open reads only headers and summaries: with synthetic files for 400 days of hour spans (an override past the 30-day default),
     14 days of minute and 25 h of raw, open time stays within §7's target.
 - **Retention on files**: `chunk_liveness` as a table (live, expired at the boundary and one
   second past, tombstoned, an unmapped `SeriesId`, an override longer and shorter); a span past
@@ -1823,10 +1824,10 @@ amendment also carries the last verification's open findings:
 | closed spans in block files: format, CRC per chunk, sparse index, `pread`, LRU of handles | §5, §7 |
 | the span handoff (durable file before its row), reconciliation at open, `HUB_STORE_FORGET_BLOCK` | §6, §8 |
 | retention by file: dead chunks filtered at read, files unlinked when all dead, rewritten at 25% dead or when only longer overrides keep them | §5 |
-| erasure of deleted systems in files delayed to their file's rewrite or expiry (author's proposal, for the owner) | §5, Security; 0011 §3 |
+| erasure of deleted systems in files delayed to their file's rewrite or expiry (confirmed by the owner, 2026-10-06, with the hour tier's default lowered to 30 days, which bounds the delay at 30 days by default) | §5, Security; 0011 §3 |
 | spans: minute 1 h, hour 1 day, so the hot part is at most two spans per tier | §5 |
 | the storage cap on the real bytes on disk; `SLACK` and `HUB_STORAGE_SLACK` removed | §5, §8 |
-| footprint ≈ 155 GB at the scale target (≈ 250 GB at the measured 1.7× in redb) | §5 |
+| footprint ≈ 155 GB at the scale target (≈ 250 GB at the measured 1.7× in redb); ≈ 113 GB after the owner lowered the hour tier's default to 30 days (2026-10-06) | §5 |
 | from the last verification: no new store before the build date; the hook's cap stated by the store; `newest_of_scan` in §10; "15 s" corrected; compaction errors reported as themselves | §8, §9, §10, Testing |
 
 **Still open**, carried into the next `rfc-adversary` pass: whether the rotating tail flush plus
