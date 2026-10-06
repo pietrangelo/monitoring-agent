@@ -233,13 +233,20 @@ generation in `systems` and `tombstones`, as defence in depth.
     agent first.
   - **A mail system re-registers with its agent's next new report** (RFC 0017 §6), within one
     mail interval; stop its agent's mail first to remove it for good.
-- **Physical removal** (0010 §5): the retention pass purges a deleted generation's chunks,
-  tails and log entries within one pass (10 minutes), resuming from its cursor after a restart.
-  The README's "Remove system + all data" becomes "removes the system; its data is unreadable
-  at once and removed from the store within about 10 minutes (freed pages may keep old bytes
-  until reused, or until the file is compacted)".
-- A tombstone is dropped once the purge has finished for its generation **and** it is at least
-  one raw-retention period old.
+- **Physical removal** (0010 §5): the retention pass purges a deleted generation's chunks in
+  `hub.redb`, its tails and its log entries within one pass (10 minutes), resuming from its
+  cursor after a restart. Its chunks in **block files** are dead at once (never read) and their
+  bytes leave the disk only when the file is rewritten (its dead bytes reach 25%) or unlinked
+  (its span passes the tier's longest effective retention: by default a day for raw, 14 days
+  for minute, 400 days for hour). This delay is the author's proposal, for the owner to decide
+  (0010 Review). The README's "Remove system + all data" becomes "removes the system; its data
+  is unreadable at once; recent data is removed from the store within about 10 minutes, older
+  data when its storage block is rewritten or expires (up to the hour tier's retention), and
+  `/api/storage` shows the bytes still waiting (freed pages may keep old bytes until reused, or
+  until the file is compacted)".
+- A tombstone is dropped once the purge has finished for its generation, it is at least one
+  raw-retention period old, **and no block file's `blocks` row lists its generation** (0010 §5),
+  so a dead chunk is recognised as dead for as long as its bytes exist.
 - Who may delete is 0012's decision: the admin token.
 
 ### 4. Sealed tokens and the key
@@ -642,7 +649,7 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
     +1 year system clock step makes no cap victim; after a forward fault, a prune, the
     correction and a rewind, a current report is accepted;
   - the prune keeps each system's newest current receipt
-    (`db/mail.rs::the_prune_keeps_the_newest_current_receipt`, ported);
+    (`db/mail.rs::the_prune_keeps_the_newest_current_receipt`, ported and released, below);
   - two `Newest` reports of one system in one scan, in both orders, and with equal `created_at`
     across two runs: points, metrics, info, round and `mail_newest` all come from the one
     `newest_of_scan` choice; a non-current choice writes `mail_newest` and the status but no
@@ -653,7 +660,8 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   - the ported tests of `db/mail.rs`, `mail_intake/ingest.rs`, `mail_intake/overdue.rs` and
     `mail_intake/scan.rs` keep their meaning, except these, each released under the
     test-contract guard with `--authority user` when implemented (the owner's decisions of
-    2026-10-03), and quoted in the change summary:
+    2026-10-03), and quoted in the change summary; a ported file that changes as a whole is
+    released as `<file>::*`, each with its authority named:
     - *newest snapshot only, at hub time*: `db/mail.rs::a_first_report_registers_its_system_and_stores_everything`,
       `mail_intake/ingest.rs::a_first_report_registers_and_stores_its_system`,
       `db/mail.rs::a_backfill_report_adds_points_but_leaves_the_status`,
@@ -669,9 +677,11 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
       but its `last_seen == CREATED + 60` assertion becomes `received_at`, so it is released
       too);
     - *no SQL, retired by generation*: `overdue.rs::a_mail_row_with_no_receipt_is_overdue_once`
-      (its row can't be re-created by hand; its `last_error` assertion is kept by the row above)
-      and `db/mail.rs::deleting_a_system_retires_its_receipts` (its `retired` column assertion
-      becomes "the entry is present with a generation other than the system's"; the rest holds);
+      (its row can't be re-created by hand; its `last_error` assertion is kept by the row above),
+      `db/mail.rs::the_prune_keeps_the_newest_current_receipt` (its SQL fixture rows become
+      catalog entries; what it keeps holds), and `db/mail.rs::deleting_a_system_retires_its_receipts` (its `retired` column assertion
+      becomes "the entry is present after the delete, with `systems/<key>` absent; after the
+      re-registration its generation differs from the new system's"; the rest holds);
     - *fail-stop instead of rollback*: `db/mail.rs::a_failure_partway_leaves_nothing_and_a_retry_stores_once`
       and `db/mail.rs::a_delete_that_fails_partway_deletes_nothing` (a SQLite trigger with no
       redb equivalent).
@@ -681,7 +691,9 @@ struct MailNewest { receipt: ReceiptKey, created_at: u64, received_at: u64, inte
   poll is in flight (its writes refused or ignored); delete removes the retention override and
   pending shortening and decrements the push counter; delete then re-register (new generation,
   empty history); delete an online push system (it re-registers, empty); the tombstone kept until
-  the purge finished and one raw-retention period passed.
+  the purge finished, one raw-retention period passed and no block file holds its generation
+  (a block file of the deleted generation still on disk keeps it; its rewrite or unlink drops
+  it at the next pass).
 - **Sealed tokens and the key**: seal and open; a wrong key; a token copied to another system, to
   a new generation, or kept while the URL is changed directly in the file, fails to open; **a
   token `PUT` then a URL `PUT` in one group commit**: the new token opens under the new URL; key

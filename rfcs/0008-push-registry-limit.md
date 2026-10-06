@@ -192,8 +192,9 @@ adapter only feeds it.
     for one id can't spend the honest one's tokens), so `decide` and the record stay one step
     and two overlapping polls, or a poll and a push, can't both store one round (RFC 0009's
     guarantee, pinned by `round_intake.rs::overlapping_polls_of_one_system_share_one_pace`).
-    *Record* returns an **ordinal** (a counter in the admission, incremented per recorded
-    round), and `SystemApplications::shown` carries it: *show* replaces `shown` only with a
+    *Record* returns an **ordinal** (an `AtomicU64` beside the admission's mutex in the same
+    entry, `fetch_add` per recorded round; atomic because a forget bumps it without the lock,
+    below), and `SystemApplications::shown` carries it: *show* replaces `shown` only with a
     higher ordinal, so two overlapping polls whose *show* steps run out of order can't show the
     older round. An **empty round** is recorded and shown like any other (0010 §10);
   - **show**, after the admission is released: the Registry read lock, the generation check, and
@@ -210,7 +211,8 @@ adapter only feeds it.
   tick's `polled_systems` (so it is bounded by the registry and drops deleted ids) and handed to
   each task behind an `Arc<Mutex<_>>`; it creates no `live_applications` entry.
   `forget_shown_round` (a poll answered 404 or `null`) is recorded as an ordinal too: it bumps
-  the admission's counter and sets `shown` to `Forgotten { at }`, so a queued older *show* can't
+  the entry's `AtomicU64` **without taking the admission lock**, which another task may hold
+  across `append`'s await on the writer, so a forget never waits on a store commit, and sets `shown` to `Forgotten { at }`, so a queued older *show* can't
   resurrect a round the agent said it no longer has; it creates nothing. The throttle is a value,
   `RefusalThrottle::note(id, now) -> HourlyWarning` with `prune(ids)`, table-tested on its own
   (log capture across spawned tasks is not testable), and `poll_every` owns it. A `LiveStatus` write for an id with no
@@ -676,6 +678,12 @@ Came closest and survived: the at-once `AlreadyRegistered` (only the id's own un
 | a forget by id had no ordinal, so a queued older *show* could resurrect a round | PLAUSIBLE (low) | a forget bumps the ordinal and sets `Forgotten { at }` (§3) |
 | the throttle's row asserted log lines across spawned tasks | PLAUSIBLE (low) | `RefusalThrottle` as a value, table-tested (§3, Testing) |
 | two fixture tests in `HEAD` change with the generation and the pace's move | noted | listed as author releases (Testing) |
+
+Last verification (with 0010's and 0011's), the 0008 part:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| a forget bumping the counter inside the admission waits on its lock, held across `append` | PLAUSIBLE (low) | the ordinal is an `AtomicU64` beside the mutex; a forget bumps it lock-free (§3) |
 
 **Still open**: nothing CONFIRMED.
 
