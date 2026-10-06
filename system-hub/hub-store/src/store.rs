@@ -17,7 +17,9 @@
 //! The store's API (RFC 0010 §9): appends and queries of series, catalog transactions run on
 //! the writer thread inside its group commit, the commit hook, close.
 
+mod blocks;
 mod catalog;
+mod handoff;
 mod head;
 mod ingest;
 mod open;
@@ -67,6 +69,8 @@ pub struct StoreOptions {
     pub tail_rotation: Duration,
     /// redb's page cache (`HUB_STORE_CACHE`).
     pub cache_bytes: usize,
+    /// How often the sweep closes quiet buckets and closed spans are handed off (§5, §6).
+    pub sweep_interval: Duration,
     pub clock: Arc<dyn SystemClock>,
 }
 
@@ -77,6 +81,7 @@ impl StoreOptions {
             commit_interval: Duration::from_secs(1),
             tail_rotation: Duration::from_secs(15 * 60),
             cache_bytes: 256 << 20,
+            sweep_interval: Duration::from_secs(crate::tier::SWEEP_SECS),
             clock,
         }
     }
@@ -188,6 +193,9 @@ pub enum OpenError {
     Format(u64),
     /// The file holds bytes this version can't read.
     Corrupt(String),
+    /// A block file no `blocks` row names and no rule explains (§6 step 2a): `hub.redb` is
+    /// older than `blocks/`. Its path.
+    UnexplainedBlock(String),
 }
 
 impl std::fmt::Display for OpenError {
@@ -199,6 +207,11 @@ impl std::fmt::Display for OpenError {
                 "the store is of format {v}, which this version doesn't read"
             ),
             OpenError::Corrupt(e) => write!(f, "the store is corrupt: {e}"),
+            OpenError::UnexplainedBlock(path) => write!(
+                f,
+                "{path} is a block file the store doesn't know: hub.redb is older than \
+                 blocks/ (restore both together, or move the file aside)"
+            ),
         }
     }
 }
@@ -272,6 +285,75 @@ pub struct Series {
     pub samples: Samples,
 }
 
+/// What the store reports of itself (RFC 0010 §9's `StoreStats`, the block-file part).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    block_files: [u64; 3],
+    handoff_failures: u64,
+    last_failures: [Option<HandoffFailure>; 3],
+}
+
+impl StoreStats {
+    /// The tier's block files: one per `blocks` row committed.
+    pub fn block_files(&self, tier: Tier) -> u64 {
+        self.block_files[usize::from(tier.code())]
+    }
+
+    /// Handoffs that failed since the open (each is retried at the next sweep).
+    pub fn handoff_failures(&self) -> u64 {
+        self.handoff_failures
+    }
+
+    /// Why the tier's last failed handoff failed, if one did since the open.
+    pub fn last_handoff_failure(&self, tier: Tier) -> Option<HandoffFailure> {
+        self.last_failures[usize::from(tier.code())]
+    }
+}
+
+/// Why a span's handoff failed (RFC 0010 §6): the span stays in redb and is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffFailure {
+    /// Its chunks couldn't be read from redb.
+    Read,
+    /// Its chunks couldn't be encoded into a file (a defect: they come in key order).
+    Encode,
+    /// Writing, syncing or linking the file failed, with this I/O error.
+    Write(std::io::ErrorKind),
+    /// A file of that name already exists: it is never replaced.
+    Exists,
+}
+
+/// Why the store failed stop, when it was the store's own decision rather than a panic or a
+/// failed commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailCause {
+    /// More than three spans of a tier waited on failing handoffs; the last one failed so.
+    HandoffBacklog { tier: Tier, last: HandoffFailure },
+}
+
+impl std::fmt::Display for HandoffFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandoffFailure::Read => f.write_str("its chunks couldn't be read"),
+            HandoffFailure::Encode => f.write_str("its chunks couldn't be encoded"),
+            HandoffFailure::Write(kind) => write!(f, "writing its file failed: {kind}"),
+            HandoffFailure::Exists => f.write_str("a file of its name already exists"),
+        }
+    }
+}
+
+impl std::fmt::Display for FailCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FailCause::HandoffBacklog { tier, last } => write!(
+                f,
+                "more than three {} spans wait on failing handoffs; the last failed because {last}",
+                tier.name()
+            ),
+        }
+    }
+}
+
 /// The hook the writer calls after each commit, in commit order, on the writer thread. It must
 /// not call back into the store (`append`, `transact`, `close` would wait on the writer that
 /// is running it): it updates in-memory state, or hands the changes to another thread.
@@ -284,7 +366,10 @@ pub(crate) type SharedHook<C> = Arc<dyn Fn(&[C]) + Send + Sync>;
 pub(crate) struct Shared<C> {
     pub db: Database,
     pub head: Head,
+    pub blocks: blocks::Blocks,
     pub failed: AtomicBool,
+    /// Why the store failed stop, when it decided to.
+    pub fail_cause: Mutex<Option<FailCause>>,
     pub hook: Mutex<Option<SharedHook<C>>>,
 }
 
@@ -299,11 +384,13 @@ impl<C> Shared<C> {
     }
 }
 
-/// The store: one redb file, one writer thread.
+/// The store: one redb file and its block files; one writer thread, one block writer.
 pub struct Store<C: Send + 'static> {
     shared: Arc<Shared<C>>,
     requests: SyncSender<Request<C>>,
-    writer: Mutex<Option<JoinHandle<()>>>,
+    /// The writer, then the block writer: joined in that order, since the block writer ends
+    /// when the writer drops its queue.
+    threads: Mutex<Vec<JoinHandle<()>>>,
     closed: AtomicBool,
 }
 
@@ -313,18 +400,31 @@ const REQUEST_QUEUE: usize = 1_024;
 impl<C: Send + 'static> Store<C> {
     /// Opens (or creates) `hub.redb` in `data_dir`, re-derives memory and starts the writer.
     pub fn open(data_dir: &Path, options: StoreOptions) -> Result<Store<C>, OpenError> {
-        let (shared, writer) = open::open(data_dir, options)?;
+        let (shared, mut writer) = open::open(data_dir, options)?;
+        let thread = |e: std::io::Error| OpenError::Database(e.to_string());
         let (requests, inbox) = mpsc::sync_channel(REQUEST_QUEUE);
+        let (jobs, block_writer) =
+            handoff::spawn(Arc::clone(&shared), requests.clone()).map_err(thread)?;
+        writer.connect(jobs);
         let handle = std::thread::Builder::new()
             .name("hub-store-writer".into())
             .spawn(move || writer.run(inbox))
-            .map_err(|e| OpenError::Database(e.to_string()))?;
+            .map_err(thread)?;
         Ok(Store {
             shared,
             requests,
-            writer: Mutex::new(Some(handle)),
+            threads: Mutex::new(vec![handle, block_writer]),
             closed: AtomicBool::new(false),
         })
+    }
+
+    /// Joins the writer, then the block writer.
+    fn join(&self) {
+        let threads =
+            std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
+        for handle in threads {
+            let _ = handle.join();
+        }
     }
 
     fn check(&self) -> Result<(), StoreError> {
@@ -369,6 +469,22 @@ impl<C: Send + 'static> Store<C> {
         query::run(&self.shared, series, query)
     }
 
+    /// What the store reports of itself.
+    pub fn stats(&self) -> Result<StoreStats, StoreError> {
+        self.check()?;
+        Ok(self.shared.blocks.stats())
+    }
+
+    /// Why the store failed stop, when it decided to (readable after the failure, for the hub
+    /// to log); `None` while it runs, or after a panic or a failed commit.
+    pub fn fail_cause(&self) -> Option<FailCause> {
+        *self
+            .shared
+            .fail_cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Runs `f` inside the writer's transaction.
     pub fn transact<T, A, F>(&self, class: Commit, f: F) -> Result<T, TransactError<A>>
     where
@@ -411,31 +527,18 @@ impl<C: Send + 'static> Store<C> {
         }
         let flushed = self.ask(|reply| Request::Close { reply });
         self.closed.store(true, Ordering::SeqCst);
-        if let Some(handle) = self
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            let _ = handle.join();
-        }
+        self.join();
         flushed?
     }
 }
 
 impl<C: Send + 'static> Drop for Store<C> {
     /// A store dropped without `close` commits nothing more: what the last group commit holds
-    /// is what reopens, as after a crash.
+    /// is what reopens, as after a crash (a file the block writer was writing has no row, and
+    /// the next open deletes it by rule (a)).
     fn drop(&mut self) {
         let _ = self.requests.send(Request::Abandon);
         // The writer holds the database: once joined, the file is free for the next open.
-        if let Some(handle) = self
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            let _ = handle.join();
-        }
+        self.join();
     }
 }

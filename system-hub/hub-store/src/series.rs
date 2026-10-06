@@ -31,6 +31,13 @@ impl SeriesId {
     pub fn get(self) -> u32 {
         self.0
     }
+
+    /// The id a table or a block file holds, as stored: for tests that build block-file
+    /// fixtures. The store gives ids itself; nothing outside it should forge one.
+    #[doc(hidden)]
+    pub fn from_raw(id: u32) -> SeriesId {
+        SeriesId(id)
+    }
 }
 
 /// What a series is: whose, which registration, and which metric.

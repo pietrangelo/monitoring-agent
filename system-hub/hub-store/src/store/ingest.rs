@@ -205,12 +205,14 @@ impl<C> Core<C> {
         Ok(Ok(()))
     }
 
-    /// Closes the buckets of quiet series (RFC 0010 §5's sweep).
+    /// Closes the buckets of quiet series (RFC 0010 §5's sweep), then seals every open chunk of
+    /// a closed span, so the span is whole in `chunks` before its handoff (§6 step 2).
     pub(super) fn sweep(&mut self, hub_now: u64) {
         let shared = Arc::clone(&self.shared);
         shared.head.each_shard(|shard| {
             for entry in shard.values_mut() {
-                let sealed = entry.state.sweep(hub_now);
+                let mut sealed = entry.state.sweep(hub_now);
+                sealed.extend(entry.state.seal_closed(hub_now));
                 if !sealed.is_empty() {
                     self.keep_sealed(entry, sealed);
                 }

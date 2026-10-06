@@ -21,13 +21,16 @@
 
 use std::collections::BTreeMap;
 
-use redb::{ReadTransaction, ReadableDatabase};
+use redb::{ReadOnlyTable, ReadTransaction, ReadableDatabase};
 
+use super::blocks::Blocks;
 use super::{CorruptChunk, Order, Query, Samples, Series, Shared, StoreError};
+use crate::block::name::BlockName;
+use crate::block::record::BlockRecord;
 use crate::codec::{Bucket, RawPoint, decode_raw, decode_rollup};
 use crate::series::{SeriesId, SeriesKey, SeriesRecord};
 use crate::state::Sealed;
-use crate::tables::{CHUNKS, SERIES, SERIES_KEY};
+use crate::tables::{BLOCKS, CHUNKS, SERIES, SERIES_KEY};
 use crate::tier::{RollupTier, SpanStart, Tier};
 use crate::value::ValueKind;
 
@@ -60,7 +63,7 @@ pub(super) fn run<C>(
             None => return Ok(None),
         },
     };
-    let mut chunks = read_chunks(&read, &view, q)?;
+    let mut chunks = read_chunks(&shared.blocks, &read, &view, q)?;
     for chunk in view.pending.iter().filter(|c| c.tier == q.tier) {
         chunks
             .entry((chunk.span.get(), chunk.seq))
@@ -121,9 +124,12 @@ fn committed(
     Ok(Some((SeriesId(id), record)))
 }
 
-/// The committed chunks of the series in the query's spans, by (span, seq). No live chunk is
-/// older than the tier's longest retention before the series' last span.
+/// The committed chunks of the series in the query's spans, by (span, seq): from the span's
+/// block file when the read transaction holds its `blocks` row (the handoff deleted its chunks
+/// from `chunks` in that same commit), from `chunks` otherwise. No live chunk is older than the
+/// tier's longest retention before the series' last span.
 fn read_chunks(
+    blocks: &Blocks,
     read: &ReadTransaction,
     view: &HeadView,
     q: &Query,
@@ -138,17 +144,63 @@ fn read_chunks(
         .saturating_sub(tier.max_retention_secs())
         .max(tier.span_of(q.from).get());
     let last = last.get().min(tier.span_of(q.until).get());
-    let table = read.open_table(CHUNKS).map_err(|_| StoreError::Io)?;
+    let (chunks, rows) = (
+        read.open_table(CHUNKS).map_err(io)?,
+        read.open_table(BLOCKS).map_err(io)?,
+    );
     let mut span = first;
     while span <= last {
-        let range = (tier.code(), span, view.id.0, 0)..=(tier.code(), span, view.id.0, u16::MAX);
-        for entry in table.range(range).map_err(|_| StoreError::Io)? {
-            let (k, v) = entry.map_err(|_| StoreError::Io)?;
-            out.insert((span, k.value().3), v.value().to_vec());
-        }
+        let held = match rows.get((tier.code(), span)).map_err(io)? {
+            Some(row) => from_file(blocks, tier, span, row.value(), view.id)?,
+            None => from_chunks(&chunks, tier, span, view.id)?,
+        };
+        out.extend(held.into_iter().map(|(seq, bytes)| ((span, seq), bytes)));
         span += tier.span_secs();
     }
     Ok(out)
+}
+
+/// A series' chunks of a span in its block file, as its `blocks` row names it. A row that
+/// doesn't decode, or a span off its grid, is a corrupt span.
+fn from_file(
+    blocks: &Blocks,
+    tier: Tier,
+    span: u64,
+    row: &[u8],
+    id: SeriesId,
+) -> Result<Vec<(u16, Vec<u8>)>, StoreError> {
+    let corrupt = StoreError::Corrupt(CorruptChunk { tier, span });
+    let record = BlockRecord::from_bytes(row).map_err(|_| corrupt)?;
+    let span = SpanStart::new(tier, span).ok_or(corrupt)?;
+    let name = BlockName {
+        tier,
+        span,
+        rewrite: record.rewrite,
+    };
+    blocks.series_chunks(name, id)
+}
+
+/// A series' chunks of a span still in `chunks`.
+fn from_chunks(
+    chunks: &ReadOnlyTable<(u8, u64, u32, u16), &[u8]>,
+    tier: Tier,
+    span: u64,
+    id: SeriesId,
+) -> Result<Vec<(u16, Vec<u8>)>, StoreError> {
+    let range = (tier.code(), span, id.0, 0)..=(tier.code(), span, id.0, u16::MAX);
+    chunks
+        .range(range)
+        .map_err(io)?
+        .map(|entry| {
+            let (k, v) = entry.map_err(io)?;
+            Ok((k.value().3, v.value().to_vec()))
+        })
+        .collect()
+}
+
+/// A redb error on a read, whichever its type.
+fn io<E>(_: E) -> StoreError {
+    StoreError::Io
 }
 
 fn decode_all(

@@ -16,8 +16,9 @@
 
 //! Block files (RFC 0010 §5, §6): each closed span of a tier, once handed off out of redb,
 //! lives in one immutable file. Its format, its name, its `blocks` row and the reconciliation
-//! of files with rows at open are pure; reading and writing files is the store's.
+//! of files with rows at open are pure; `file` reads and writes the files themselves.
 
+pub(crate) mod file;
 pub mod format;
 pub mod name;
 pub mod reconcile;

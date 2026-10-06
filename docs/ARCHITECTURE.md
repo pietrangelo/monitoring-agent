@@ -305,9 +305,11 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
   spans on their grid, chunks decodable, values in the domain, buckets consistent, and the
   fields against each other: every point and bucket in its chunk's span and none after the
   series' last time).
-- `block.rs` and `block/`: the pure side of **block files**, where each closed span of a tier
-  will live once handed off out of redb (RFC 0010 §5, §6; the handoff, the reads and the open's
-  file handling are the next step). `block/format.rs`: the file format (`encode_block`,
+- `block.rs` and `block/`: **block files**, where each closed span of a tier lives once handed
+  off out of redb (RFC 0010 §5, §6). `block/file.rs` is their I/O: `blocks/<tier>/`, created
+  mode 0700; a file written to its `.tmp`, synced, then hard-linked to its name (which fails
+  rather than replace an existing file) and the directory synced; reads by offset of the
+  ranges the format names. The rest is pure. `block/format.rs`: the file format (`encode_block`,
   `BlockSummary`): a header (`HUBBLK`, format, tier, span, chunk count, index offset), the
   span's chunks ordered by (series id, seq), an index of 22-byte entries in index blocks of
   1,024, a summary of one entry per index block (first series, offset, CRC-32C), and a trailer
@@ -345,16 +347,30 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
     by elapsed time (every series' tail once per rotation, 15 minutes by default), the catalog
     writes, the deletion of log entries older than the last completed rotation's start, and
     the clock. After it, the commit hook gets the interval's changes, in commit order.
+  - **The span handoff** (`store/handoff.rs`): each sweep (every 60 s by default,
+    `StoreOptions::sweep_interval`) closes quiet buckets and seals every open chunk of a closed
+    span; the spans with chunks in `chunks` that are closed (past their end plus one bucket and
+    one sweep) become due and, after the commit holding those seals, go to the **block writer
+    thread**. It reads the span in a read transaction, writes its file and sends the outcome
+    back; the writer inserts the `blocks` row and deletes the span's chunks in the next group
+    commit, so a span is in exactly one of `chunks` or a file. A failed write leaves the span in
+    redb, served from there and retried at the next sweep; more than three spans of one tier
+    waiting on failures fail the store stop. `store/blocks.rs` keeps, per committed row, the
+    file's summary (or that it is unreadable) and the handoff counts behind `Store::stats`.
   - **The head** (`store/head.rs`): active series in 16 shards behind leaf locks; only the
     writer changes it. **Queries** (`store/query.rs`) read committed chunks in a redb read
-    transaction and copy the series' uncommitted chunks and unsealed points from its shard,
-    checking every value against the series' kind; an unsealed point at or before the last
-    committed one was sealed meanwhile and is read once. A commit hook must not call back
-    into the store.
-  - **Recovery** (`store/open.rs`): redb's own repair, then the head from the tails, then the
-    points log replayed in order, each point applied only to a series whose last point is
-    earlier, then a sweep. A panic on the writer thread, an I/O error on commit or a refusal
-    after a write fails the store stop: every later call answers `Failed`.
+    transaction (a span with a `blocks` row from its file: the series' index blocks and
+    chunks, each checked against its CRC, a failure answering `Corrupt` for that span only)
+    and copy the series' uncommitted chunks and unsealed points from its shard, checking every
+    value against the series' kind; an unsealed point at or before the last committed one was
+    sealed meanwhile and is read once. A commit hook must not call back into the store.
+  - **Recovery** (`store/open.rs`): the block directories created and every `.tmp` deleted,
+    redb's own repair, then the head from the tails, then the block files reconciled with
+    the rows (`block/reconcile.rs`'s plan over the tails and the persisted clock; a row whose
+    file is missing or whose header or summary fails opens unreadable), then the points log
+    replayed in order, each point applied only to a series whose last point is earlier, then a
+    sweep. The open itself hands nothing off. A panic on the writer thread, an I/O error on
+    commit or a refusal after a write fails the store stop: every later call answers `Failed`.
 
 Measured encoded sizes (`hub-store/tests/size_budget.rs`, seeded generators over a day of
 points; the test asserts these plus 10%):
@@ -406,7 +422,7 @@ match those rules (listed under Open architectural questions below).
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`, `MAX_DISPLAY_BYTES`, `UptimeDisplay`, `LastSeen`, `StatusUpdate` / `after_snapshot`, `PollInterval`, `needs_system_info`, `SystemSource`, `PUSH_URL`, `polled_systems`); `presence.rs` (`PushPresence`, `ConnectionNumber`, `ConnectionLease`, `LeaseHandle`, `Ending`, `Sweep`, `OfflineReason`, `RECONNECT_GRACE`) | `db/mod.rs` `systems` table (`insert_system_if_absent` / `Registration`, `update_system_status` for the offline markings), `db/sources.rs` (`system_sources` / `SourceRow`, `reset_status`), `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll: `PolledAnswer` / `PolledInfo`, the parsed answer and the system info the registry fill reads; `PollFailure`; `MAX_SYSTEM_BODY`; `collector/capped_body.rs`: `read_capped`, `CappedBodyError`), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` (with `RegistryUnavailable` / `RegistryFailure`) / `Answer`, the handshake and idle deadlines, the oversize linger; `push/ingest.rs`: hub-side `PushPayload`, `SnapshotFrame` / `PushedInfo`, `SnapshotRefusal`, `register_and_accept`, `register_if_new`, `ingest_frame`, `update_registry`, `end_connection`; `push/connection.rs`: `ConnectionState` (a connection's decode budget, pace and counts), `Tally`, `Occurrence`, `warn_first`, `DecodeBudget`, `DECODE_BURST`); `snapshot_intake.rs` stores one snapshot for either mode (`store_snapshot`: the rule, the store, the live metrics entry); `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `log_refused_round`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits`, `PushConfig` (with `decode_refill`) and the production timings, `DECODE_REFILL` among them) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`AlertRecord`, `HubSummary`); `snapshot.rs` (`ReportedSnapshot`, `ReportedDisk`, `Snapshot`, `Scalar`, `MountPoint`, `SnapshotTime`, `LeftOut`, `snapshot_rule`, `MAX_DISKS`, `MAX_MOUNT_POINT_BYTES`, `LeftOutLog`, `left_out_log`, `snapshot_retention`, `LiveMetrics`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db/history.rs` `metrics` / `metric_retention` tables (`store_snapshot` / `SnapshotStored`, `store_round`, the pruning), `db/mod.rs` `alerts` table, `state.rs` (`live_metrics`, `evict_live_metrics`, `live_applications`, `summary`), `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`; `routes/sse.rs`: the publisher, `Summary`, `SummaryFailure`, and the wire DTOs `SummaryDto` / `LiveMetricsDto`) | stored time series, alert history, retention, each system's live metrics, and each system's shown scrape round |
-| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `block/` (`encode_block`, `BlockSummary`, `BlockName`, `BlockRecord`, `reconcile`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
+| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `block/` (`encode_block`, `BlockSummary`, `BlockName`, `BlockRecord`, `reconcile`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery; the span handoff and the block writer thread); `block/file.rs` (block-file I/O); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
 
 Two pure modules belong to no context and have no domain term of their own:
 `token_bucket.rs` (`TokenBucket`, `Refill`, `Empty`), the bucket arithmetic both `SourcePace`
@@ -568,6 +584,9 @@ mixed-version fleet must keep working):
 | **seal** | closing a series' open chunk (full, or a point or bucket in a new span, or its span closing) into a **sealed chunk** of its span, at the span's next seq, committed with the next group commit | `Sealed`, `SeriesState::seal_span` |
 | **closed span** | a span whose tier's grace has passed in hub time (its end plus one bucket and one sweep interval): no point or bucket can land in it any more, so its open chunks are sealed and it can be handed off | `SpanStart::is_closed`, `SeriesState::seal_closed` |
 | **block file** | the immutable file holding one closed span of one tier once handed off out of redb, with its index, summary and CRC-32C checks; named by its span and **rewrite number** (0 for the handoff's file, then 1, 2, … for each rewrite) | `encode_block`, `BlockSummary`, `BlockName`, `Rewrite` |
+| **span handoff** | moving a closed span out of `chunks` into its block file: the file written durably by the **block writer** thread, then its `blocks` row inserted and the span's chunks deleted in one commit | `store::handoff`, `Handoffs` |
+| **handoff backlog** | the spans of a tier waiting on failed handoffs; more than three fail the store stop, naming the tier and the last failure's cause | `Handoffs::choose`, `Backlog`, `FailCause::HandoffBacklog`, `HandoffFailure` |
+| **unreadable block file** | a row whose file is missing, or whose header or summary fails its check: the open keeps going, and every query of that span answers `Corrupt` | `StoreError::Corrupt` |
 | **reconciliation** | the open's pass over the block files against the `blocks` rows: finishing pending unlinks, deleting only provably redundant row-less files, refusing the open on any other, and marking rows whose file is missing as unreadable | `block::reconcile` |
 | **rotating tail flush** | the commit's writing of a slice of the series' tails, sized by elapsed time, so every tail is rewritten once per rotation (15 minutes by default) however many commits run | `Rotation` |
 | **commit interval** | the time between group commits (1 s by default, `HUB_COMMIT_INTERVAL`): the durability window, the most a crash can lose | `StoreOptions::commit_interval` |

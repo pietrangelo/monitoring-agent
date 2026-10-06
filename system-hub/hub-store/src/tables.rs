@@ -36,6 +36,12 @@ pub(crate) const TAILS: TableDefinition<(u8, u32), &[u8]> = TableDefinition::new
 pub(crate) const CHUNKS: TableDefinition<(u8, u64, u32, u16), &[u8]> =
     TableDefinition::new("chunks");
 
+/// (tier, span start) → the span's `BlockRecord`: its chunks are in that block file.
+pub(crate) const BLOCKS: TableDefinition<(u8, u64), &[u8]> = TableDefinition::new("blocks");
+/// (tier, span start, rewrite) → (): block files no row names any more, not yet unlinked.
+pub(crate) const PENDING_UNLINKS: TableDefinition<(u8, u64, u32), ()> =
+    TableDefinition::new("pending_unlinks");
+
 /// The format of the store: refused at open when it differs.
 pub(crate) const META_FORMAT: &str = "format";
 /// The next `SeriesId` to give.

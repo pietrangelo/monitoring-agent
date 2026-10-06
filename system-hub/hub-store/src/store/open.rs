@@ -25,15 +25,19 @@ use std::sync::{Arc, Mutex};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, WriteTransaction};
 
+use super::blocks::{Blocks, reconcile_at_open};
+use super::handoff::Handoffs;
 use super::head::HeadEntry;
 use super::writer::{Core, Writer};
 use super::{Head, OpenError, Shared, StoreOptions};
+use crate::block::file::BlockDir;
 use crate::clock::{HubClock, first_retention_clock};
 use crate::series::{SeriesId, SeriesRecord};
 use crate::state::SeriesState;
 use crate::tables::{
-    CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_FORMAT, META_ID_COUNTER, META_RETENTION_CLOCK,
-    POINTS_LOG, SERIES, SERIES_KEY, STORE_FORMAT, TAILS, decode_log_entry,
+    BLOCKS, CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_FORMAT, META_ID_COUNTER,
+    META_RETENTION_CLOCK, PENDING_UNLINKS, POINTS_LOG, SERIES, SERIES_KEY, STORE_FORMAT, TAILS,
+    decode_log_entry,
 };
 
 /// The file's name inside the data directory.
@@ -54,6 +58,9 @@ pub(super) fn open<C: Send + 'static>(
     data_dir: &Path,
     options: StoreOptions,
 ) -> Result<(Arc<Shared<C>>, Writer<C>), OpenError> {
+    // Temporaries go before redb opens: a crashed raw handoff's can be half a gigabyte (§8).
+    let dir = BlockDir::create(data_dir).map_err(database)?;
+    dir.remove_temporaries().map_err(database)?;
     let db = Database::builder()
         .set_cache_size(options.cache_bytes)
         .create(data_dir.join(STORE_FILE))
@@ -62,7 +69,9 @@ pub(super) fn open<C: Send + 'static>(
     let shared = Arc::new(Shared {
         db,
         head: Head::new(),
+        blocks: Blocks::new(dir),
         failed: AtomicBool::new(false),
+        fail_cause: Mutex::new(None),
         hook: Mutex::new(None),
     });
     let mut core = Core::new(
@@ -72,10 +81,16 @@ pub(super) fn open<C: Send + 'static>(
         meta.next_id,
     );
     let records = load_head(&shared, &mut core)?;
+    // Rule (a) asks the tails as persisted and the clock as last committed (§6 step 2a).
+    let waiting = reconcile_at_open(&shared.db, &shared.head, &shared.blocks, meta.clock)?;
     replay(&shared, &mut core, &records)?;
     let now = core.hub_now();
     core.sweep(now);
-    Ok((shared, Writer::new(core, &options, meta.commit_seq)))
+    let handoffs = Handoffs::new(waiting);
+    Ok((
+        shared,
+        Writer::new(core, &options, meta.commit_seq, handoffs),
+    ))
 }
 
 fn read_u64(bytes: Option<&[u8]>) -> Result<Option<u64>, OpenError> {
@@ -150,6 +165,8 @@ fn create_store_tables(txn: &WriteTransaction) -> Result<(), OpenError> {
     txn.open_table(POINTS_LOG).map_err(database)?;
     txn.open_table(TAILS).map_err(database)?;
     txn.open_table(CHUNKS).map_err(database)?;
+    txn.open_table(BLOCKS).map_err(database)?;
+    txn.open_table(PENDING_UNLINKS).map_err(database)?;
     Ok(())
 }
 

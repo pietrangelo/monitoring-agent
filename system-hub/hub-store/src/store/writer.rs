@@ -20,22 +20,27 @@
 //! it, the tails due, the catalog writes and the clock.
 
 use std::collections::BTreeSet;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
-use redb::{Database, Durability, WriteTransaction};
+use redb::{Database, Durability, ReadableTable, WriteTransaction};
 
+use super::blocks::span_range;
 use super::catalog::{CatalogTxn, Deliver, Run, Settled};
+use super::handoff::{Backlog, Handoffs, Outcome, handoff_name};
 pub(crate) use super::ingest::Core;
-use super::{AppendReport, Commit, Shared, StoreError, StoreOptions};
+use super::{AppendReport, Commit, FailCause, Shared, StoreError, StoreOptions};
+use crate::block::format::BlockSummary;
+use crate::block::name::BlockName;
+use crate::block::record::BlockRecord;
 use crate::name::{Generation, MetricName, SystemKey};
 use crate::series::{SeriesId, SeriesKey, SeriesRecord};
 use crate::tables::{
-    CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_ID_COUNTER, POINTS_LOG, SERIES, SERIES_KEY,
-    TAILS, encode_log_entry,
+    BLOCKS, CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_ID_COUNTER, POINTS_LOG, SERIES,
+    SERIES_KEY, TAILS, encode_log_entry,
 };
-use crate::tier::{SWEEP_SECS, Tier};
+use crate::tier::Tier;
 use crate::value::ValueKind;
 
 /// What callers ask of the writer.
@@ -56,6 +61,8 @@ pub(crate) enum Request<C> {
     },
     /// The store was dropped without `close`: stop, committing nothing more.
     Abandon,
+    /// The block writer's outcome for one span (§6 *Span handoff*).
+    HandOff(Outcome),
 }
 
 /// Which tails a commit writes beside the ones that sealed.
@@ -120,6 +127,12 @@ pub(crate) struct Writer<C> {
     committing: BTreeSet<SeriesId>,
     commit_interval: Duration,
     tail_rotation: Duration,
+    sweep_interval: Duration,
+    handoffs: Handoffs,
+    /// The block writer's queue; `None` until the store connects it.
+    jobs: Option<Sender<BlockName>>,
+    /// Files whose rows the commit in progress holds: known to queries once it lands.
+    landed: Vec<(BlockName, BlockSummary)>,
 }
 
 /// The interval's transaction, begun when first needed: durable when committed, with 2-phase
@@ -139,6 +152,39 @@ fn open_txn<'a>(
     slot.as_ref().ok_or(StoreError::Failed)
 }
 
+/// Why a handoff's commit couldn't join the transaction: either fails the store stop.
+#[derive(Debug)]
+enum HandoffCommitError {
+    /// The span already has a row: spans in flight are handed over once, so this is a defect.
+    SecondRow,
+    /// redb refused a read or write, as any commit's failure.
+    Store,
+}
+
+impl<E: Into<redb::Error>> From<E> for HandoffCommitError {
+    fn from(_: E) -> HandoffCommitError {
+        HandoffCommitError::Store
+    }
+}
+
+/// A span's file is durable: its row and the deletion of its chunks join this commit (§6 *Span
+/// handoff* step 4).
+fn commit_handoff(
+    txn: &WriteTransaction,
+    name: &BlockName,
+    record: &BlockRecord,
+) -> Result<(), HandoffCommitError> {
+    let key = (name.tier.code(), name.span.get());
+    let mut blocks = txn.open_table(BLOCKS)?;
+    if blocks.get(key)?.is_some() {
+        return Err(HandoffCommitError::SecondRow);
+    }
+    blocks.insert(key, record.to_bytes().as_slice())?;
+    txn.open_table(CHUNKS)?
+        .retain_in(span_range(name.tier, name.span), |_, _| false)?;
+    Ok(())
+}
+
 /// Marks the store failed if the writer thread unwinds.
 struct FailOnPanic<C>(Arc<Shared<C>>);
 
@@ -153,7 +199,12 @@ impl<C> Drop for FailOnPanic<C> {
 }
 
 impl<C> Writer<C> {
-    pub(super) fn new(core: Core<C>, options: &StoreOptions, commit_seq: u64) -> Writer<C> {
+    pub(super) fn new(
+        core: Core<C>,
+        options: &StoreOptions,
+        commit_seq: u64,
+        handoffs: Handoffs,
+    ) -> Writer<C> {
         let rotation = Rotation::start(commit_seq, core.index.keys().copied());
         Writer {
             core,
@@ -165,12 +216,21 @@ impl<C> Writer<C> {
             committing: BTreeSet::new(),
             commit_interval: options.commit_interval,
             tail_rotation: options.tail_rotation,
+            sweep_interval: options.sweep_interval,
+            handoffs,
+            jobs: None,
+            landed: Vec::new(),
         }
+    }
+
+    /// Connects the block writer's queue: closed spans are handed to it from now on.
+    pub(super) fn connect(&mut self, jobs: Sender<BlockName>) {
+        self.jobs = Some(jobs);
     }
 
     pub(super) fn run(mut self, inbox: Receiver<Request<C>>) {
         let _guard = FailOnPanic(Arc::clone(&self.core.shared));
-        let sweep_every = Duration::from_secs(SWEEP_SECS);
+        let sweep_every = self.sweep_interval;
         let (mut next_commit, mut next_sweep) = (
             Instant::now() + self.commit_interval,
             Instant::now() + sweep_every,
@@ -192,6 +252,16 @@ impl<C> Writer<C> {
             if Instant::now() >= next_sweep {
                 let now = self.core.hub_now();
                 self.core.sweep(now);
+                if let Err(Backlog { tier, last }) = self.handoffs.choose(now) {
+                    *self
+                        .core
+                        .shared
+                        .fail_cause
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) =
+                        Some(FailCause::HandoffBacklog { tier, last });
+                    return self.fail_stop();
+                }
                 next_sweep = Instant::now() + sweep_every;
             }
             if force || Instant::now() >= next_commit {
@@ -205,6 +275,13 @@ impl<C> Writer<C> {
 
     /// Handles one request; whether it asks for a commit at once.
     fn handle(&mut self, request: Request<C>) -> bool {
+        let request = match request {
+            Request::HandOff(outcome) => {
+                self.hand_off(outcome);
+                return false;
+            }
+            other => other,
+        };
         let shared = Arc::clone(&self.core.shared);
         let Ok(txn) = open_txn(&mut self.txn, &shared.db) else {
             self.core
@@ -238,7 +315,35 @@ impl<C> Writer<C> {
                 let settled = run(&mut CatalogTxn::new(txn, &mut self.core, now));
                 self.settle(class, settled)
             }
-            Request::Close { .. } | Request::Abandon => false,
+            Request::Close { .. } | Request::Abandon | Request::HandOff(_) => false,
+        }
+    }
+
+    /// The block writer's outcome: a durable file's row and the deletion of its chunks join
+    /// this commit; a failure leaves the span waiting for the next sweep, its cause kept. A
+    /// second row for a span (a defect: spans in flight are handed over once) fails the store.
+    fn hand_off(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Written {
+                name,
+                record,
+                summary,
+            } => {
+                let shared = Arc::clone(&self.core.shared);
+                let committed = open_txn(&mut self.txn, &shared.db)
+                    .map_err(|_| HandoffCommitError::Store)
+                    .and_then(|txn| commit_handoff(txn, &name, &record));
+                match committed {
+                    Ok(()) => self.landed.push((name, summary)),
+                    Err(HandoffCommitError::SecondRow | HandoffCommitError::Store) => shared
+                        .failed
+                        .store(true, std::sync::atomic::Ordering::SeqCst),
+                }
+            }
+            Outcome::Failed(name, cause) => {
+                self.handoffs.failed((name.tier, name.span), cause);
+                self.core.shared.blocks.handoff_failed(name.tier, cause);
+            }
         }
     }
 
@@ -305,6 +410,7 @@ impl<C> Writer<C> {
                 (chunk.tier.code(), chunk.span.get(), id.0, chunk.seq),
                 chunk.bytes.as_slice(),
             )?;
+            self.handoffs.sealed((chunk.tier, chunk.span));
             self.committing.insert(id);
         }
         drop(chunks);
@@ -382,6 +488,7 @@ impl<C> Writer<C> {
                 entry.pending.clear();
             }
         }
+        self.after_handoffs();
         if self.rotation.finished() {
             self.log_bound = self.rotation.started_seq;
             self.rotation = Rotation::start(self.commit_seq, self.core.index.keys().copied());
@@ -399,6 +506,24 @@ impl<C> Writer<C> {
         self.core.catalog_dirty = false;
         for deliver in std::mem::take(&mut self.waiters) {
             deliver(Ok(()));
+        }
+    }
+
+    /// After a commit: the files whose rows it held become known to queries, and the spans due
+    /// since the last sweep go to the block writer, whose read transaction now sees them whole.
+    fn after_handoffs(&mut self) {
+        for (name, summary) in std::mem::take(&mut self.landed) {
+            self.handoffs.landed((name.tier, name.span));
+            self.core.shared.blocks.install(name, Ok(summary));
+        }
+        let Some(jobs) = &self.jobs else {
+            return;
+        };
+        for span in self.handoffs.take_due() {
+            // The block writer is gone only once this thread is stopping: nothing to retry.
+            if jobs.send(handoff_name(span)).is_err() {
+                return;
+            }
         }
     }
 
