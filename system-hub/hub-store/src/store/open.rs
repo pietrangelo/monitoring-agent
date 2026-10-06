@@ -20,7 +20,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, WriteTransaction};
@@ -70,7 +69,7 @@ pub(super) fn open<C: Send + 'static>(
         db,
         head: Head::new(),
         blocks: Blocks::new(dir),
-        failed: AtomicBool::new(false),
+        lifecycle: super::lifecycle::Lifecycle::new(),
         fail_cause: Mutex::new(None),
         hook: Mutex::new(None),
     });

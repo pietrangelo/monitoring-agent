@@ -388,6 +388,11 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
     replayed in order, each point applied only to a series whose last point is earlier, then a
     sweep. The open itself hands nothing off. A panic on the writer thread, an I/O error on
     commit or a refusal after a write fails the store stop: every later call answers `Failed`.
+    The store's **lifecycle** (`store/lifecycle.rs`) is one state, running, closed or failed:
+    the writer marks it closed only after `close`'s final commit succeeds, before it answers;
+    a caller whose request the writer never answers latches failed unless it stopped cleanly,
+    so a panic is seen by every later call at once, and a call that raced `close` answers
+    `Closed`, never `Failed`.
 
 Measured encoded sizes (`hub-store/tests/size_budget.rs`, seeded generators over a day of
 points; the test asserts these plus 10%):
@@ -622,6 +627,7 @@ mixed-version fleet must keep working):
 | **holder** | one generation's chunks in one block file and their bytes (a `block_generations` entry), with the system it belongs to, or unmapped when the generation maps to no system | `Holder` |
 | **span in flight / damaged file** | a file whose handoff or rewrite is running is in flight: retention and the cap leave it alone until it commits or fails. A file opened unreadable, or one whose rewrite met a chunk failing its CRC, is damaged: retired like any other, never rewritten | `FileCondition` |
 | **compaction** | shrinking `hub.redb` to the pages it uses, at start and only when asked (`HUB_STORE_COMPACT=1`) and worth it: over 1 GiB and over a quarter of the file reclaimable | `compaction_due` |
+| **store lifecycle** | the store is running, closed (a clean stop: `close` committed, every later call answers `Closed`) or failed (a fail-stop: every later call answers `Failed`); one is never reported as the other | `Lifecycle`, `State` (`hub-store`, internal) |
 | **storage cap** | the bytes the store may take on disk (`hub.redb` plus block files): bytes, a share of the volume (80% by default) or none; over it, a pass retires the oldest raw files, then the oldest minute files, never hour files | `StorageLimit`, `StorageCap`, `cap_retirements` |
 | **floor** | the free space the open requires: the larger of 1 GiB and 2% of the volume (plus twice what a clock rewind brings back); below it the hub refuses to start | `capacity::floor`, `BelowFloor` |
 

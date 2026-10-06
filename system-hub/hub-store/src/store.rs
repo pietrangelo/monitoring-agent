@@ -22,12 +22,12 @@ mod catalog;
 mod handoff;
 mod head;
 mod ingest;
+mod lifecycle;
 mod open;
 mod query;
 mod writer;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -367,20 +367,18 @@ pub(crate) struct Shared<C> {
     pub db: Database,
     pub head: Head,
     pub blocks: blocks::Blocks,
-    pub failed: AtomicBool,
+    /// Running, closed or failed.
+    pub lifecycle: lifecycle::Lifecycle,
     /// Why the store failed stop, when it decided to.
     pub fail_cause: Mutex<Option<FailCause>>,
     pub hook: Mutex<Option<SharedHook<C>>>,
 }
 
 impl<C> Shared<C> {
-    /// `Failed` once the writer failed; the store answers nothing after that.
+    /// `Closed` once the store closed, `Failed` once the writer failed; the store answers
+    /// nothing after either.
     pub(crate) fn check(&self) -> Result<(), StoreError> {
-        if self.failed.load(Ordering::SeqCst) {
-            Err(StoreError::Failed)
-        } else {
-            Ok(())
-        }
+        self.lifecycle.check()
     }
 }
 
@@ -391,7 +389,6 @@ pub struct Store<C: Send + 'static> {
     /// The writer, then the block writer: joined in that order, since the block writer ends
     /// when the writer drops its queue.
     threads: Mutex<Vec<JoinHandle<()>>>,
-    closed: AtomicBool,
 }
 
 /// How many requests may wait for the writer: a full channel makes callers wait.
@@ -414,7 +411,6 @@ impl<C: Send + 'static> Store<C> {
             shared,
             requests,
             threads: Mutex::new(vec![handle, block_writer]),
-            closed: AtomicBool::new(false),
         })
     }
 
@@ -428,24 +424,21 @@ impl<C: Send + 'static> Store<C> {
     }
 
     fn check(&self) -> Result<(), StoreError> {
-        self.shared.check()?;
-        if self.closed.load(Ordering::SeqCst) {
-            Err(StoreError::Closed)
-        } else {
-            Ok(())
-        }
+        self.shared.check()
     }
 
-    /// Sends a request and waits for its answer; a writer gone answers `Failed`.
+    /// Sends a request and waits for its answer. A request the writer never answers (it is
+    /// gone: closed, or failed) answers what the lifecycle says.
     fn ask<R>(&self, request: impl FnOnce(SyncSender<R>) -> Request<C>) -> Result<R, StoreError> {
         self.check()?;
         let (reply, answer) = mpsc::sync_channel(1);
+        let lifecycle = &self.shared.lifecycle;
         self.requests
             .send(request(reply))
-            .map_err(|_| StoreError::Failed)?;
-        answer
-            .recv()
-            .map_err(|_| self.shared.check().err().unwrap_or(StoreError::Failed))
+            .map_err(|_| lifecycle.writer_gone())?;
+        // A panic drops the reply while the writer's stack unwinds, before the writer marks
+        // the store failed: `writer_gone` latches it here, so every later call sees it.
+        answer.recv().map_err(|_| lifecycle.writer_gone())
     }
 
     pub fn append(
@@ -520,13 +513,13 @@ impl<C: Send + 'static> Store<C> {
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::from(hook));
     }
 
-    /// Flushes every tail and commits; later calls answer `Closed`. Idempotent.
+    /// Flushes every tail and commits; later calls answer `Closed`. Idempotent when called
+    /// in turn; a close racing another close may answer `Closed` (the other one closed it).
     pub fn close(&self) -> Result<(), StoreError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.shared.lifecycle.state() == lifecycle::State::Closed {
             return Ok(());
         }
         let flushed = self.ask(|reply| Request::Close { reply });
-        self.closed.store(true, Ordering::SeqCst);
         self.join();
         flushed?
     }
@@ -540,5 +533,39 @@ impl<C: Send + 'static> Drop for Store<C> {
         let _ = self.requests.send(Request::Abandon);
         // The writer holds the database: once joined, the file is free for the next open.
         self.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 0010 §6 Shutdown: a call that reaches the writer after its `Close` (queued behind
+    /// it, or sent once the writer is gone) answers `Closed`, and so does every later call.
+    #[test]
+    fn a_call_behind_the_writers_close_answers_closed_through_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = StoreOptions::with_clock(Arc::new(WallClock));
+        let store = Store::<()>::open(dir.path(), options).expect("opens");
+        let (reply, closed) = mpsc::sync_channel(1);
+        store
+            .requests
+            .send(Request::Close { reply })
+            .expect("queued");
+        let system = SystemKey::try_from(&b"a"[..]).expect("key");
+        let behind = store.append(&system, Generation::new(1), &[]);
+        assert_eq!(closed.recv(), Ok(Ok(())), "the close is answered");
+        assert_eq!(behind.err(), Some(StoreError::Closed), "the call behind it");
+        assert_eq!(
+            store.stats().err(),
+            Some(StoreError::Closed),
+            "a later call"
+        );
+        assert_eq!(
+            store.append(&system, Generation::new(1), &[]).err(),
+            Some(StoreError::Closed),
+            "a later append"
+        );
+        assert_eq!(store.shared.lifecycle.state(), lifecycle::State::Closed);
     }
 }

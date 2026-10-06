@@ -755,6 +755,86 @@ fn a_writer_panic_fails_the_store_with_no_cause() {
     assert_eq!(store.fail_cause(), None);
 }
 
+/// RFC 0010 §6: once a call has answered `Failed` for a writer panic, every later call
+/// answers `Failed` too, at once. The panic drops the caller's reply while the writer's stack
+/// unwinds, before the writer marks the store failed, so this races; repeated to catch it.
+#[test]
+fn after_a_writer_panic_answers_failed_every_later_call_does_too() {
+    const TABLE: hub_store::store::CatalogTable =
+        hub_store::store::CatalogTable::new("catalog.race");
+    // The calls that read without asking the writer: each is first after the panic in turn.
+    type FirstCall = (&'static str, fn(&Store<()>) -> Option<StoreError>);
+    let first_calls: [FirstCall; 3] = [
+        ("stats", |s| s.stats().err()),
+        ("read_catalog", |s| {
+            s.read_catalog(|r| r.get(TABLE, b"x")).err()
+        }),
+        ("query", |s| query(s, "a", Tier::Raw).err()),
+    ];
+    for round in 0..900 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(T0);
+        let store = open_quiet(dir.path(), &clock).expect("opens");
+        append_one(&store, &clock, "a", T0, 1_000);
+        let answer = store.transact(
+            hub_store::store::Commit::Batched,
+            |_| -> Result<((), hub_store::store::Answer), hub_store::store::Abort<()>> {
+                panic!("injected");
+            },
+        );
+        assert_eq!(
+            answer.err(),
+            Some(hub_store::store::TransactError::Store(StoreError::Failed)),
+            "round {round}: the panic answers Failed"
+        );
+        let (name, first) = first_calls[round % first_calls.len()];
+        assert_eq!(
+            first(&store),
+            Some(StoreError::Failed),
+            "round {round}: the next call, {name}, sees it"
+        );
+        assert_eq!(
+            query(&store, "a", Tier::Raw),
+            Err(StoreError::Failed),
+            "round {round}: a query after it too"
+        );
+    }
+}
+
+/// RFC 0010 §6 Shutdown: after `close`, calls answer `Closed`, the one that raced it (queued
+/// behind the close, its reply dropped unanswered) included: a clean stop is never a failure.
+#[test]
+fn a_call_racing_close_answers_closed_and_so_does_every_later_call() {
+    for round in 0..300 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = TestClock::at(T0);
+        let store = Arc::new(open_quiet(dir.path(), &clock).expect("opens"));
+        let racer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let point = [(
+                    MetricName::try_from("a").expect("valid"),
+                    ValueKind::Percent,
+                    1_000,
+                )];
+                loop {
+                    if let Err(e) = store.append(&key("a").system, Generation::new(1), &point) {
+                        return e;
+                    }
+                }
+            })
+        };
+        store.close().expect("closes");
+        let seen = racer.join().expect("the racer ends");
+        assert_eq!(seen, StoreError::Closed, "round {round}: the racing call");
+        assert_eq!(
+            store.stats().err(),
+            Some(StoreError::Closed),
+            "round {round}: a later call"
+        );
+    }
+}
+
 /// RFC 0010 §6: the backlog's fail-stop names the tier and the block-write failure.
 #[test]
 fn the_backlog_fail_stop_names_its_tier_and_cause() {

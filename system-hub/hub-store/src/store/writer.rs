@@ -191,9 +191,7 @@ struct FailOnPanic<C>(Arc<Shared<C>>);
 impl<C> Drop for FailOnPanic<C> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0
-                .failed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.lifecycle.fail();
         }
     }
 }
@@ -238,10 +236,7 @@ impl<C> Writer<C> {
         loop {
             let wait = next_commit.saturating_duration_since(Instant::now());
             let force = match inbox.recv_timeout(wait) {
-                Ok(Request::Close { reply }) => {
-                    let _ = reply.send(self.commit(Flush::All));
-                    return;
-                }
+                Ok(Request::Close { reply }) => return self.finish(reply),
                 Ok(Request::Abandon) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(request) => self.handle(request),
                 Err(RecvTimeoutError::Timeout) => false,
@@ -284,10 +279,7 @@ impl<C> Writer<C> {
         };
         let shared = Arc::clone(&self.core.shared);
         let Ok(txn) = open_txn(&mut self.txn, &shared.db) else {
-            self.core
-                .shared
-                .failed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.core.shared.lifecycle.fail();
             return false;
         };
         match request {
@@ -302,10 +294,7 @@ impl<C> Writer<C> {
                     .core
                     .append_points(txn, &system, generation, &points, at);
                 if report.is_err() {
-                    self.core
-                        .shared
-                        .failed
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.core.shared.lifecycle.fail();
                 }
                 let _ = reply.send(report);
                 false
@@ -335,9 +324,9 @@ impl<C> Writer<C> {
                     .and_then(|txn| commit_handoff(txn, &name, &record));
                 match committed {
                     Ok(()) => self.landed.push((name, summary)),
-                    Err(HandoffCommitError::SecondRow | HandoffCommitError::Store) => shared
-                        .failed
-                        .store(true, std::sync::atomic::Ordering::SeqCst),
+                    Err(HandoffCommitError::SecondRow | HandoffCommitError::Store) => {
+                        shared.lifecycle.fail()
+                    }
                 }
             }
             Outcome::Failed(name, cause) => {
@@ -351,10 +340,7 @@ impl<C> Writer<C> {
         match settled {
             Settled::Now(answer) => answer(),
             Settled::FailStop(answer) => {
-                self.core
-                    .shared
-                    .failed
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.core.shared.lifecycle.fail();
                 answer();
             }
             Settled::Wait {
@@ -527,14 +513,61 @@ impl<C> Writer<C> {
         }
     }
 
+    /// The close: flushes every tail and commits; marks the store closed before answering
+    /// and before the inbox drops, so a call queued behind the close finds a clean stop. A
+    /// failed commit stays a failure.
+    fn finish(&mut self, reply: SyncSender<Result<(), StoreError>>) {
+        let committed = self.commit(Flush::All);
+        if committed.is_ok() {
+            self.core.shared.lifecycle.close();
+        }
+        let _ = reply.send(committed);
+    }
+
     /// Marks the store failed and answers every waiting caller.
     fn fail_stop(&mut self) {
-        self.core
-            .shared
-            .failed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.core.shared.lifecycle.fail();
         for deliver in std::mem::take(&mut self.waiters) {
             deliver(Err(StoreError::Failed));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::store::lifecycle::State;
+    use crate::store::{WallClock, open};
+
+    /// RFC 0010 §6 Shutdown: a request queued behind `Close` is dropped unanswered when the
+    /// writer stops, and its caller finds the store closed, not failed.
+    #[test]
+    fn a_request_queued_behind_close_finds_the_store_closed_not_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = StoreOptions::with_clock(Arc::new(WallClock));
+        let (shared, writer) = open::open::<()>(dir.path(), options).expect("opens");
+        let (requests, inbox) = mpsc::sync_channel(4);
+        let (close_reply, closed) = mpsc::sync_channel(1);
+        let (append_reply, appended) = mpsc::sync_channel(1);
+        requests
+            .send(Request::Close { reply: close_reply })
+            .expect("queued");
+        requests
+            .send(Request::Append {
+                system: SystemKey::try_from(&b"a"[..]).expect("key"),
+                generation: Generation::new(1),
+                points: Vec::new(),
+                reply: append_reply,
+            })
+            .expect("queued");
+        drop(requests);
+        writer.run(inbox);
+        assert_eq!(closed.recv(), Ok(Ok(())), "the close is answered");
+        assert!(appended.recv().is_err(), "the request behind it is not");
+        assert_eq!(shared.lifecycle.state(), State::Closed);
+        assert_eq!(shared.lifecycle.writer_gone(), StoreError::Closed);
+        assert_eq!(shared.lifecycle.check(), Err(StoreError::Closed));
     }
 }
