@@ -14,22 +14,20 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The hub's store (RFC 0010): tiered time series and the hub's catalog, in one redb file
-//! plus immutable block files. It knows no hub term but "system key" and "generation".
+//! Retention (RFC 0010 §5), the pure core: the policies (the global one, per-system
+//! overrides and their pending shortenings, RFC 0012 §2), which chunks are live, and what
+//! becomes of each block file. The retention pass that acts on them runs on the writer thread.
 
-#![forbid(unsafe_code)]
+mod files;
+mod liveness;
+mod policy;
 
-pub mod block;
-mod bytes;
-pub mod capacity;
-pub mod clock;
-pub mod codec;
-pub mod name;
-pub mod retention;
-pub mod rollup;
-pub mod series;
-pub mod state;
-pub mod store;
-mod tables;
-pub mod tier;
-pub mod value;
+pub use files::{
+    FileCondition, FileFacts, FileFate, FileKey, FilePlan, Holder, RewriteCause, file_fate,
+    plan_files,
+};
+pub use liveness::{Death, Liveness, Owner, Tombstones, chunk_liveness, expired};
+pub use policy::{
+    DuplicateTier, OutOfBounds, Override, PendingShortening, PerTier, Policies, RetentionChange,
+    RetentionOutcome, RetentionPolicy, TierMismatch, TierOverride, TierPeriod, TierSetting,
+};

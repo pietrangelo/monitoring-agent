@@ -614,7 +614,8 @@ pub struct PendingShortening { next: TierSetting, delay: Duration }
   when **(a)** its tombstoned bytes reach 25% of its length, or **(b)** its span is past the
   tier's global retention and only longer overrides keep it, so one system with `raw=30d` keeps a
   small file of its own chunks, not every system's raw data for 30 days. At most one rewrite per
-  pass, the most overdue file first; a rewrite reads one file and writes less, on the block
+  pass, the most overdue file first (the earliest span end, the lower tier on a tie; with (a)
+  taking precedence over (b) for a file that meets both); a rewrite reads one file and writes less, on the block
   writer thread. **A damaged file is never selected**: a file opened unreadable, or one whose
   rewrite met a chunk failing its CRC (that rewrite is abandoned, its temporary file deleted, the
   file marked damaged in memory and counted; after a restart one failed attempt marks it again),
@@ -642,7 +643,8 @@ length plus every block file's length. Block files are what grows, and retiring 
 bytes once it is unlinked, right after the commit (its cached handle is closed first; a query
 still reading it holds the bytes until that query ends), so the rule acts on the real total and
 stops as soon as it is met: while the total exceeds the cap, each pass retires the oldest raw
-block file, then the oldest minute block file, never an hour file, the hot part or a tail,
+block file, and only once no raw file the cap may take is left the oldest minute block file, never an hour
+file, a file in flight, the hot part or a tail,
 logging each at `warn`. Between passes the total can exceed the cap by at most ten minutes of
 ingest. `hub.redb`'s length is bounded by the hot part (two spans per tier, plus a handoff
 backlog of at most three, §6); it never drops while the hub runs, and the cap counts it as it
