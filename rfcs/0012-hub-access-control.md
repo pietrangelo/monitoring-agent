@@ -23,7 +23,7 @@
   0017's `mail_receipts` as a catalog table, retired on delete, a `mail://` column in 0011's
   per-source API table, and `enabled` settable as 0017 §6 uses it) and 0010's `LiveStatus` carries
   0017's overdue marking. This RFC states what it needs from those amendments (§2, §3); it
-  doesn't design them.
+  doesn't design them. They were made on 2026-10-03 (each RFC's Review, *mail amendment*).
 - The new dashboard reaches Compose users through the static-files prerequisite (0010's header),
   shipped first as its own change.
 - This RFC adds the hub's first client authentication. `docs/ARCHITECTURE.md` says that is "an
@@ -139,14 +139,17 @@ global policy, every override and each pending shortening), and `GET /api/storag
   **After a restart, `since` is the system's recovered last contact, for every source**: 0010
   §10 marks polled systems `Offline { since: last_contact }` at open, and the release requires
   the first marking after open by the push sweep (RFC 0016's grace) and by the mail overdue
-  sweep (RFC 0017 §7) to do the same (the open time when the system has never been heard from),
-  not `since: now`. Otherwise every hub restart would reset a push or mail system's offline age.
+  sweep (RFC 0017 §7) to use when the system went silent, not `since: now`: its last contact
+  for a push system, and the moment it became overdue (`received_at` + 3 intervals + 15
+  minutes) for a mail system, as RFC 0010 §10's `offline_since` states (the open time when the
+  system has never been heard from). Otherwise every hub restart would reset a push or mail system's offline age.
   **That last contact is on hub time for every source.** Push and poll already are (0010 §10,
   0016 §8). A mail system's *last seen* is its newest report's agent-stamped `created_at` (0017
   §7), which can lag the hub by up to the 7-day receipt window; used as `since`, a reporting
   mail system with a slow clock would be listed as offline for days after a restart and deleted.
   So the 0010 amendment stores, for a mail system, the **hub time at which its newest report was
-  accepted** as `last_contact`; `created_at` stays for display and for 0017's overdue rule only.
+  accepted** as `last_contact`; `created_at` stays for display only (RFC 0010 §10 later moved
+  0017's overdue rule onto `received_at` too, owner's decision).
   The retention clock trails hub time after an outage, so with `since` on hub time the age shown
   is a lower bound and a candidate can only appear late, never early.
   With the mail intake off, no sweep marks mail systems and they stay `Unknown`, so they are
@@ -240,10 +243,13 @@ one. Every id the registry holds under another source is a *reserved push id*.
 
 - **Where it is decided.** Not in `authenticate`, which stays a pure parse of the handshake
   message with no registry (0017's reasoning, kept). It is decided by the registration unit, on
-  the blocking pool after the token check, in the **same transaction** that would register the
-  id (today `insert_system_if_absent` answers `Known(url)`, and `SystemSource::of(url)` decides;
-  under 0011, `Source` inside `transact`). So no check-then-insert can race a mail scan, a
-  `POST` or an admin `DELETE`. 0017's `Refusal::TransportMismatch { id }` widens to
+  the blocking pool after the token check, **on the catalog's committed state** (today
+  `insert_system_if_absent` answers `Known(url)` under the database mutex, and
+  `SystemSource::of(url)` decides): under RFC 0008 §3, a held id is decided by an MVCC read
+  (no commit, no writer work, no presence lock), and a new id inside the transaction that
+  would register it, which re-reads. A stale read can only follow a delete, and generations
+  fence it. So no check-then-insert can race a mail scan, a `POST` or an admin `DELETE`, and a
+  refused handshake never forces a commit (0008's fourth-round finding). 0017's `Refusal::TransportMismatch { id }` widens to
   `TransportMismatch { id, held: ReservedSource }`, with `enum ReservedSource { Poll, Mail }`
   (no `Push` variant: a push row is never a mismatch, so the type can't say one is).
 - **One answer for both.** The agent-facing message stays `transport mismatch`, the string 0017
@@ -739,6 +745,11 @@ instant candidates, and CORS `Any` with `Authorization`.
 Came closest and survived in the fifth pass: `MailKeyShaped` against padding, alphabet and
 whitespace variants (both sides decode padded `STANDARD` after trimming); a test pins that the
 rule uses the same engine as `MailMasterKey::from_base64`, so a change of engine fails it.
+
+**Aligned after acceptance (2026-10-03).** RFC 0008's own pass found that deciding every
+handshake inside a durable transaction would stall the fleet; §3's "where it is decided" now
+follows 0008 §3 (an MVCC read for a held id, the transaction for a new one). The rule, the
+answer and the tests are unchanged.
 
 **Still open**: nothing CONFIRMED. The fifth pass's resolutions adopt the fixes it proposed and
 add no design of their own, so no sixth pass was run. The amendments this RFC requires of 0008,

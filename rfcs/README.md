@@ -33,10 +33,10 @@ Trivial fixes, dependency bumps, formatting, and pure test-additions don't need 
 | [0005](0005-system-id-dot-segments.md) | System Ids That Are Always One Path Segment | Implemented |
 | [0006](0006-push-connection-limits.md) | Push Connection Limits and Fail-Closed Token | Implemented |
 | [0007](0007-push-ingestion-cost.md) | One Snapshot Rule, One Transaction, One Serialisation | Implemented |
-| [0008](0008-push-registry-limit.md) | Push Registry Limit and Push System Lifecycle | Draft |
+| [0008](0008-push-registry-limit.md) | Push Registry Limit and Push System Lifecycle | Accepted |
 | [0009](0009-spring-boot-application-telemetry.md) | Spring Boot Application Telemetry | Implemented |
-| [0010](0010-hub-store.md) | Hub Store on redb: Tiered Time Series and the Hub's Catalog in One Embedded Database | Draft |
-| [0011](0011-registry-and-alert-catalog.md) | Registry and Alert Catalog, with Sealed Agent Tokens | Draft |
+| [0010](0010-hub-store.md) | Hub Store on redb: Tiered Time Series and the Hub's Catalog in One Embedded Database | Accepted |
+| [0011](0011-registry-and-alert-catalog.md) | Registry and Alert Catalog, with Sealed Agent Tokens | Accepted |
 | [0012](0012-hub-access-control.md) | Hub Access Control: Admin Token over Registry and Retention Writes, Reserved Push Ids | Accepted |
 | [0013](0013-sqlite-import.md) | One-Shot Import from SQLite into the Hub Store | Rejected |
 | [0014](0014-execution-environment.md) | Execution Environment: the Agent Monitors What It Runs In | Implemented |

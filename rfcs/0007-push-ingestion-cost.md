@@ -18,7 +18,7 @@
   - RFC 0016 (planned: the current-connection lifecycle and the agent's id, split from RFC 0008
     §5 and §7) comes after it, also on SQLite. It narrows §4's eviction to the current
     connection.
-  - RFC 0010 (Draft, the redb release with RFCs 0008, 0011 and 0012) supersedes §2 once
+  - RFC 0010 (Accepted, the redb release with RFCs 0008, 0011 and 0012) supersedes §2 once
     implemented, carries §2's cache rule forward, and maps snapshots through §1. It stamps
     points at hub time, so it drops §1's `SnapshotTime` refusal (§1).
   - Nothing here depends on RFC 0008, 0010 or 0016.
