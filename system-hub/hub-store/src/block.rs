@@ -14,20 +14,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The hub's store (RFC 0010): tiered time series and the hub's catalog, in one redb file
-//! plus immutable block files. It knows no hub term but "system key" and "generation".
+//! Block files (RFC 0010 §5, §6): each closed span of a tier, once handed off out of redb,
+//! lives in one immutable file. Its format, its name, its `blocks` row and the reconciliation
+//! of files with rows at open are pure; reading and writing files is the store's.
 
-#![forbid(unsafe_code)]
-
-pub mod block;
-mod bytes;
-pub mod clock;
-pub mod codec;
+pub mod format;
 pub mod name;
-pub mod rollup;
-pub mod series;
-pub mod state;
-pub mod store;
-mod tables;
-pub mod tier;
-pub mod value;
+pub mod reconcile;
+pub mod record;

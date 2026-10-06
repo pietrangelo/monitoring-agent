@@ -144,6 +144,12 @@ impl SpanStart {
     pub fn end(self, tier: Tier) -> u64 {
         self.0.saturating_add(tier.span_secs())
     }
+
+    /// Whether the span is closed at `hub_now`: hub time past its end plus its tier's grace
+    /// (§6 *Span handoff*), so no point or bucket can land in it any more.
+    pub fn is_closed(self, tier: Tier, hub_now: u64) -> bool {
+        hub_now > self.end(tier).saturating_add(tier.grace_secs())
+    }
 }
 
 /// The sweep's interval: it closes quiet series' buckets (RFC 0010 §5).
@@ -255,5 +261,64 @@ mod tests {
             .filter(|c| Tier::from_code(*c).is_some())
             .count();
         assert_eq!(named, 3);
+    }
+
+    #[test]
+    fn a_span_closes_one_second_after_its_end_plus_its_tiers_grace() {
+        let day = 1_800_057_600;
+        let cases = [
+            ("raw, at the grace", Tier::Raw, day + 3_600 + 120, false),
+            ("raw, one second past", Tier::Raw, day + 3_600 + 121, true),
+            (
+                "minute, at the grace",
+                Tier::Minute,
+                day + 3_600 + 120,
+                false,
+            ),
+            (
+                "minute, one second past",
+                Tier::Minute,
+                day + 3_600 + 121,
+                true,
+            ),
+            (
+                "hour, at the grace",
+                Tier::Hour,
+                day + 86_400 + 3_660,
+                false,
+            ),
+            (
+                "hour, one second past",
+                Tier::Hour,
+                day + 86_400 + 3_661,
+                true,
+            ),
+            ("inside the span", Tier::Raw, day + 10, false),
+            ("before the span", Tier::Raw, 0, false),
+        ];
+        for (name, tier, now, closed) in cases {
+            let span = SpanStart::new(tier, day).expect("grid");
+            assert_eq!(span.is_closed(tier, now), closed, "{name}");
+        }
+        let next = SpanStart::new(Tier::Raw, day + 3_600).expect("grid");
+        assert!(
+            !next.is_closed(Tier::Raw, day + 7_200 + 120),
+            "the next span, at its grace"
+        );
+        assert!(
+            next.is_closed(Tier::Raw, day + 7_200 + 121),
+            "the next span, one second past"
+        );
+        let early = SpanStart::new(Tier::Hour, 86_400).expect("grid");
+        assert!(
+            early.is_closed(Tier::Hour, 2 * 86_400 + 3_661),
+            "an early hour span"
+        );
+        assert!(!early.is_closed(Tier::Hour, 2 * 86_400 + 3_660));
+        let last = SpanStart::new(Tier::Raw, u64::MAX - u64::MAX % 3_600).expect("grid");
+        assert!(
+            !last.is_closed(Tier::Raw, u64::MAX),
+            "the last span never closes"
+        );
     }
 }

@@ -281,7 +281,8 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
 - `name.rs`: `MetricName` (1 to 261 bytes of UTF-8, no control character), `SystemKey` (1 to
   255 bytes), `Generation`; `InvalidName`.
 - `tier.rs`: `Tier` (raw, minute, hour), `RollupTier`, `SpanStart`: spans of 1 h (raw,
-  minute) and 1 day (hour), and the grace after which a span closes.
+  minute) and 1 day (hour), and the grace after which a span closes (`SpanStart::is_closed`:
+  hub time past its end plus one bucket and one sweep interval).
 - `codec/`: the chunk codec, versioned by a leading format byte and total on any input. A raw
   chunk (`RawChunk`, format `0x01`) holds at most 240 points or 1 KiB: a header (count, first
   timestamp, first value) then, per point, the timestamp's delta of deltas (`0` | `10`+3 |
@@ -297,11 +298,33 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
   run into another's) and `SeriesRecord` (kind and last span per tier).
 - `state.rs`: `SeriesState`, one series in the head: its open raw chunk, its open minute and
   hour buckets and chunks, sealing a chunk when it is full or a point lands in a new span, and
-  the sweep that closes quiet series' buckets more than one bucket length past their end.
+  the sweep that closes quiet series' buckets more than one bucket length past their end;
+  `seal_closed` seals the open chunks of closed spans, and `holds_open` says whether the
+  series still holds a span open (unsealed data in it, or an open bucket that closes into it).
   `state/tail.rs` persists it as the series' **tail**, checked whole when read back (kind,
   spans on their grid, chunks decodable, values in the domain, buckets consistent, and the
   fields against each other: every point and bucket in its chunk's span and none after the
   series' last time).
+- `block.rs` and `block/`: the pure side of **block files**, where each closed span of a tier
+  will live once handed off out of redb (RFC 0010 §5, §6; the handoff, the reads and the open's
+  file handling are the next step). `block/format.rs`: the file format (`encode_block`,
+  `BlockSummary`): a header (`HUBBLK`, format, tier, span, chunk count, index offset), the
+  span's chunks ordered by (series id, seq), an index of 22-byte entries in index blocks of
+  1,024, a summary of one entry per index block (first series, offset, CRC-32C), and a trailer
+  (summary offset, CRC-32C of header and summary, magic). Each chunk's CRC covers its tier, span,
+  series id and seq as well as its bytes, so an entry pointing at another series' chunk fails;
+  every index block is checked against its CRC, its order (strictly by series and seq), its
+  first series against the summary's and its offsets against the data region, and the header
+  and summary against each other and the file's length, so a forged file whose CRCs were
+  recomputed is still refused as malformed. `block/name.rs`: `BlockName` and its one canonical
+  file name, `<span start>[.r<rewrite>].blk` (a `.tmp` suffix while being written; anything
+  else in the directory is not the store's). `block/record.rs`: `BlockRecord`, the `blocks`
+  row. `block/reconcile.rs`: the open's decision over the files on disk and the rows in redb
+  (§6 step 2a), a pure plan: unlink what `pending_unlinks` names; delete a row-less file only
+  as a provable redundant copy, (a) a handoff that crashed before its commit (no row, the span
+  closed by the persisted clock, no tail open in it, its chunks in `chunks`) or (b) a rewrite
+  that crashed before its swap (the row's lower rewrite number with its own file present);
+  refuse to open on any other row-less file; open a row whose file is absent as unreadable.
 - `clock.rs`: `HubClock` (hub time: `max(system clock, last issued)`, never backwards) and
   `retention_now`, the guarded retention clock (at most twice real time, never past either
   clock, unchanged by the first pass after an open).
@@ -383,7 +406,7 @@ match those rules (listed under Open architectural questions below).
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`, `MAX_DISPLAY_BYTES`, `UptimeDisplay`, `LastSeen`, `StatusUpdate` / `after_snapshot`, `PollInterval`, `needs_system_info`, `SystemSource`, `PUSH_URL`, `polled_systems`); `presence.rs` (`PushPresence`, `ConnectionNumber`, `ConnectionLease`, `LeaseHandle`, `Ending`, `Sweep`, `OfflineReason`, `RECONNECT_GRACE`) | `db/mod.rs` `systems` table (`insert_system_if_absent` / `Registration`, `update_system_status` for the offline markings), `db/sources.rs` (`system_sources` / `SourceRow`, `reset_status`), `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll: `PolledAnswer` / `PolledInfo`, the parsed answer and the system info the registry fill reads; `PollFailure`; `MAX_SYSTEM_BODY`; `collector/capped_body.rs`: `read_capped`, `CappedBodyError`), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` (with `RegistryUnavailable` / `RegistryFailure`) / `Answer`, the handshake and idle deadlines, the oversize linger; `push/ingest.rs`: hub-side `PushPayload`, `SnapshotFrame` / `PushedInfo`, `SnapshotRefusal`, `register_and_accept`, `register_if_new`, `ingest_frame`, `update_registry`, `end_connection`; `push/connection.rs`: `ConnectionState` (a connection's decode budget, pace and counts), `Tally`, `Occurrence`, `warn_first`, `DecodeBudget`, `DECODE_BURST`); `snapshot_intake.rs` stores one snapshot for either mode (`store_snapshot`: the rule, the store, the live metrics entry); `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `log_refused_round`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits`, `PushConfig` (with `decode_refill`) and the production timings, `DECODE_REFILL` among them) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`AlertRecord`, `HubSummary`); `snapshot.rs` (`ReportedSnapshot`, `ReportedDisk`, `Snapshot`, `Scalar`, `MountPoint`, `SnapshotTime`, `LeftOut`, `snapshot_rule`, `MAX_DISKS`, `MAX_MOUNT_POINT_BYTES`, `LeftOutLog`, `left_out_log`, `snapshot_retention`, `LiveMetrics`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db/history.rs` `metrics` / `metric_retention` tables (`store_snapshot` / `SnapshotStored`, `store_round`, the pruning), `db/mod.rs` `alerts` table, `state.rs` (`live_metrics`, `evict_live_metrics`, `live_applications`, `summary`), `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`; `routes/sse.rs`: the publisher, `Summary`, `SummaryFailure`, and the wire DTOs `SummaryDto` / `LiveMetricsDto`) | stored time series, alert history, retention, each system's live metrics, and each system's shown scrape round |
-| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
+| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `block/` (`encode_block`, `BlockSummary`, `BlockName`, `BlockRecord`, `reconcile`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
 
 Two pure modules belong to no context and have no domain term of their own:
 `token_bucket.rs` (`TokenBucket`, `Refill`, `Empty`), the bucket arithmetic both `SourcePace`
@@ -543,6 +566,9 @@ mixed-version fleet must keep working):
 | **tail** | a series' open state (open chunks and buckets, last time) as persisted, rewritten when the series seals a chunk and by the rotating tail flush | `SeriesState::to_tail` |
 | **head** | the store's in-memory state of every active series: its open chunks and buckets, and its chunks sealed since the last commit; changed only by the writer thread, read by queries under a shard lock | `Head`, `HeadEntry` |
 | **seal** | closing a series' open chunk (full, or a point or bucket in a new span, or its span closing) into a **sealed chunk** of its span, at the span's next seq, committed with the next group commit | `Sealed`, `SeriesState::seal_span` |
+| **closed span** | a span whose tier's grace has passed in hub time (its end plus one bucket and one sweep interval): no point or bucket can land in it any more, so its open chunks are sealed and it can be handed off | `SpanStart::is_closed`, `SeriesState::seal_closed` |
+| **block file** | the immutable file holding one closed span of one tier once handed off out of redb, with its index, summary and CRC-32C checks; named by its span and **rewrite number** (0 for the handoff's file, then 1, 2, … for each rewrite) | `encode_block`, `BlockSummary`, `BlockName`, `Rewrite` |
+| **reconciliation** | the open's pass over the block files against the `blocks` rows: finishing pending unlinks, deleting only provably redundant row-less files, refusing the open on any other, and marking rows whose file is missing as unreadable | `block::reconcile` |
 | **rotating tail flush** | the commit's writing of a slice of the series' tails, sized by elapsed time, so every tail is rewritten once per rotation (15 minutes by default) however many commits run | `Rotation` |
 | **commit interval** | the time between group commits (1 s by default, `HUB_COMMIT_INTERVAL`): the durability window, the most a crash can lose | `StoreOptions::commit_interval` |
 | **points log** | one entry per group commit holding its points, so the points not yet in a tail survive a crash; replayed at open, truncated once every tail was rewritten | `points_log`, `LoggedPoint` |

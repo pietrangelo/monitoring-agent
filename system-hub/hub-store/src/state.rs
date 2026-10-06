@@ -124,6 +124,32 @@ impl SeriesState {
         }
     }
 
+    /// Seals every tier's open chunk whose span is closed at `hub_now` (§6 *Span handoff*
+    /// step 2), so a closed span is whole in `chunks` before its handoff. Call it after
+    /// [`SeriesState::sweep`] at the same `hub_now`: the sweep closes a closed span's last
+    /// buckets into its open chunks first (a span's grace is one bucket and one sweep interval
+    /// past its end, so by then every bucket of it is past the sweep's bound).
+    pub fn seal_closed(&mut self, hub_now: u64) -> Vec<Sealed> {
+        [
+            self.raw.seal_if_closed(hub_now),
+            self.minute.open.seal_if_closed(hub_now),
+            self.hour.open.seal_if_closed(hub_now),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Whether the series still holds something of `span` open in `tier`: an unsealed point
+    /// or bucket there, or an open bucket that will close into it.
+    pub fn holds_open(&self, tier: Tier, span: SpanStart) -> bool {
+        match tier {
+            Tier::Raw => self.raw.holds(span),
+            Tier::Minute => self.minute.holds_open(span),
+            Tier::Hour => self.hour.holds_open(span),
+        }
+    }
+
     /// The raw points not yet sealed, in time order.
     pub fn unsealed_points(&self) -> Vec<RawPoint> {
         self.raw.chunk.points()
@@ -227,6 +253,21 @@ impl<C: OpenChunk> Open<C> {
             None
         }
     }
+
+    /// Seals the open chunk if its span is closed at `hub_now`.
+    fn seal_if_closed(&mut self, hub_now: u64) -> Option<Sealed> {
+        let tier = self.chunk.tier();
+        if self.span.is_some_and(|s| s.is_closed(tier, hub_now)) {
+            self.seal()
+        } else {
+            None
+        }
+    }
+
+    /// Whether the open chunk holds anything of `span`.
+    fn holds(&self, span: SpanStart) -> bool {
+        self.span == Some(span) && !self.chunk.is_empty()
+    }
 }
 
 impl Open<RawChunk> {
@@ -257,6 +298,16 @@ impl RollupState {
         let sealed = self.close_bucket();
         self.bucket = Some(Accumulator::open(self.tier, ts, value));
         sealed
+    }
+
+    /// Whether the tier holds `span` open: closed buckets of it unsealed, or its open bucket.
+    fn holds_open(&self, span: SpanStart) -> bool {
+        let bucket_span = |b: &Accumulator| {
+            self.tier
+                .tier()
+                .span_of(b.index() * self.tier.bucket_secs())
+        };
+        self.open.holds(span) || self.bucket.as_ref().is_some_and(|b| bucket_span(b) == span)
     }
 
     fn sweep(&mut self, hub_now: u64) -> Vec<Sealed> {
@@ -540,6 +591,155 @@ mod tests {
         assert_eq!(
             buckets.iter().map(|b| b.avg).collect::<Vec<_>>(),
             vec![4, 6]
+        );
+    }
+
+    #[test]
+    fn a_closed_span_seals_each_tiers_open_chunk_and_only_once_closed() {
+        // Points in the raw and minute span [T0, T0 + 1 h) and the hour span [T0, T0 + 1 day).
+        let mut state = SeriesState::new(ValueKind::Percent);
+        feed(&mut state, &[(T0 + 10, 4), (T0 + 70, 6)]);
+        let hour_end = T0 + 86_400;
+        type Row = (&'static str, u64, Vec<Tier>);
+        let cases: [Row; 7] = [
+            ("at the raw grace: nothing", T0 + 3_600 + 120, vec![]),
+            (
+                "raw closed; minute's last bucket swept first",
+                T0 + 3_600 + 121,
+                vec![Tier::Raw, Tier::Minute],
+            ),
+            ("again: nothing left", T0 + 3_600 + 500, vec![]),
+            (
+                "the hour bucket swept into the hour chunk; the day still open",
+                T0 + 7_201,
+                vec![],
+            ),
+            (
+                "past the day's end plus the raw grace",
+                hour_end + 121,
+                vec![],
+            ),
+            ("at the hour grace", hour_end + 3_660, vec![]),
+            ("the hour span closed", hour_end + 3_661, vec![Tier::Hour]),
+        ];
+        for (name, now, tiers) in cases {
+            state.sweep(now);
+            let sealed = state.seal_closed(now);
+            assert_eq!(
+                sealed.iter().map(|s| s.tier).collect::<Vec<_>>(),
+                tiers,
+                "{name}"
+            );
+            for s in &sealed {
+                assert_eq!(s.span, s.tier.span_of(T0), "{name}");
+            }
+        }
+        assert_eq!(state.unsealed_points(), vec![]);
+        assert_eq!(state.unsealed_buckets(RollupTier::Minute), vec![]);
+        assert_eq!(state.unsealed_buckets(RollupTier::Hour), vec![]);
+    }
+
+    #[test]
+    fn sealing_closed_spans_keeps_the_open_span_and_every_point_once() {
+        let mut state = SeriesState::new(ValueKind::Count);
+        feed(&mut state, &[(T0 + 5, 1), (T0 + 3_600 + 5, 2)]);
+        // No sweep: the minute bucket of T0 + 3,605 is still open, so only the closed span's
+        // minute chunk (holding the bucket of T0 + 5) is left to seal. The raw span T0 was
+        // sealed by the point in the next span; nothing of the open span is sealed.
+        let sealed = state.seal_closed(T0 + 3_600 + 121);
+        assert_eq!(
+            sealed.iter().map(|s| (s.tier, s.span)).collect::<Vec<_>>(),
+            vec![(Tier::Minute, Tier::Minute.span_of(T0))],
+            "{sealed:?}"
+        );
+        assert_eq!(
+            state.unsealed_points(),
+            vec![RawPoint {
+                ts: T0 + 3_605,
+                value: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn a_series_holds_a_span_open_while_it_has_unsealed_data_or_an_open_bucket_there() {
+        let span = |tier: Tier| tier.span_of(T0);
+        let mut state = SeriesState::new(ValueKind::Percent);
+        assert!(
+            !state.holds_open(Tier::Raw, span(Tier::Raw)),
+            "a new series holds nothing"
+        );
+        feed(&mut state, &[(T0 + 3_599, 7)]);
+        let cases = [
+            ("raw point unsealed", Tier::Raw, span(Tier::Raw), true),
+            (
+                "minute bucket open, closing into S",
+                Tier::Minute,
+                span(Tier::Minute),
+                true,
+            ),
+            ("hour bucket open", Tier::Hour, span(Tier::Hour), true),
+            (
+                "another raw span",
+                Tier::Raw,
+                Tier::Raw.span_of(T0 + 3_600),
+                false,
+            ),
+            (
+                "another minute span",
+                Tier::Minute,
+                Tier::Minute.span_of(T0 + 3_600),
+                false,
+            ),
+            (
+                "another hour span",
+                Tier::Hour,
+                Tier::Hour.span_of(T0 + 86_400),
+                false,
+            ),
+        ];
+        for (name, tier, s, open) in cases {
+            assert_eq!(state.holds_open(tier, s), open, "{name}");
+        }
+        // A closed bucket of S still unsealed in the minute chunk, and the open bucket in the
+        // next span: S is held by the chunk, the next span by the bucket.
+        let mut quiet = SeriesState::new(ValueKind::Count);
+        feed(&mut quiet, &[(T0 + 5, 1), (T0 + 3_605, 2)]);
+        assert!(
+            quiet.holds_open(Tier::Minute, span(Tier::Minute)),
+            "a closed bucket unsealed in S"
+        );
+        assert!(
+            quiet.holds_open(Tier::Minute, Tier::Minute.span_of(T0 + 3_600)),
+            "the open bucket's span"
+        );
+        assert!(
+            !quiet.holds_open(Tier::Raw, span(Tier::Raw)),
+            "the raw chunk of S was sealed by the next span's point"
+        );
+        // The same for the hour tier: the day's last hour bucket closed into its chunk, the
+        // open bucket already in the next day.
+        let mut daily = SeriesState::new(ValueKind::Count);
+        feed(&mut daily, &[(T0 + 86_399, 1), (T0 + 86_400 + 5, 2)]);
+        assert!(
+            daily.holds_open(Tier::Hour, span(Tier::Hour)),
+            "a closed hour bucket unsealed in S"
+        );
+        assert!(
+            daily.holds_open(Tier::Hour, Tier::Hour.span_of(T0 + 86_400)),
+            "the open hour bucket's span"
+        );
+        let now = T0 + 3_600 + 121;
+        state.sweep(now);
+        state.seal_closed(now);
+        assert!(!state.holds_open(Tier::Raw, span(Tier::Raw)), "sealed");
+        assert!(
+            !state.holds_open(Tier::Minute, span(Tier::Minute)),
+            "swept and sealed"
+        );
+        assert!(
+            state.holds_open(Tier::Hour, span(Tier::Hour)),
+            "the hour span is still open"
         );
     }
 

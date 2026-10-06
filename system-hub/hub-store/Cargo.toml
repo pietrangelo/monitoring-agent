@@ -17,4 +17,5 @@ proptest = "1"
 tempfile = "3"
 
 [dependencies]
+crc32c = "0.6"
 redb = "4.3.0"
