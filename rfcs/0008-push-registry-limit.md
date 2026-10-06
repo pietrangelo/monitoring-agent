@@ -216,8 +216,11 @@ adapter only feeds it.
   `forget_shown_round` (a poll answered 404 or `null`) is recorded as an ordinal too: it bumps
   the entry's `AtomicU64` **without taking the admission lock**, which another task may hold
   across `append`'s await on the writer, so a forget never waits on a store commit, and sets
-  `shown` to `Forgotten { at, ordinal }` when its ordinal is higher than `shown`'s, and records
-  that ordinal in the admission entry's `forgotten` (`fetch_max`, also lock-free), so a queued
+  `shown` to `Forgotten { at, ordinal }` when its ordinal is higher than `shown`'s, after it has
+  recorded that ordinal in the admission entry's `forgotten` (`fetch_max`, also lock-free):
+  **the `fetch_max` comes first**, then the check and the write of `shown` under the
+  `live_applications` lock, and *show* reads `forgotten` while holding that same lock, so one of
+  the two always sees the other. So a queued
   older *show*, or one whose ordinal was taken at `decide` before the forget, can't resurrect a
   round the agent said it no longer has, **even when no `live_applications` entry existed yet**
   (a system's first round still in `append`); it creates no `live_applications` entry. The throttle is a value,
@@ -447,7 +450,8 @@ TDD, per `CLAUDE.md`, with `red-test-adversary` and `rosette-auditor`.
     leave `shown` on the newer; an empty round is `Stored` and replaces `shown`; a forget
     followed by a queued older *show* leaves `shown` forgotten; a forget that runs while a round's
     `append` is pending (a seam inside `append`) leaves `shown` forgotten after that round's
-    *show*, also when it is the system's first round and no `live_applications` entry existed; `RefusalThrottle` as a table
+    *show*, also when it is the system's first round and no `live_applications` entry existed,
+    and with a seam between the forget's `fetch_max` and its `shown` step, *show* run in it; `RefusalThrottle` as a table
     (first note warns, a second within the hour is quiet, at the hour warns, `prune` drops ids);
   - a delete through a seam **inside *show***, between the generation check and the insert: the
     delete's hook waits for the Registry guard, and no orphan entry exists afterwards;
@@ -693,6 +697,7 @@ Last verification (with 0010's and 0011's), the 0008 part:
 | Finding | Verdict | Resolution |
 |---|---|---|
 | a forget bumping the counter inside the admission waits on its lock, held across `append` | PLAUSIBLE (low) | the ordinal is an `AtomicU64` beside the mutex; a forget bumps it lock-free (§3) |
+| the order of the forget's `fetch_max` and its `shown` step was unstated | PLAUSIBLE (0010's final verification) | **adopted**: `fetch_max` first; *show* reads `forgotten` under the `live_applications` lock; a seam row (§3, Testing) |
 | a forget before a system's first *show* found no entry and recorded nothing | CONFIRMED (0010's block-file verification) | the forget's ordinal kept in the admission entry's `forgotten` (`fetch_max`); *show* must beat it too; a test row (§3, Testing) |
 | with a lock-free forget, a round recorded after its `append` took a higher ordinal and showed over the forget | CONFIRMED (0010's block-file pass) | the ordinal is taken at `decide`, before `append`; `Forgotten` carries its ordinal and both replace `shown` only upward; a test row (§3, Testing) |
 

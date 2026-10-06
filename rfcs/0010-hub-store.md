@@ -75,7 +75,7 @@ one redb transaction decides on which side of the handoff a span lives (§5, §6
 | History | tiered downsampling: raw points, 1-minute rollups, 1-hour rollups | owner |
 | Sequencing | RFC 0009 ships first on SQLite | owner |
 | Precision | a declared resolution per metric kind (values stored as scaled integers) | owner |
-| Default tiers | raw 24 h, 1-minute 14 days, 1-hour **30 days** (so by default nothing is kept longer than 30 days; a longer hour tier is set through `HUB_RETENTION` or a system's override) | owner (30 days: 2026-10-06) |
+| Default tiers | raw 24 h, 1-minute 14 days, 1-hour **30 days** (so by default no metric history is kept longer than 30 days; a longer hour tier is set through `HUB_RETENTION` or a system's override). Alert records follow their own `events=` period, 90 days by default (0011 §5), and freed pages of `hub.redb` keep old bytes until reused or compacted (Impact) | owner (30 days: 2026-10-06) |
 | Erasure of a deleted system | unreadable at once; removed from `hub.redb` within one retention pass; in block files written before the delete, removed when the file is rewritten or retired, at the latest at the tier's longest effective retention (30 days with the defaults) | owner (2026-10-06) |
 | Storage cap | on by default: 80% of the data volume's size, re-read at every retention pass; `HUB_STORAGE_LIMIT=none` disables it. *Behaviour change.* | owner |
 | Container mounts | dropped by the hub's snapshot → points rule. *Behaviour change.* | owner |
@@ -228,8 +228,10 @@ impl HubClock {
   the scale target, which the floor check counts when the rewind will act, §8), so the rules
   below act on it as on a span never handed off and its next handoff writes a new file, never
   over the old one (§6); a span whose file is unreadable (§6 step 2a) can't be brought back and
-  is dropped instead, its row removed, logged at `warn` and counted, so the rewind never loops
-  at open. It discards open
+  is dropped instead (its row and `block_generations` entries removed and its file queued in
+  `pending_unlinks`, as for a brought-back span, logged at `warn` and counted), and a chunk of a
+  brought-back file that fails its CRC is skipped, logged at `warn` and counted, so the rewind
+  always commits and never loops at open. It discards open
   chunks that start after it, resets `last_issued` to the system clock and every series' last
   timestamp to `min(last, system clock)`, applies `min(x, system clock)` to every other persisted hub
   time (0011's receipts' and `MailNewest`'s `received_at`, `last_seen_active`, the flushed
@@ -587,6 +589,14 @@ pub struct PendingShortening { next: TierSetting, delay: Duration }
   rule still sees it.
 - **A file is retired when every chunk in it is dead**: with no overrides, when its span passes
   its tier's global retention, the whole span at once.
+- **A span in flight is left alone.** While the block writer hands off or rewrites S (from its
+  read transaction to the commit or the failure of its row), the writer keeps an in-memory set
+  of such spans, and pass steps 3, 4 and 6 and the storage cap skip S: they don't delete its
+  chunks from `chunks`, retire its row or purge its generation's chunks there, and the cap moves
+  to the next oldest file. S's turn comes at the next pass. So a crash in the middle always
+  leaves what §6 step 2a's rules expect: a handoff's chunks still in `chunks`, a rewrite's row
+  still at its number with its own file present. A crash empties the set, and reconciliation
+  runs at open before any pass.
 - **Rewrite.** A file that still holds live chunks is rewritten without its dead ones (§6: a new
   file under the next rewrite number, a row swap that queues the old file in `pending_unlinks`)
   when **(a)** its tombstoned bytes reach 25% of its length, or **(b)** its span is past the
@@ -874,18 +884,22 @@ The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's,
 
 **Opening, in order**, in `main`, after configuration and before any other state:
 1. the data-directory checks below (they create nothing when a check fails);
-2. when `hub.redb` exists, **open it**, which takes redb's file lock before any other state: a
-   second hub on the same directory gets `DatabaseAlreadyOpen` and refuses to start, naming
-   the file, and touches nothing. A redb open that fails for lack of space exits as the floor
-   check does. When `hub.redb` is absent and `blocks/` holds any file, the hub refuses to start,
-   naming the directory (an empty store must not adopt or delete history it doesn't know);
-3. **compaction**, when `HUB_STORE_COMPACT=1` asks for it (§5), on that open database: it runs
-   **before** the floor check, since a data volume full of reclaimable `hub.redb` is the case
-   it exists for;
-4. **cleanup of a crash's leftovers**, under the lock and also before the floor check, since a
-   crash in the middle of a raw handoff or rewrite can leave ≈ 0.55 GB that would otherwise
-   hold the volume below the floor: every `*.tmp` under `blocks/` is deleted (no row ever names
-   one), and the block files are reconciled (§6 step 2a);
+2. **the directory lock**: an exclusive, non-blocking `flock` on `HUB_DATA_DIR/hub.lock`
+   (created 0600, `rustix::fs::flock`, held for the process's life) before any other state; a
+   second hub on the same directory gets `EWOULDBLOCK`, refuses to start naming the file, and
+   touches nothing. redb's own file lock is still taken when the file opens. Under the lock,
+   every `*.tmp` under `blocks/` is deleted (no row ever names one) **before redb opens**, since
+   a crash in the middle of a raw handoff or rewrite (a fail-stop on `ENOSPC` among them) can
+   leave ≈ 0.55 GB that would otherwise keep redb's repair, or the floor check, short of space;
+3. when `hub.redb` exists, **open it**; a redb open that fails for lack of space exits as the
+   floor check does. When `hub.redb` is absent and `blocks/` holds any `.blk` file, the hub
+   refuses to start, naming the directory (an empty store must not adopt or delete history it
+   doesn't know). Then **compaction**, when `HUB_STORE_COMPACT=1` asks for it (§5), on that
+   open database: **before** the floor check, since a data volume full of reclaimable
+   `hub.redb` is the case it exists for;
+4. the **reconciliation** of the block files (§6 step 2a), also before the floor check, since
+   the files a crash left (`pending_unlinks`, a handoff or rewrite before its commit) can hold
+   as much space as a `.tmp`;
 5. the **floor check** (§6): `statvfs` on `HUB_DATA_DIR`; below the floor the hub exits before
    creating anything. When `HUB_CLOCK_REWIND` matches, the floor is raised by twice the
    length of the files the rewind will bring back (§2). The storage cap's retirements run at the first retention pass, after this
@@ -898,7 +912,7 @@ The admin token is 0012's, the secret key 0011's, `HUB_MAX_PUSH_SYSTEMS` 0008's,
    constant); otherwise the hub exits naming the clock, so a host that boots before NTP (no
    real-time clock) can't create a retention clock decades in the past (§2). An existing file
    keeps its persisted clocks. `blocks/` and its tier directories are created with mode 0700.
-   Everything 0011 writes beside the store (the generated key) happens after redb's lock is
+   Everything 0011 writes beside the store (the generated key) happens after `hub.lock` is
    held, so two hubs can't both generate a key.
    (The steps of §6's recovery that follow the reconciliation run after this list.)
 
@@ -1291,7 +1305,7 @@ tier names, and is an open read like the rest of the hub API.
   before any file is created, on `HUB_DATA_DIR`, `blocks/` and its tier directories; block files
   opened with `O_NOFOLLOW` and named from typed keys; `hub.redb` and block files created 0600 in
   0700 directories; redb's
-  file lock; fail-closed configuration; one-shot `HUB_CLOCK_REWIND` and `HUB_STORE_FORGET_BLOCK`;
+  file lock behind `hub.lock`; fail-closed configuration; one-shot `HUB_CLOCK_REWIND` and `HUB_STORE_FORGET_BLOCK`;
   no new store created before the binary's build date; the data directory and key ignored by git and
   Docker.
 - **A06 Vulnerable Components:** `redb` (pure Rust, no dependencies), `crc32c` (pure Rust) and
@@ -1397,7 +1411,11 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
     rewrite (its row at `r1`, `S.r1.blk` gone, `S.r3.blk` present), and `hub.redb` taken while
     S was still open (part of S in `chunks`, `S.blk` whole); a row-less file no rule explains
     refuses the same way; `hub.redb` absent with files in `blocks/` refuses;
-  - a second hub on the same directory refuses at redb's lock and deletes no `.tmp`;
+  - a second hub on the same directory refuses at `hub.lock` and deletes no `.tmp`; a raw `.tmp`
+    left by a fail-stop on `ENOSPC` is deleted before redb opens;
+  - a kill inside each in-flight window (a handoff after its rename while pass step 3 would
+    expire S, a rewrite after its rename while the cap would retire S): the pass and the cap
+    skipped S, and the reopen deletes the orphan by rule (a) or (b) and starts;
   - an orphan `.tmp` of 0.55 GB that holds free space below the floor is deleted before the
     floor check, and the hub starts; a rename that succeeded before a failed directory `fsync`
     leaves no row-less `S.blk`;
@@ -1504,7 +1522,9 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   spans are back in `chunks` and their files retired, the next handoff writes a new file and
   replaces none, the counts equal a recomputation from raw, and every pre-fault point of the
   brought-back span survives a further seal in it; a rewind whose span's file is unreadable
-  drops that span, counted, and the hub opens.
+  drops that span, counted, and the hub opens, then restarts twice and opens both times with
+  the file gone; a brought-back file with one corrupt chunk skips that chunk, counted, and the
+  rewind commits.
 - **Storage cap**: the `80%` default from an injected volume size, re-read when it grows;
   deletion order; the cap unmet; `none`.
 - **Compaction**: `HUB_STORE_COMPACT=1` compacts only above the threshold; the reclaimable
@@ -1515,7 +1535,7 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
   primary or supplementary group, owned by the hub or by root (accepted); an `emptyDir`-like
   ancestor (refused); `/tmp`-like with the sticky bit (accepted); an ancestor owned by another
   user (refused); no file created when a check fails; `hub.redb` created 0600; a second process
-  refused by redb's lock.
+  refused by `hub.lock` (and redb's lock behind it).
 - **Hub adapter and routes**: the metric tests of `db.rs` ported; resolution boundaries (`auto`
   without `since`; exactly at `limit × 2 s` and one second past; exactly at `limit × 60 s`;
   `since` at a tier's retention edge and one second older); `limit` 0, 10,000 and 10,001;
@@ -1550,7 +1570,7 @@ nearly all of it is unit-testable. The crash tests target **our** invariants on 
 - **Domain model**: the Fleet Storage context; Fleet History and Fleet Registry rows; the
   glossary per Domain impact.
 - **Trust boundaries**: the data directory, `blocks/` and its tier directories (checks, modes,
-  `O_NOFOLLOW`, redb's lock); block files trusted as far as redb's pages are (CRCs against bit
+  `O_NOFOLLOW`, `hub.lock` and redb's lock); block files trusted as far as redb's pages are (CRCs against bit
   rot, not against a writer of `HUB_DATA_DIR`).
 - **Storage**: rewritten: `hub.redb` and its tables, the block files and their format, the span
   handoff and its reconciliation, live and dead chunks and rewrites, tiers and spans, the group
@@ -1923,11 +1943,31 @@ the backlog bound held. Every finding was acted on:
 | the rewind had no answer for an unreadable span or for seq; its size understated | CONFIRMED / PLAUSIBLE | the span dropped and counted; seq from the tail, last chunks reopened into tails; ≈ 0.94 GB read, ≈ 1.6 GB written, counted by the floor (§2, §5, §8) |
 | 0008: a forget before the first *show* was lost | CONFIRMED | `forgotten` ordinal in the admission entry (0008 §3) |
 | a Testing row contradicted the backlog bound | CONFIRMED | split (Testing) |
-| `.tmp` cleanup ran before redb's lock | CONFIRMED (low) | redb opened first; cleanup and compaction under its lock (§8) |
+| `.tmp` cleanup ran before redb's lock | CONFIRMED (low) | redb opened first; cleanup and compaction under its lock (§8); *superseded by the final verification: `hub.lock` first, then `.tmp` cleanup, then redb* |
 | leftovers outside the rules: a failed directory `fsync`, an absent `hub.redb` beside files | PLAUSIBLE (low) | **adopted**: the final name unlinked on failure; an absent `hub.redb` with files in `blocks/` refuses to start (§6, §8) |
 
 Came closest and survived: the backlog fail-stop under `ENOSPC` on a shared volume (the restart's
 floor check either hands the volume to the operator or leaves room for the raw write).
+
+`rfc-adversary`, final verification (commits 5003309 and 0d21d7e). The mixed-backup refusals,
+`HUB_STORE_FORGET_BLOCK`, `block_generations`, tombstoned bytes, the damaged-file skip, the
+rewind's floor and the 30-day default across 0010, 0011 and 0012 held. Every finding was acted
+on:
+
+| Finding | Verdict | Resolution |
+|---|---|---|
+| the rewind dropped an unreadable span without queueing its file, so the next start refused | CONFIRMED | the file queued in `pending_unlinks` and its entries deleted; a two-restart test row (§2, Testing) |
+| a crash while a retirement, the cap or an expiry raced an in-flight handoff or rewrite left a file no rule explained | CONFIRMED | spans in flight are left alone by the pass and the cap until their commit or failure, so step 2a's rules always hold; kill rows in both windows (§5, Testing) |
+| one corrupt chunk in a brought-back file looped the rewind | CONFIRMED | the chunk skipped and counted; the rewind always commits (§2, Testing) |
+| "nothing kept longer than 30 days" ignored alert records (90 days) and freed pages | CONFIRMED (text) | the decision row scoped to metric history, with both stated (decisions table) |
+| redb's repair ran before a 0.55 GB `.tmp` could be deleted | PLAUSIBLE | **adopted**: `hub.lock` first, `.tmp` cleanup, then redb (§8) |
+| 0008: the forget's `fetch_max` and `shown` order | PLAUSIBLE | **adopted**: `fetch_max` first, *show* reads under the `live_applications` lock (0008 §3) |
+
+**For the owner:** alert records keep their own 90-day default (`events=`, 0011 §5); lowering it
+to 30 days is a one-line change if wanted.
+
+Came closest and survived: reusing a rewound span's name (`RENAME_NOREPLACE` refuses while the old
+file exists, and its `pending_unlinks` entry is gone long before S can close again).
 
 **Earlier passes, as written against the custom engine.** Section references in these tables
 point at that draft, not at this one; the redb rewrite above says what each finding is now.
