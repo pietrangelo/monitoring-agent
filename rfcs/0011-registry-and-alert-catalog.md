@@ -238,8 +238,9 @@ generation in `systems` and `tombstones`, as defence in depth.
   cursor after a restart. Its chunks in **block files** are dead at once (never read) and their
   bytes leave the disk only when the file is rewritten (its dead bytes reach 25%) or unlinked
   (its span passes the tier's longest effective retention: by default a day for raw, 14 days
-  for minute, 30 days for hour). No file written after the delete holds its chunks: the
-  handoff and every rewrite skip tombstoned generations. This delay is the owner's decision (2026-10-06, 0010's decisions table). The README's "Remove system + all data" becomes "removes the system; its data
+  for minute, 30 days for hour). No file begun after the delete holds its chunks: the
+  handoff and every rewrite skip tombstoned generations, and a file already being written when
+  the delete commits counts its chunks as tombstoned bytes from its own commit (0010 §5). This delay is the owner's decision (2026-10-06, 0010's decisions table). The README's "Remove system + all data" becomes "removes the system; its data
   is unreadable at once; recent data is removed from the store within about 10 minutes, older
   data when its storage block is rewritten or expires (within 30 days with the default
   retention), and
