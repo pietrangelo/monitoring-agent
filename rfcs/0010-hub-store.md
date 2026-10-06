@@ -1,6 +1,7 @@
 # RFC 0010: Hub Store on redb — Tiered Time Series and the Hub's Catalog in One Embedded Database
 
-- Status: Draft
+- Status: Accepted (2026-10-06, after the block-file amendment's `rfc-adversary` pass and two
+  verifications, Review; ships with 0008, 0011 and 0012)
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-26 (rewritten on redb the same day, after three `rfc-adversary` passes on a
   custom engine; amended 2026-10-03 for RFC 0017's mail systems; see Review)
@@ -75,7 +76,7 @@ one redb transaction decides on which side of the handoff a span lives (§5, §6
 | History | tiered downsampling: raw points, 1-minute rollups, 1-hour rollups | owner |
 | Sequencing | RFC 0009 ships first on SQLite | owner |
 | Precision | a declared resolution per metric kind (values stored as scaled integers) | owner |
-| Default tiers | raw 24 h, 1-minute 14 days, 1-hour **30 days** (so by default no metric history is kept longer than 30 days; a longer hour tier is set through `HUB_RETENTION` or a system's override). Alert records follow their own `events=` period, 90 days by default (0011 §5), and freed pages of `hub.redb` keep old bytes until reused or compacted (Impact) | owner (30 days: 2026-10-06) |
+| Default tiers | raw 24 h, 1-minute 14 days, 1-hour **30 days** (so by default no metric history is kept longer than 30 days; a longer hour tier is set through `HUB_RETENTION` or a system's override). Alert records follow their own `events=` period, also 30 days by default (0011 §5, owner, 2026-10-06), and freed pages of `hub.redb` keep old bytes until reused or compacted (Impact) | owner (30 days: 2026-10-06) |
 | Erasure of a deleted system | unreadable at once; removed from `hub.redb` within one retention pass; in block files written before the delete, removed when the file is rewritten or retired, at the latest at the tier's longest effective retention (30 days with the defaults) | owner (2026-10-06) |
 | Storage cap | on by default: 80% of the data volume's size, re-read at every retention pass; `HUB_STORAGE_LIMIT=none` disables it. *Behaviour change.* | owner |
 | Container mounts | dropped by the hub's snapshot → points rule. *Behaviour change.* | owner |
@@ -1963,8 +1964,9 @@ on:
 | redb's repair ran before a 0.55 GB `.tmp` could be deleted | PLAUSIBLE | **adopted**: `hub.lock` first, `.tmp` cleanup, then redb (§8) |
 | 0008: the forget's `fetch_max` and `shown` order | PLAUSIBLE | **adopted**: `fetch_max` first, *show* reads under the `live_applications` lock (0008 §3) |
 
-**For the owner:** alert records keep their own 90-day default (`events=`, 0011 §5); lowering it
-to 30 days is a one-line change if wanted.
+**Owner's decision (2026-10-06):** alert records' `events=` default lowered to 30 days too
+(0011 §5), so by default neither metric history nor alert records are kept longer than 30 days.
+RFCs 0008, 0010 and 0011 set to Accepted.
 
 Came closest and survived: reusing a rewound span's name (`RENAME_NOREPLACE` refuses while the old
 file exists, and its `pending_unlinks` entry is gone long before S can close again).

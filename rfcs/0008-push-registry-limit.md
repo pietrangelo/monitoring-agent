@@ -1,6 +1,7 @@
 # RFC 0008: Push Registry Limit and Push System Lifecycle
 
-- Status: Draft
+- Status: Accepted (2026-10-06, after the `rfc-adversary` passes recorded in Review; ships with
+  0010, 0011 and 0012)
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-25 (revised 2026-09-26 for the catalog-backed registry, then for the redb store;
   2026-09-29, §5 and §7 split into RFC 0016; 2026-10-03, amended for RFC 0017's mail systems and

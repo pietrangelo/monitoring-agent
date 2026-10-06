@@ -1,7 +1,7 @@
 # RFC 0009: Spring Boot Application Telemetry
 
 - Status: Implemented
-- Amended by RFC 0008 (Draft, ships with the redb release) §3: §5's `on_stored` splits into
+- Amended by RFC 0008 (Accepted, ships with the redb release) §3: §5's `on_stored` splits into
   *record* (under the admission lock, which then holds `recent` and the paces) and *show* (under
   the Registry's read lock, by generation), and §8's delete-then-evict order is superseded by
   the generation fence (the delete's commit hook evicts by generation); the one-round guarantee

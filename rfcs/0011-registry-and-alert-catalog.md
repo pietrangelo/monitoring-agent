@@ -1,6 +1,7 @@
 # RFC 0011: Registry and Alert Catalog, with Sealed Agent Tokens
 
-- Status: Draft
+- Status: Accepted (2026-10-06, after the `rfc-adversary` passes and their verifications recorded
+  in Review; ships with 0008, 0010 and 0012)
 - Author: Claude (pairing with pietrangelomasalaMD)
 - Date: 2026-09-26 (rewritten on redb the same day; amended 2026-10-03 for RFC 0017's mail
   systems; see Review)
@@ -352,7 +353,8 @@ of the intake as `last_seen_active`. Where a rule below says "poll", it means ei
   incident updates only `last_seen_active`, coalesced: written only when at least 1 h has passed
   since the stored value. A repeated acknowledgement writes nothing.
 - **Retention (`events`)** evicts a record once `last_seen_active` is older than the `events`
-  period (default 90 days, bounds 1 d to 400 d, `events=` in 0010's `HUB_RETENTION`), measured
+  period (default **30 days**, owner's decision of 2026-10-06, in line with 0010's metric
+  history; bounds 1 d to 400 d; `events=` in 0010's `HUB_RETENTION`), measured
   on **0010's retention clock**, not hub time, so a forward clock fault can't evict incidents
   that are still firing. It runs in 0010's retention pass, in transactions of at most 1,000
   evictions. An incident still reported is never evicted, however old.
