@@ -14,3 +14,7 @@ publish = false
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
+
+[dependencies]
+redb = "4.3.0"

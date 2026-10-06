@@ -292,6 +292,46 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
   count. Both reopen from their bytes, which is how a tail will be persisted.
 - `rollup.rs`: `Accumulator`, a series' open bucket, summed in `i128`; its average rounds
   half away from zero.
+- `series.rs`: `SeriesId` (interned, never reused), `SeriesKey` (system key, generation,
+  metric name; its bytes start with the length-prefixed system key, so one system's keys never
+  run into another's) and `SeriesRecord` (kind and last span per tier).
+- `state.rs`: `SeriesState`, one series in the head: its open raw chunk, its open minute and
+  hour buckets and chunks, sealing a chunk when it is full or a point lands in a new span, and
+  the sweep that closes quiet series' buckets more than one bucket length past their end.
+  `state/tail.rs` persists it as the series' **tail**, checked whole when read back (kind,
+  spans on their grid, chunks decodable, values in the domain, buckets consistent, and the
+  fields against each other: every point and bucket in its chunk's span and none after the
+  series' last time).
+- `clock.rs`: `HubClock` (hub time: `max(system clock, last issued)`, never backwards) and
+  `retention_now`, the guarded retention clock (at most twice real time, never past either
+  clock, unchanged by the first pass after an open).
+- `tables.rs`: the store's redb tables (`meta`, `series`, `series_key`, `points_log`, `tails`,
+  `chunks`) and the points log's entry format.
+- `store.rs` and `store/`: the `Store` (generic over the hub's commit-hook change type).
+  - **One writer thread** (`store/writer.rs`) owns every redb write transaction. Callers send
+    requests over a bounded channel and wait for the answer. An `append` is stamped at hub time,
+    checked and applied to the head (`store/ingest.rs`), and answered at once; a catalog
+    transaction (`transact`) runs its closure inside the open transaction (`store/catalog.rs`,
+    `CatalogTxn`: catalog tables as bytes, `notify`, staged points) and is answered after the
+    commit holding it (`Commit::Durable` forces that commit; a write-free one per its `Answer`;
+    a refusal only before its first write, otherwise the store fails stop).
+  - **The group commit**: every commit interval (1 s by default), unconditionally, one redb
+    transaction with 2-phase commit and quick-repair, made durable before it returns, holds
+    the interval's points as one `points_log` entry, every chunk sealed in it, the tails and
+    records of the series that sealed or are new, the slice of the **rotating tail flush** due
+    by elapsed time (every series' tail once per rotation, 15 minutes by default), the catalog
+    writes, the deletion of log entries older than the last completed rotation's start, and
+    the clock. After it, the commit hook gets the interval's changes, in commit order.
+  - **The head** (`store/head.rs`): active series in 16 shards behind leaf locks; only the
+    writer changes it. **Queries** (`store/query.rs`) read committed chunks in a redb read
+    transaction and copy the series' uncommitted chunks and unsealed points from its shard,
+    checking every value against the series' kind; an unsealed point at or before the last
+    committed one was sealed meanwhile and is read once. A commit hook must not call back
+    into the store.
+  - **Recovery** (`store/open.rs`): redb's own repair, then the head from the tails, then the
+    points log replayed in order, each point applied only to a series whose last point is
+    earlier, then a sweep. A panic on the writer thread, an I/O error on commit or a refusal
+    after a write fails the store stop: every later call answers `Failed`.
 
 Measured encoded sizes (`hub-store/tests/size_budget.rs`, seeded generators over a day of
 points; the test asserts these plus 10%):
@@ -343,7 +383,7 @@ match those rules (listed under Open architectural questions below).
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`, `MAX_DISPLAY_BYTES`, `UptimeDisplay`, `LastSeen`, `StatusUpdate` / `after_snapshot`, `PollInterval`, `needs_system_info`, `SystemSource`, `PUSH_URL`, `polled_systems`); `presence.rs` (`PushPresence`, `ConnectionNumber`, `ConnectionLease`, `LeaseHandle`, `Ending`, `Sweep`, `OfflineReason`, `RECONNECT_GRACE`) | `db/mod.rs` `systems` table (`insert_system_if_absent` / `Registration`, `update_system_status` for the offline markings), `db/sources.rs` (`system_sources` / `SourceRow`, `reset_status`), `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll: `PolledAnswer` / `PolledInfo`, the parsed answer and the system info the registry fill reads; `PollFailure`; `MAX_SYSTEM_BODY`; `collector/capped_body.rs`: `read_capped`, `CappedBodyError`), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` (with `RegistryUnavailable` / `RegistryFailure`) / `Answer`, the handshake and idle deadlines, the oversize linger; `push/ingest.rs`: hub-side `PushPayload`, `SnapshotFrame` / `PushedInfo`, `SnapshotRefusal`, `register_and_accept`, `register_if_new`, `ingest_frame`, `update_registry`, `end_connection`; `push/connection.rs`: `ConnectionState` (a connection's decode budget, pace and counts), `Tally`, `Occurrence`, `warn_first`, `DecodeBudget`, `DECODE_BURST`); `snapshot_intake.rs` stores one snapshot for either mode (`store_snapshot`: the rule, the store, the live metrics entry); `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `log_refused_round`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits`, `PushConfig` (with `decode_refill`) and the production timings, `DECODE_REFILL` among them) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`AlertRecord`, `HubSummary`); `snapshot.rs` (`ReportedSnapshot`, `ReportedDisk`, `Snapshot`, `Scalar`, `MountPoint`, `SnapshotTime`, `LeftOut`, `snapshot_rule`, `MAX_DISKS`, `MAX_MOUNT_POINT_BYTES`, `LeftOutLog`, `left_out_log`, `snapshot_retention`, `LiveMetrics`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db/history.rs` `metrics` / `metric_retention` tables (`store_snapshot` / `SnapshotStored`, `store_round`, the pruning), `db/mod.rs` `alerts` table, `state.rs` (`live_metrics`, `evict_live_metrics`, `live_applications`, `summary`), `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`; `routes/sse.rs`: the publisher, `Summary`, `SummaryFailure`, and the wire DTOs `SummaryDto` / `LiveMetricsDto`) | stored time series, alert history, retention, each system's live metrics, and each system's shown scrape round |
-| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`) | none yet (RFC 0010 adds redb and block files) | how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
+| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
 
 Two pure modules belong to no context and have no domain term of their own:
 `token_bucket.rs` (`TokenBucket`, `Refill`, `Empty`), the bucket arithmetic both `SourcePace`
@@ -499,6 +539,17 @@ mixed-version fleet must keep working):
 | **system key** | a system id's bytes as the store keys a series by them (1 to 255 bytes); not a new name for a system, only the system id in Fleet Storage's own type, which knows no other hub term | `SystemKey` (`hub-store`) |
 | **generation** | one registration of a system (RFC 0011): a system deleted and registered again gets a new generation, so its old series never mix with the new ones | `Generation` (`hub-store`) |
 | **hub time** | the one clock every metric point will be stamped with in the store, in whole seconds, which never runs backwards (RFC 0010 §2); spans and chunk timestamps are in hub time | `SpanStart`, `RawPoint::ts` |
+| **series** | one metric of one system's generation, as the store keeps it: `(system key, generation, metric name)`, interned once as a series id in the **series table** | `SeriesKey`, `SeriesId`, `SeriesRecord` |
+| **tail** | a series' open state (open chunks and buckets, last time) as persisted, rewritten when the series seals a chunk and by the rotating tail flush | `SeriesState::to_tail` |
+| **head** | the store's in-memory state of every active series: its open chunks and buckets, and its chunks sealed since the last commit; changed only by the writer thread, read by queries under a shard lock | `Head`, `HeadEntry` |
+| **seal** | closing a series' open chunk (full, or a point or bucket in a new span, or its span closing) into a **sealed chunk** of its span, at the span's next seq, committed with the next group commit | `Sealed`, `SeriesState::seal_span` |
+| **rotating tail flush** | the commit's writing of a slice of the series' tails, sized by elapsed time, so every tail is rewritten once per rotation (15 minutes by default) however many commits run | `Rotation` |
+| **commit interval** | the time between group commits (1 s by default, `HUB_COMMIT_INTERVAL`): the durability window, the most a crash can lose | `StoreOptions::commit_interval` |
+| **points log** | one entry per group commit holding its points, so the points not yet in a tail survive a crash; replayed at open, truncated once every tail was rewritten | `points_log`, `LoggedPoint` |
+| **group commit** | the one redb transaction the writer thread commits per commit interval (1 s by default), holding everything since the previous one: the durability window | `Writer::commit` |
+| **catalog** | the hub's own tables in the store's file (registry, alert records, receipts), written only through catalog transactions on the writer thread | `CatalogTable`, `CatalogTxn`, `CatalogRead` |
+| **commit class** | when a catalog transaction is committed: durable (at once) or batched (with the next group commit) | `Commit` |
+| **commit hook** | what the store calls after each commit, in commit order, with that commit's catalog changes | `Store::on_commit` |
 | **rollup** | one closed bucket of a series in a rollup tier: the average, minimum, maximum and count of its points | `Bucket`, `Accumulator` |
 
 ## Trust boundaries & auth

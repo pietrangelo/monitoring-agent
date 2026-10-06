@@ -133,6 +133,16 @@ impl RawChunk {
         out
     }
 
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
+    /// The chunk's points, in time order.
+    pub fn points(&self) -> Vec<RawPoint> {
+        // What a chunk encodes always decodes; an empty chunk decodes to no point.
+        decode_raw(&self.encode(), self.encoding).unwrap_or_default()
+    }
+
     /// Reopens an encoded chunk to push more points into it.
     pub fn reopen(bytes: &[u8], encoding: Encoding) -> Result<RawChunk, DecodeError> {
         let mut chunk = RawChunk::new(encoding);

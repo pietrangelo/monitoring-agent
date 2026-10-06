@@ -83,13 +83,14 @@ impl Accumulator {
         }
     }
 
-    /// The accumulator as persisted in a tail: index, sum, count, minimum, maximum.
-    pub fn parts(&self) -> (u64, i128, u32, i64, i64) {
+    /// The accumulator as persisted in a tail: index, sum, count, minimum, maximum. Crate
+    /// code reads and writes it through [`AccumulatorRow`]'s named fields.
+    pub(crate) fn parts(&self) -> (u64, i128, u32, i64, i64) {
         (self.index, self.sum, self.count, self.min, self.max)
     }
 
     /// An accumulator read back from a tail, if its parts are consistent.
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         index: u64,
         sum: i128,
         count: u32,
@@ -106,6 +107,48 @@ impl Accumulator {
             min,
             max,
         })
+    }
+}
+
+/// An open bucket as a tail persists it: every field named, so none can be swapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccumulatorRow {
+    pub index: u64,
+    pub sum: i128,
+    pub count: u32,
+    pub min: i64,
+    pub max: i64,
+}
+
+/// A row whose sum, count, minimum and maximum can't belong to one bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InconsistentBucket;
+
+impl From<Accumulator> for AccumulatorRow {
+    fn from(acc: Accumulator) -> AccumulatorRow {
+        let (index, sum, count, min, max) = acc.parts();
+        AccumulatorRow {
+            index,
+            sum,
+            count,
+            min,
+            max,
+        }
+    }
+}
+
+impl TryFrom<AccumulatorRow> for Accumulator {
+    type Error = InconsistentBucket;
+
+    fn try_from(row: AccumulatorRow) -> Result<Accumulator, InconsistentBucket> {
+        let AccumulatorRow {
+            index,
+            sum,
+            count,
+            min,
+            max,
+        } = row;
+        Accumulator::from_parts(index, sum, count, min, max).ok_or(InconsistentBucket)
     }
 }
 

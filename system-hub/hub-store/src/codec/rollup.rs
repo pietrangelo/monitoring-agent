@@ -133,6 +133,16 @@ impl RollupChunk {
         out
     }
 
+    pub fn rollup_tier(&self) -> RollupTier {
+        self.tier
+    }
+
+    /// The chunk's buckets, in index order.
+    pub fn buckets(&self) -> Vec<Bucket> {
+        // What a chunk encodes always decodes; an empty chunk decodes to no bucket.
+        decode_rollup(&self.encode(), self.tier).unwrap_or_default()
+    }
+
     pub fn reopen(bytes: &[u8], tier: RollupTier) -> Result<RollupChunk, DecodeError> {
         let mut chunk = RollupChunk::new(tier);
         for bucket in decode_rollup(bytes, tier)? {

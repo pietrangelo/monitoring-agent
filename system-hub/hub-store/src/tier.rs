@@ -62,6 +62,18 @@ impl Tier {
         bucket + SWEEP_SECS
     }
 
+    /// The longest retention a policy may set for the tier (RFC 0010 §5): 30 days of raw
+    /// points, 400 days of minutes, 10 years (3,650 days) of hours. No chunk older than this is
+    /// ever live, so a query never needs to look further back.
+    pub fn max_retention_secs(self) -> u64 {
+        const DAY: u64 = 86_400;
+        match self {
+            Tier::Raw => 30 * DAY,
+            Tier::Minute => 400 * DAY,
+            Tier::Hour => 3_650 * DAY,
+        }
+    }
+
     /// The tier's rollups, if it holds rollups.
     pub fn rollup(self) -> Option<RollupTier> {
         match self {
@@ -213,6 +225,19 @@ mod tests {
             );
         }
         assert_eq!(Tier::Raw.rollup(), None);
+    }
+
+    #[test]
+    fn each_tier_bounds_its_retention_from_above() {
+        const DAY: u64 = 86_400;
+        let cases = [
+            (Tier::Raw, 30 * DAY),
+            (Tier::Minute, 400 * DAY),
+            (Tier::Hour, 3_650 * DAY),
+        ];
+        for (tier, max) in cases {
+            assert_eq!(tier.max_retention_secs(), max, "{tier:?}");
+        }
     }
 
     #[test]

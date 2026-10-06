@@ -19,8 +19,14 @@
 
 #![forbid(unsafe_code)]
 
+mod bytes;
+pub mod clock;
 pub mod codec;
 pub mod name;
 pub mod rollup;
+pub mod series;
+pub mod state;
+pub mod store;
+mod tables;
 pub mod tier;
 pub mod value;
