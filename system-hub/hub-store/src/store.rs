@@ -24,14 +24,18 @@ mod head;
 mod ingest;
 mod lifecycle;
 mod open;
+mod pass;
 mod query;
+mod records;
+mod retire;
+mod rotation;
 mod writer;
 
 use std::path::Path;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use redb::{Database, ReadableDatabase};
 
@@ -41,6 +45,7 @@ use writer::Request;
 
 use crate::codec::{Bucket, RawPoint};
 use crate::name::{Generation, MetricName, SystemKey};
+use crate::retention::RetentionPolicy;
 use crate::series::SeriesKey;
 use crate::tier::Tier;
 use crate::value::ValueKind;
@@ -61,6 +66,33 @@ impl SystemClock for WallClock {
     }
 }
 
+/// The monotonic clock: time since an origin of its own, never running backwards. Read only
+/// by the writer thread, to measure the time between retention passes; injected for tests.
+pub trait MonotonicClock: Send + Sync + 'static {
+    fn elapsed(&self) -> Duration;
+}
+
+/// The host's monotonic clock, from the moment it was made.
+pub struct InstantClock(Instant);
+
+impl InstantClock {
+    pub fn new() -> InstantClock {
+        InstantClock(Instant::now())
+    }
+}
+
+impl Default for InstantClock {
+    fn default() -> InstantClock {
+        InstantClock::new()
+    }
+}
+
+impl MonotonicClock for InstantClock {
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
 /// How the store runs.
 pub struct StoreOptions {
     /// The group commit: the durability window (`HUB_COMMIT_INTERVAL`).
@@ -71,7 +103,13 @@ pub struct StoreOptions {
     pub cache_bytes: usize,
     /// How often the sweep closes quiet buckets and closed spans are handed off (§5, §6).
     pub sweep_interval: Duration,
+    /// How often the retention pass runs (§5): every 10 minutes of monotonic time.
+    pub retention_interval: Duration,
+    /// The global retention policy (`HUB_RETENTION`).
+    pub retention: RetentionPolicy,
     pub clock: Arc<dyn SystemClock>,
+    /// Measures the time between retention passes, which bounds the retention clock (§2).
+    pub monotonic: Arc<dyn MonotonicClock>,
 }
 
 impl StoreOptions {
@@ -82,7 +120,10 @@ impl StoreOptions {
             tail_rotation: Duration::from_secs(15 * 60),
             cache_bytes: 256 << 20,
             sweep_interval: Duration::from_secs(crate::tier::SWEEP_SECS),
+            retention_interval: Duration::from_secs(10 * 60),
+            retention: RetentionPolicy::default(),
             clock,
+            monotonic: Arc::new(InstantClock::new()),
         }
     }
 }
@@ -291,6 +332,8 @@ pub struct StoreStats {
     block_files: [u64; 3],
     handoff_failures: u64,
     last_failures: [Option<HandoffFailure>; 3],
+    retention_clock: u64,
+    retention_passes: u64,
 }
 
 impl StoreStats {
@@ -307,6 +350,16 @@ impl StoreStats {
     /// Why the tier's last failed handoff failed, if one did since the open.
     pub fn last_handoff_failure(&self, tier: Tier) -> Option<HandoffFailure> {
         self.last_failures[usize::from(tier.code())]
+    }
+
+    /// The retention clock as the last pass committed it (§2), or as the open read it.
+    pub fn retention_clock(&self) -> u64 {
+        self.retention_clock
+    }
+
+    /// Retention passes finished since the open.
+    pub fn retention_passes(&self) -> u64 {
+        self.retention_passes
     }
 }
 
@@ -372,6 +425,11 @@ pub(crate) struct Shared<C> {
     /// Why the store failed stop, when it decided to.
     pub fail_cause: Mutex<Option<FailCause>>,
     pub hook: Mutex<Option<SharedHook<C>>>,
+    /// The global policy; per-system overrides join it with RFC 0012's routes.
+    pub policies: crate::retention::Policies,
+    /// Deleted generations; filled by RFC 0011's tombstones.
+    pub tombstones: crate::retention::Tombstones,
+    pub retention: pass::PassStats,
 }
 
 impl<C> Shared<C> {
@@ -465,7 +523,9 @@ impl<C: Send + 'static> Store<C> {
     /// What the store reports of itself.
     pub fn stats(&self) -> Result<StoreStats, StoreError> {
         self.check()?;
-        Ok(self.shared.blocks.stats())
+        let mut stats = self.shared.blocks.stats();
+        self.shared.retention.fill(&mut stats);
+        Ok(stats)
     }
 
     /// Why the store failed stop, when it decided to (readable after the failure, for the hub

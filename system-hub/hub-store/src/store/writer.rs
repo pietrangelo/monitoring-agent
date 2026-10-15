@@ -19,26 +19,28 @@
 //! transaction) one transaction holding the interval's points log entry, the chunks sealed in
 //! it, the tails due, the catalog writes and the clock.
 
+mod files;
+
 use std::collections::BTreeSet;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
-use redb::{Database, Durability, ReadableTable, WriteTransaction};
+use redb::{Database, Durability, WriteTransaction};
 
-use super::blocks::span_range;
 use super::catalog::{CatalogTxn, Deliver, Run, Settled};
-use super::handoff::{Backlog, Handoffs, Outcome, handoff_name};
+use super::handoff::{Backlog, Handoffs, Job, Outcome};
 pub(crate) use super::ingest::Core;
+use super::pass::Retention;
+use super::rotation::Rotation;
 use super::{AppendReport, Commit, FailCause, Shared, StoreError, StoreOptions};
 use crate::block::format::BlockSummary;
 use crate::block::name::BlockName;
-use crate::block::record::BlockRecord;
 use crate::name::{Generation, MetricName, SystemKey};
 use crate::series::{SeriesId, SeriesKey, SeriesRecord};
 use crate::tables::{
-    BLOCKS, CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_ID_COUNTER, POINTS_LOG, SERIES,
-    SERIES_KEY, TAILS, encode_log_entry,
+    CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_ID_COUNTER, META_RETENTION_CLOCK, POINTS_LOG,
+    SERIES, SERIES_KEY, TAILS, encode_log_entry,
 };
 use crate::tier::Tier;
 use crate::value::ValueKind;
@@ -63,6 +65,8 @@ pub(crate) enum Request<C> {
     Abandon,
     /// The block writer's outcome for one span (§6 *Span handoff*).
     HandOff(Outcome),
+    /// The block writer unlinked a retired file: its `pending_unlinks` entry goes.
+    Unlinked(BlockName),
 }
 
 /// Which tails a commit writes beside the ones that sealed.
@@ -72,45 +76,6 @@ enum Flush {
     Rotation,
     /// Every dirty tail (a close).
     All,
-}
-
-/// One rotation of the tail flush: every series' tail written once in it, sized by time.
-struct Rotation {
-    started_seq: u64,
-    started: Instant,
-    queue: Vec<SeriesId>,
-    done: usize,
-}
-
-impl Rotation {
-    fn start(seq: u64, ids: impl Iterator<Item = SeriesId>) -> Rotation {
-        let mut queue: Vec<SeriesId> = ids.collect();
-        queue.sort_unstable();
-        Rotation {
-            started_seq: seq,
-            started: Instant::now(),
-            queue,
-            done: 0,
-        }
-    }
-
-    /// The series due by now: the share of the queue the elapsed share of the period covers.
-    fn due(&mut self, period: Duration) -> Vec<SeriesId> {
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let share = if period.is_zero() {
-            1.0
-        } else {
-            (elapsed / period.as_secs_f64()).min(1.0)
-        };
-        let target = ((self.queue.len() as f64 * share).ceil() as usize).min(self.queue.len());
-        let due = self.queue[self.done.min(target)..target].to_vec();
-        self.done = self.done.max(target);
-        due
-    }
-
-    fn finished(&self) -> bool {
-        self.done >= self.queue.len()
-    }
 }
 
 /// The writer: its core, the open redb transaction, and what waits for the next commit.
@@ -130,9 +95,14 @@ pub(crate) struct Writer<C> {
     sweep_interval: Duration,
     handoffs: Handoffs,
     /// The block writer's queue; `None` until the store connects it.
-    jobs: Option<Sender<BlockName>>,
+    jobs: Option<Sender<Job>>,
     /// Files whose rows the commit in progress holds: known to queries once it lands.
     landed: Vec<(BlockName, BlockSummary)>,
+    retention: Retention,
+    /// Files whose retirement the commit in progress holds: unlinked once it lands.
+    retired: Vec<BlockName>,
+    /// Passes the commit in progress finishes.
+    finishing: u64,
 }
 
 /// The interval's transaction, begun when first needed: durable when committed, with 2-phase
@@ -152,39 +122,6 @@ fn open_txn<'a>(
     slot.as_ref().ok_or(StoreError::Failed)
 }
 
-/// Why a handoff's commit couldn't join the transaction: either fails the store stop.
-#[derive(Debug)]
-enum HandoffCommitError {
-    /// The span already has a row: spans in flight are handed over once, so this is a defect.
-    SecondRow,
-    /// redb refused a read or write, as any commit's failure.
-    Store,
-}
-
-impl<E: Into<redb::Error>> From<E> for HandoffCommitError {
-    fn from(_: E) -> HandoffCommitError {
-        HandoffCommitError::Store
-    }
-}
-
-/// A span's file is durable: its row and the deletion of its chunks join this commit (§6 *Span
-/// handoff* step 4).
-fn commit_handoff(
-    txn: &WriteTransaction,
-    name: &BlockName,
-    record: &BlockRecord,
-) -> Result<(), HandoffCommitError> {
-    let key = (name.tier.code(), name.span.get());
-    let mut blocks = txn.open_table(BLOCKS)?;
-    if blocks.get(key)?.is_some() {
-        return Err(HandoffCommitError::SecondRow);
-    }
-    blocks.insert(key, record.to_bytes().as_slice())?;
-    txn.open_table(CHUNKS)?
-        .retain_in(span_range(name.tier, name.span), |_, _| false)?;
-    Ok(())
-}
-
 /// Marks the store failed if the writer thread unwinds.
 struct FailOnPanic<C>(Arc<Shared<C>>);
 
@@ -202,6 +139,7 @@ impl<C> Writer<C> {
         options: &StoreOptions,
         commit_seq: u64,
         handoffs: Handoffs,
+        retention: Retention,
     ) -> Writer<C> {
         let rotation = Rotation::start(commit_seq, core.index.keys().copied());
         Writer {
@@ -218,11 +156,14 @@ impl<C> Writer<C> {
             handoffs,
             jobs: None,
             landed: Vec::new(),
+            retention,
+            retired: Vec::new(),
+            finishing: 0,
         }
     }
 
     /// Connects the block writer's queue: closed spans are handed to it from now on.
-    pub(super) fn connect(&mut self, jobs: Sender<BlockName>) {
+    pub(super) fn connect(&mut self, jobs: Sender<Job>) {
         self.jobs = Some(jobs);
     }
 
@@ -259,6 +200,10 @@ impl<C> Writer<C> {
                 }
                 next_sweep = Instant::now() + sweep_every;
             }
+            if self.retention.due() {
+                let (hub_now, system_now) = self.core.clocks();
+                self.retention.begin(hub_now, system_now);
+            }
             if force || Instant::now() >= next_commit {
                 if self.commit(Flush::Rotation).is_err() {
                     return;
@@ -273,6 +218,10 @@ impl<C> Writer<C> {
         let request = match request {
             Request::HandOff(outcome) => {
                 self.hand_off(outcome);
+                return false;
+            }
+            Request::Unlinked(name) => {
+                self.unlinked(name);
                 return false;
             }
             other => other,
@@ -304,35 +253,10 @@ impl<C> Writer<C> {
                 let settled = run(&mut CatalogTxn::new(txn, &mut self.core, now));
                 self.settle(class, settled)
             }
-            Request::Close { .. } | Request::Abandon | Request::HandOff(_) => false,
-        }
-    }
-
-    /// The block writer's outcome: a durable file's row and the deletion of its chunks join
-    /// this commit; a failure leaves the span waiting for the next sweep, its cause kept. A
-    /// second row for a span (a defect: spans in flight are handed over once) fails the store.
-    fn hand_off(&mut self, outcome: Outcome) {
-        match outcome {
-            Outcome::Written {
-                name,
-                record,
-                summary,
-            } => {
-                let shared = Arc::clone(&self.core.shared);
-                let committed = open_txn(&mut self.txn, &shared.db)
-                    .map_err(|_| HandoffCommitError::Store)
-                    .and_then(|txn| commit_handoff(txn, &name, &record));
-                match committed {
-                    Ok(()) => self.landed.push((name, summary)),
-                    Err(HandoffCommitError::SecondRow | HandoffCommitError::Store) => {
-                        shared.lifecycle.fail()
-                    }
-                }
-            }
-            Outcome::Failed(name, cause) => {
-                self.handoffs.failed((name.tier, name.span), cause);
-                self.core.shared.blocks.handoff_failed(name.tier, cause);
-            }
+            Request::Close { .. }
+            | Request::Abandon
+            | Request::HandOff(_)
+            | Request::Unlinked(_) => false,
         }
     }
 
@@ -415,7 +339,13 @@ impl<C> Writer<C> {
             u64::from(self.core.next_id).to_be_bytes().as_slice(),
         )?;
         meta.insert(META_COMMIT_SEQ, (seq + 1).to_be_bytes().as_slice())?;
-        Ok(())
+        meta.insert(
+            META_RETENTION_CLOCK,
+            self.retention.clock().to_be_bytes().as_slice(),
+        )?;
+        drop(meta);
+        // After the chunks this commit seals, so a span the pass empties is seen whole.
+        self.retention_step(txn)
     }
 
     /// The tails and records of series that sealed or are new, and the tails due.
@@ -475,6 +405,7 @@ impl<C> Writer<C> {
             }
         }
         self.after_handoffs();
+        self.after_retention();
         if self.rotation.finished() {
             self.log_bound = self.rotation.started_seq;
             self.rotation = Rotation::start(self.commit_seq, self.core.index.keys().copied());
@@ -492,24 +423,6 @@ impl<C> Writer<C> {
         self.core.catalog_dirty = false;
         for deliver in std::mem::take(&mut self.waiters) {
             deliver(Ok(()));
-        }
-    }
-
-    /// After a commit: the files whose rows it held become known to queries, and the spans due
-    /// since the last sweep go to the block writer, whose read transaction now sees them whole.
-    fn after_handoffs(&mut self) {
-        for (name, summary) in std::mem::take(&mut self.landed) {
-            self.handoffs.landed((name.tier, name.span));
-            self.core.shared.blocks.install(name, Ok(summary));
-        }
-        let Some(jobs) = &self.jobs else {
-            return;
-        };
-        for span in self.handoffs.take_due() {
-            // The block writer is gone only once this thread is stopping: nothing to retry.
-            if jobs.send(handoff_name(span)).is_err() {
-                return;
-            }
         }
     }
 

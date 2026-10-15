@@ -33,6 +33,7 @@ use crate::block::reconcile::{
     Catalogued, ChunksInRedb, Refusal, SpanEvidence, TailsInSpan, reconcile,
 };
 use crate::block::record::BlockRecord;
+use crate::retention::FileCondition;
 use crate::series::SeriesId;
 use crate::tables::{BLOCKS, CHUNKS, PENDING_UNLINKS};
 use crate::tier::{SpanStart, Tier};
@@ -99,6 +100,19 @@ impl Blocks {
             },
         };
         self.known().insert((name.tier, name.span), known);
+    }
+
+    /// Forgets a retired file: its row is gone, and it is unlinked next.
+    pub(crate) fn evict(&self, span: SpanKey) {
+        self.known().remove(&span);
+    }
+
+    /// Whether retention may rewrite a span's file: never one opened unreadable.
+    pub(crate) fn condition(&self, span: SpanKey) -> FileCondition {
+        match self.known().get(&span) {
+            Some(Known::Unreadable { .. }) => FileCondition::Damaged,
+            Some(Known::Readable { .. }) | None => FileCondition::Sound,
+        }
     }
 
     pub(crate) fn handoff_failed(&self, tier: Tier, cause: HandoffFailure) {

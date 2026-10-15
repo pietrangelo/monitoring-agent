@@ -28,9 +28,10 @@ use super::{CorruptChunk, Order, Query, Samples, Series, Shared, StoreError};
 use crate::block::name::BlockName;
 use crate::block::record::BlockRecord;
 use crate::codec::{Bucket, RawPoint, decode_raw, decode_rollup};
+use crate::retention::{Liveness, Owner, Policies, Tombstones, chunk_liveness};
 use crate::series::{SeriesId, SeriesKey, SeriesRecord};
 use crate::state::Sealed;
-use crate::tables::{BLOCKS, CHUNKS, SERIES, SERIES_KEY};
+use crate::tables::{BLOCKS, CHUNKS, META, META_RETENTION_CLOCK, SERIES, SERIES_KEY};
 use crate::tier::{RollupTier, SpanStart, Tier};
 use crate::value::ValueKind;
 
@@ -50,6 +51,16 @@ pub(super) fn run<C>(
 ) -> Result<Option<Series>, StoreError> {
     let view = head_view(shared, key, q.tier);
     let read = shared.db.begin_read().map_err(|_| StoreError::Io)?;
+    let alive = Alive {
+        tier: q.tier,
+        owner: Owner {
+            system: key.system.clone(),
+            generation: key.generation,
+        },
+        policies: &shared.policies,
+        tombstones: &shared.tombstones,
+        retention_now: retention_clock(&read)?,
+    };
     let view = match view {
         Some(view) => view,
         None => match committed(&read, key)? {
@@ -63,7 +74,7 @@ pub(super) fn run<C>(
             None => return Ok(None),
         },
     };
-    let mut chunks = read_chunks(&shared.blocks, &read, &view, q)?;
+    let mut chunks = read_chunks(&shared.blocks, &read, &view, q, &alive)?;
     for chunk in view.pending.iter().filter(|c| c.tier == q.tier) {
         chunks
             .entry((chunk.span.get(), chunk.seq))
@@ -72,8 +83,63 @@ pub(super) fn run<C>(
     let samples = decode_all(&chunks, view.kind, q.tier, view.unsealed)?;
     Ok(Some(Series {
         kind: view.kind,
-        samples: select(samples, q),
+        samples: select(alive.only_live(samples), q),
     }))
+}
+
+/// What decides whether a span of the queried series is live (§5): its owner, the policies,
+/// the tombstones, and the retention clock as the query's read transaction holds it.
+struct Alive<'a> {
+    tier: Tier,
+    owner: Owner,
+    policies: &'a Policies,
+    tombstones: &'a Tombstones,
+    retention_now: u64,
+}
+
+impl Alive<'_> {
+    fn span(&self, span: SpanStart) -> Liveness {
+        chunk_liveness(
+            self.tier,
+            span,
+            Some(&self.owner),
+            self.policies,
+            self.tombstones,
+            self.retention_now,
+        )
+    }
+
+    /// Whether the span holding `ts` is live.
+    fn at(&self, ts: u64) -> bool {
+        self.span(self.tier.span_of(ts)) == Liveness::Live
+    }
+
+    /// The samples of live spans only: a chunk sealed or still open in the head is held to
+    /// the same rule as a committed one.
+    fn only_live(&self, samples: Samples) -> Samples {
+        match samples {
+            Samples::Raw(points) => {
+                Samples::Raw(points.into_iter().filter(|p| self.at(p.ts)).collect())
+            }
+            Samples::Rollup(buckets) => {
+                let secs = self.tier.rollup().map_or(1, RollupTier::bucket_secs);
+                let live = |b: &Bucket| self.at(b.index.saturating_mul(secs));
+                Samples::Rollup(buckets.into_iter().filter(live).collect())
+            }
+        }
+    }
+}
+
+/// The retention clock as the read transaction holds it.
+fn retention_clock(read: &ReadTransaction) -> Result<u64, StoreError> {
+    let meta = read.open_table(META).map_err(io)?;
+    let value = meta
+        .get(META_RETENTION_CLOCK)
+        .map_err(io)?
+        .ok_or(StoreError::Io)?;
+    <[u8; 8]>::try_from(value.value())
+        .map(u64::from_be_bytes)
+        .map_err(io)
 }
 
 fn empty(tier: Tier) -> Samples {
@@ -133,6 +199,7 @@ fn read_chunks(
     read: &ReadTransaction,
     view: &HeadView,
     q: &Query,
+    alive: &Alive<'_>,
 ) -> Result<BTreeMap<(u64, u16), Vec<u8>>, StoreError> {
     let mut out = BTreeMap::new();
     let Some(last) = view.last_span else {
@@ -150,6 +217,12 @@ fn read_chunks(
     );
     let mut span = first;
     while span <= last {
+        // A dead span is never read: retention may be unlinking its file.
+        let dead = SpanStart::new(tier, span).is_none_or(|s| alive.span(s) != Liveness::Live);
+        if dead {
+            span += tier.span_secs();
+            continue;
+        }
         let held = match rows.get((tier.code(), span)).map_err(io)? {
             Some(row) => from_file(blocks, tier, span, row.value(), view.id)?,
             None => from_chunks(&chunks, tier, span, view.id)?,

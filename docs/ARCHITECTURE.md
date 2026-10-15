@@ -330,8 +330,8 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
 - `clock.rs`: `HubClock` (hub time: `max(system clock, last issued)`, never backwards) and
   `retention_now`, the guarded retention clock (at most twice real time, never past either
   clock, unchanged by the first pass after an open).
-- `retention.rs` and `retention/`: retention's pure core (RFC 0010 §5, RFC 0012 §2), not yet
-  driven by a retention pass. `retention/policy.rs`: `TierPeriod` (a period inside its tier's
+- `retention.rs` and `retention/`: retention's pure core (RFC 0010 §5, RFC 0012 §2), driven
+  by the retention pass (`store/pass.rs`). `retention/policy.rs`: `TierPeriod` (a period inside its tier's
   bounds), the global `RetentionPolicy`, per-system `Override`s whose tiers follow the global
   policy or a fixed period, each with at most one `PendingShortening` (a change at least as
   long as what is enforced applies at once and drops it; a shorter one replaces it), and
@@ -348,7 +348,9 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
   larger of 1 GiB and 2% of the volume, plus twice a rewind's bytes), and when `hub.redb` is
   worth compacting (over 1 GiB and over a quarter of the file reclaimable).
 - `tables.rs`: the store's redb tables (`meta`, `series`, `series_key`, `points_log`, `tails`,
-  `chunks`) and the points log's entry format.
+  `chunks`, `blocks`, `block_generations`, `pending_unlinks`) and the points log's entry
+  format. `block_generations` holds, per (generation, tier, span start), that generation's
+  chunk bytes in the span's file: written with the `blocks` row, removed with it.
 - `store.rs` and `store/`: the `Store` (generic over the hub's commit-hook change type).
   - **One writer thread** (`store/writer.rs`) owns every redb write transaction. Callers send
     requests over a bounded channel and wait for the answer. An `append` is stamped at hub time,
@@ -372,21 +374,48 @@ persists to SQLite (see Storage). Synchronous, with no async dependency and
     back; the writer inserts the `blocks` row and deletes the span's chunks in the next group
     commit, so a span is in exactly one of `chunks` or a file. A failed write leaves the span in
     redb, served from there and retried at the next sweep; more than three spans of one tier
-    waiting on failures fail the store stop. `store/blocks.rs` keeps, per committed row, the
-    file's summary (or that it is unreadable) and the handoff counts behind `Store::stats`.
+    waiting on failures fail the store stop. The outcome also carries each generation's chunk
+    bytes in the file, committed as its `block_generations` entries. `store/blocks.rs` keeps,
+    per committed row, the file's summary (or that it is unreadable) and the handoff counts
+    behind `Store::stats`.
+  - **The retention pass** (`store/pass.rs`, `store/retire.rs`): one starts at the open and
+    then every `StoreOptions::retention_interval` (10 minutes by default) of `Instant` time, and
+    runs one bounded step (at most 50,000 entries) inside each group commit, so ingestion keeps
+    committing between steps. It moves the guarded retention clock (`retention_now`, measured
+    by `StoreOptions::monotonic` since the previous pass; the pass at the open measures
+    nothing) and every commit persists it in `meta/retention_clock`; it deletes the dead chunks
+    still in `chunks` (`chunk_fate`: never a span in flight at the block writer), forgets the
+    spans it emptied (no handoff left to do, so a failing one no longer counts toward the
+    backlog), then plans the block files from their rows and `block_generations` entries
+    (`plan_files`) and retires every file whose chunks are all dead: its row and entries go and
+    a `pending_unlinks` entry comes in one commit; after it, the file leaves `store/blocks.rs`'s
+    memory and the block writer unlinks it, and the next commit clears the entry (a crash in
+    between leaves it for the open). The pass deletes only what it can name: a `series` record
+    that doesn't decode is unreadable, not unmapped (`store/records.rs`), so the chunks it owns
+    stay, a handoff of their span fails as a read failure, and no file is retired in that pass;
+    a `blocks` row that counts chunks but has no `block_generations` entries is incomplete,
+    so no file facts are built from it and the file is kept. A handoff names each chunk's
+    generation from its `series` record, so the series GC (a later part) must not remove a
+    record while a block file still holds that series' chunks, or the file would be kept for
+    good. Only the global policy is enforced so far, with no
+    tombstones: overrides, rewrites, the purge, series GC and the storage cap are later parts of
+    RFC 0010 step 3. `Store::stats` reports the committed retention clock and the passes
+    finished.
   - **The head** (`store/head.rs`): active series in 16 shards behind leaf locks; only the
     writer changes it. **Queries** (`store/query.rs`) read committed chunks in a redb read
     transaction (a span with a `blocks` row from its file: the series' index blocks and
     chunks, each checked against its CRC, a failure answering `Corrupt` for that span only)
     and copy the series' uncommitted chunks and unsealed points from its shard, checking every
     value against the series' kind; an unsealed point at or before the last committed one was
-    sealed meanwhile and is read once. A commit hook must not call back into the store.
+    sealed meanwhile and is read once. A query never returns a dead chunk: it reads the
+    retention clock in its own read transaction, never opens a dead span's file (retention may
+    be unlinking it), and drops the points and buckets of dead spans wherever they came from. A commit hook must not call back into the store.
   - **Recovery** (`store/open.rs`): the block directories created and every `.tmp` deleted,
     redb's own repair, then the head from the tails, then the block files reconciled with
     the rows (`block/reconcile.rs`'s plan over the tails and the persisted clock; a row whose
     file is missing or whose header or summary fails opens unreadable), then the points log
     replayed in order, each point applied only to a series whose last point is earlier, then a
-    sweep. The open itself hands nothing off. A panic on the writer thread, an I/O error on
+    sweep, then the first retention pass begins. The open itself hands nothing off. A panic on the writer thread, an I/O error on
     commit or a refusal after a write fails the store stop: every later call answers `Failed`.
     The store's **lifecycle** (`store/lifecycle.rs`) is one state, running, closed or failed:
     the writer marks it closed only after `close`'s final commit succeeds, before it answers;
@@ -444,7 +473,7 @@ match those rules (listed under Open architectural questions below).
 | **Fleet Registry** | hub | `models.rs` (`SystemInfo`, `SystemStatus`, `SystemId` and the default-name rule); `registry.rs` (`MemoryCapacity`, `memory_capacity_refresh`, `MAX_DISPLAY_BYTES`, `UptimeDisplay`, `LastSeen`, `StatusUpdate` / `after_snapshot`, `PollInterval`, `needs_system_info`, `SystemSource`, `PUSH_URL`, `polled_systems`); `presence.rs` (`PushPresence`, `ConnectionNumber`, `ConnectionLease`, `LeaseHandle`, `Ending`, `Sweep`, `OfflineReason`, `RECONNECT_GRACE`) | `db/mod.rs` `systems` table (`insert_system_if_absent` / `Registration`, `update_system_status` for the offline markings), `db/sources.rs` (`system_sources` / `SourceRow`, `reset_status`), `routes/api.rs` system CRUD | which systems exist, their config and last-known status |
 | **Ingestion** | hub | — | `collector/` (HTTP poll: `PolledAnswer` / `PolledInfo`, the parsed answer and the system info the registry fill reads; `PollFailure`; `MAX_SYSTEM_BODY`; `collector/capped_body.rs`: `read_capped`, `CappedBodyError`), `push/` (WS receiver: handshake parsing via `authenticate` / `HandshakeRejection`, the handshake outcome `Handshake` / `Refusal` (with `RegistryUnavailable` / `RegistryFailure`) / `Answer`, the handshake and idle deadlines, the oversize linger; `push/ingest.rs`: hub-side `PushPayload`, `SnapshotFrame` / `PushedInfo`, `SnapshotRefusal`, `register_and_accept`, `register_if_new`, `ingest_frame`, `update_registry`, `end_connection`; `push/connection.rs`: `ConnectionState` (a connection's decode budget, pace and counts), `Tally`, `Occurrence`, `warn_first`, `DecodeBudget`, `DECODE_BURST`); `snapshot_intake.rs` stores one snapshot for either mode (`store_snapshot`: the rule, the store, the live metrics entry); `round_intake.rs` admits and stores one round for any source (`store_round`, `Arrival`); `application_wire.rs` holds `ApplicationFrameDto` / `ApplicationsResponseDto` / `ApplicationReportDto`, their `TryFrom` into `ScrapeRound` / `PolledRound`, and `FrameRefusal`; `collector/application_poll.rs` holds the applications poll (`poll_applications`, `ApplicationsAnswer`, `Unusable`, `log_refused_round`); `round_intake.rs` has `store_round` (push, the connection's pace by value) and `store_polled_round` (poll, the system's pace read and written under the database mutex); `push/config.rs` holds `PushAuth` / `PushToken`, `PushSocketLimits`, `PushConfig` (with `decode_refill`) and the production timings, `DECODE_REFILL` among them) | turning agent output into hub metrics, alerts and status |
 | **Fleet History** | hub | `models.rs` (`AlertRecord`, `HubSummary`); `snapshot.rs` (`ReportedSnapshot`, `ReportedDisk`, `Snapshot`, `Scalar`, `MountPoint`, `SnapshotTime`, `LeftOut`, `snapshot_rule`, `MAX_DISKS`, `MAX_MOUNT_POINT_BYTES`, `LeftOutLog`, `left_out_log`, `snapshot_retention`, `LiveMetrics`); `applications.rs` (`ApplicationName`, `ApplicationHealth`, `ApplicationVersion`, `ApplicationGauge`, `Gauges`, `ApplicationReport`, `RoundId`, `ScrapeInterval`, `ScrapeRound`, `ScrapeRoundError`, `HeldRound`, `RoundDigest` / `RoundDigester`, `RecentRounds`, `SourcePace`, `admit`, `freshness`, `application_points`) | `db/history.rs` `metrics` / `metric_retention` tables (`store_snapshot` / `SnapshotStored`, `store_round`, the pruning), `db/mod.rs` `alerts` table, `state.rs` (`live_metrics`, `evict_live_metrics`, `live_applications`, `summary`), `retention.rs` (the `app:*` pruning task), `routes/*` (`routes/applications.rs`: `GET /api/systems/:id/applications`; `routes/sse.rs`: the publisher, `Summary`, `SummaryFailure`, and the wire DTOs `SummaryDto` / `LiveMetricsDto`) | stored time series, alert history, retention, each system's live metrics, and each system's shown scrape round |
-| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `block/` (`encode_block`, `BlockSummary`, `BlockName`, `BlockRecord`, `reconcile`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`), `retention/` (`RetentionPolicy`, `TierPeriod`, `Override`, `TierMismatch`, `PendingShortening`, `RetentionChange`, `RetentionOutcome`, `Policies`, `Owner`, `Tombstones`, `Liveness`, `Death`, `chunk_liveness`, `Holder`, `FileCondition`, `FileFate`, `plan_files`), `capacity.rs` (`Share`, `StorageLimit`, `CapCandidate`, `CapPlan`, `CapOutcome`, `cap_retirements`, `floor`, `check_floor`, `compaction_due`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery; the span handoff and the block writer thread); `block/file.rs` (block-file I/O); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
+| **Fleet Storage** | `hub-store` | `value.rs` (`ValueKind`, `Encoding`, `Scaled`, `OutOfDomain`), `name.rs` (`MetricName`, `SystemKey`, `Generation`, `InvalidName`), `tier.rs` (`Tier`, `RollupTier`, `SpanStart`), `block/` (`encode_block`, `BlockSummary`, `BlockName`, `BlockRecord`, `reconcile`), `codec/` (`RawChunk`, `RollupChunk`, `Bucket`, `decode_raw`, `decode_rollup`), `rollup.rs` (`Accumulator`, `AccumulatorRow`), `series.rs` (`SeriesId`, `SeriesKey`, `SeriesRecord`), `state.rs` (`SeriesState`, `Sealed`, the tail format), `clock.rs` (`HubClock`, `retention_now`), `retention/` (`RetentionPolicy`, `TierPeriod`, `Override`, `TierMismatch`, `PendingShortening`, `RetentionChange`, `RetentionOutcome`, `Policies`, `Owner`, `Tombstones`, `Liveness`, `Death`, `chunk_liveness`, `Holder`, `FileCondition`, `FileFate`, `plan_files`), `capacity.rs` (`Share`, `StorageLimit`, `CapCandidate`, `CapPlan`, `CapOutcome`, `cap_retirements`, `floor`, `check_floor`, `compaction_due`) | `store.rs` and `store/` (redb: the writer thread, the group commit, the head, queries, catalog transactions, recovery; the span handoff and the block writer thread; the retention pass); `block/file.rs` (block-file I/O); `tables.rs` |  how a series is stored: its value kind, its tiers and spans, the chunk codec and rollups (RFC 0010; being built, not yet used by the hub) |
 
 Two pure modules belong to no context and have no domain term of their own:
 `token_bucket.rs` (`TokenBucket`, `Refill`, `Empty`), the bucket arithmetic both `SourcePace`
@@ -624,6 +653,8 @@ mixed-version fleet must keep working):
 | **tombstone** | the record that a system's generation was deleted: its data is unreadable from that commit on | `Tombstones`, `Owner` |
 | **live / dead chunk** | a chunk is dead when its series maps to no system, its generation is tombstoned, or its whole span is older than the retention clock minus its system's tier period; queries never read a dead chunk and retention removes it | `chunk_liveness`, `Liveness`, `Death` |
 | **retirement / rewrite** | a block file whose every chunk is dead is retired (deleted whole); one still holding live chunks is rewritten without its dead ones when erased chunks reach a quarter of it, or when its span is past the global period and only longer overrides keep it; at most one rewrite per pass, the earliest span end first | `plan_files`, `FileFate`, `RewriteCause` |
+| **retention clock** | the clock retention acts on, never hub time directly: moved by each retention pass by at most twice the monotonic time since the previous one, never past hub time or the system clock, not at all by the pass at an open; persisted in `meta/retention_clock` | `retention_now`, `Retention`, `StoreStats::retention_clock` |
+| **retention pass** | the writer's periodic work that moves the retention clock, deletes dead chunks from `chunks` and retires block files whose every chunk is dead, one bounded step per group commit | `store/pass.rs` (`Retention`, `chunk_fate`), `store/retire.rs` |
 | **holder** | one generation's chunks in one block file and their bytes (a `block_generations` entry), with the system it belongs to, or unmapped when the generation maps to no system | `Holder` |
 | **span in flight / damaged file** | a file whose handoff or rewrite is running is in flight: retention and the cap leave it alone until it commits or fails. A file opened unreadable, or one whose rewrite met a chunk failing its CRC, is damaged: retired like any other, never rewritten | `FileCondition` |
 | **compaction** | shrinking `hub.redb` to the pages it uses, at start and only when asked (`HUB_STORE_COMPACT=1`) and worth it: over 1 GiB and over a quarter of the file reclaimable | `compaction_due` |
