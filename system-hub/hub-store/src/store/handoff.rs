@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 use redb::ReadableDatabase;
 
 use super::blocks::{SpanKey, span_range};
+use super::records::{Unreadable, recorded_key};
 use super::writer::Request;
 use super::{HandoffFailure, Shared};
 use crate::block::file::WriteError;
@@ -35,13 +36,22 @@ use crate::block::format::{
 };
 use crate::block::name::{BlockName, Rewrite};
 use crate::block::record::BlockRecord;
+use crate::name::Generation;
 use crate::series::SeriesId;
-use crate::tables::CHUNKS;
+use crate::tables::{CHUNKS, SERIES};
 use crate::tier::Tier;
 
 /// How many spans of one tier may wait on a failing handoff before the store fails stop
 /// (§6): `hub.redb` would otherwise grow with no bound while the hub runs.
 pub(crate) const BACKLOG_BOUND: usize = 3;
+
+/// What the writer asks of the block writer, in order.
+pub(crate) enum Job {
+    /// Write a closed span's file.
+    HandOff(BlockName),
+    /// Unlink a retired file, whose `pending_unlinks` entry has committed.
+    Unlink(BlockName),
+}
 
 /// What the block writer sends back for one span.
 pub(crate) enum Outcome {
@@ -49,6 +59,8 @@ pub(crate) enum Outcome {
         name: BlockName,
         record: BlockRecord,
         summary: BlockSummary,
+        /// Each generation's chunk bytes in the file: its `block_generations` entries.
+        generations: BTreeMap<Generation, u64>,
     },
     Failed(BlockName, HandoffFailure),
 }
@@ -118,6 +130,24 @@ impl Handoffs {
         self.failed.remove(&span);
     }
 
+    /// The spans the block writer is handing off: nothing may change their chunks.
+    pub(crate) fn in_flight(&self) -> &BTreeSet<SpanKey> {
+        &self.in_flight
+    }
+
+    /// The spans with chunks in `chunks` that the block writer isn't handing off.
+    pub(crate) fn idle(&self) -> Vec<SpanKey> {
+        self.waiting.difference(&self.in_flight).copied().collect()
+    }
+
+    /// Retention deleted every chunk of the span: nothing is left to hand off, and a failure
+    /// of it no longer counts toward its tier's backlog.
+    pub(crate) fn emptied(&mut self, span: SpanKey) {
+        self.waiting.remove(&span);
+        self.failed.remove(&span);
+        self.due.remove(&span);
+    }
+
     /// The attempt failed: the span waits for the next sweep.
     pub(crate) fn failed(&mut self, span: SpanKey, cause: HandoffFailure) {
         self.in_flight.remove(&span);
@@ -141,7 +171,7 @@ impl Handoffs {
 pub(crate) fn spawn<C: Send + 'static>(
     shared: Arc<Shared<C>>,
     requests: SyncSender<Request<C>>,
-) -> std::io::Result<(Sender<BlockName>, JoinHandle<()>)> {
+) -> std::io::Result<(Sender<Job>, JoinHandle<()>)> {
     let (jobs, inbox) = mpsc::channel();
     let handle = std::thread::Builder::new()
         .name("hub-store-blocks".into())
@@ -149,29 +179,41 @@ pub(crate) fn spawn<C: Send + 'static>(
     Ok((jobs, handle))
 }
 
-fn run<C>(shared: &Shared<C>, inbox: &Receiver<BlockName>, requests: &SyncSender<Request<C>>) {
-    for name in inbox {
-        let outcome = match write_span(shared, name) {
-            Ok((record, summary)) => Outcome::Written {
-                name,
-                record,
-                summary,
+fn run<C>(shared: &Shared<C>, inbox: &Receiver<Job>, requests: &SyncSender<Request<C>>) {
+    for job in inbox {
+        let request = match job {
+            Job::HandOff(name) => Request::HandOff(hand_off(shared, name)),
+            // A failed unlink keeps its `pending_unlinks` entry: the next open finishes it.
+            Job::Unlink(name) => match shared.blocks.dir().unlink(&name) {
+                Ok(()) => Request::Unlinked(name),
+                Err(_) => continue,
             },
-            Err(cause) => Outcome::Failed(name, cause),
         };
-        if requests.send(Request::HandOff(outcome)).is_err() {
+        if requests.send(request).is_err() {
             return;
         }
     }
 }
 
+fn hand_off<C>(shared: &Shared<C>, name: BlockName) -> Outcome {
+    match write_span(shared, name) {
+        Ok((record, summary, generations)) => Outcome::Written {
+            name,
+            record,
+            summary,
+            generations,
+        },
+        Err(cause) => Outcome::Failed(name, cause),
+    }
+}
+
+/// A written file's row, summary and per-generation bytes.
+type Written = (BlockRecord, BlockSummary, BTreeMap<Generation, u64>);
+
 /// The span's file, written from a read transaction taken after the commit that sealed it.
 /// Everything that can fail before the file exists is done first, so a failure leaves no file.
-fn write_span<C>(
-    shared: &Shared<C>,
-    name: BlockName,
-) -> Result<(BlockRecord, BlockSummary), HandoffFailure> {
-    let held = read_span(shared, name).map_err(|_| HandoffFailure::Read)?;
+fn write_span<C>(shared: &Shared<C>, name: BlockName) -> Result<Written, HandoffFailure> {
+    let (held, generations) = read_span(shared, name).map_err(|_| HandoffFailure::Read)?;
     let refs: Vec<ChunkRef<'_>> = held
         .iter()
         .map(|(id, seq, bytes)| ChunkRef {
@@ -197,22 +239,38 @@ fn write_span<C>(
         chunk_count: summary.chunk_count(),
         tombstoned: 0,
     };
-    Ok((record, summary))
+    Ok((record, summary, generations))
 }
 
+/// A span's chunks in key order, held for the file.
+type Held = Vec<(SeriesId, u16, Vec<u8>)>;
+
+/// The span's chunks, and each generation's bytes among them, from one read transaction. A
+/// chunk whose series has no record is written but held by no generation. The open refuses a
+/// store whose `series` records don't decode and no record is ever removed, so today every
+/// chunk handed off has one; a file whose chunks have none has no holders and is kept.
 fn read_span<C>(
     shared: &Shared<C>,
     name: BlockName,
-) -> Result<Vec<(SeriesId, u16, Vec<u8>)>, redb::Error> {
+) -> Result<(Held, BTreeMap<Generation, u64>), Unreadable> {
     let read = shared.db.begin_read()?;
-    let table = read.open_table(CHUNKS)?;
+    let (table, series) = (read.open_table(CHUNKS)?, read.open_table(SERIES)?);
     let mut held = Vec::new();
+    let mut owners: BTreeMap<u32, Option<Generation>> = BTreeMap::new();
+    let mut generations = BTreeMap::new();
     for entry in table.range(span_range(name.tier, name.span))? {
         let (key, bytes) = entry?;
         let (_, _, id, seq) = key.value();
+        if let std::collections::btree_map::Entry::Vacant(slot) = owners.entry(id) {
+            // A record that doesn't decode fails the handoff: its bytes are never unattributed.
+            slot.insert(recorded_key(&series, id)?.map(|key| key.generation));
+        }
+        if let Some(Some(generation)) = owners.get(&id) {
+            *generations.entry(*generation).or_insert(0) += bytes.value().len() as u64;
+        }
         held.push((SeriesId(id), seq, bytes.value().to_vec()));
     }
-    Ok(held)
+    Ok((held, generations))
 }
 
 /// The summary of a file about to be written, from its bytes.

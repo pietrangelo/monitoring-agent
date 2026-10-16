@@ -74,6 +74,17 @@ impl Tier {
         }
     }
 
+    /// The shortest retention a policy may set for the tier (RFC 0010 §5): an hour of raw
+    /// points, a day of minutes, 7 days of hours.
+    pub fn min_retention_secs(self) -> u64 {
+        const DAY: u64 = 86_400;
+        match self {
+            Tier::Raw => 3_600,
+            Tier::Minute => DAY,
+            Tier::Hour => 7 * DAY,
+        }
+    }
+
     /// The tier's rollups, if it holds rollups.
     pub fn rollup(self) -> Option<RollupTier> {
         match self {
@@ -243,6 +254,19 @@ mod tests {
         ];
         for (tier, max) in cases {
             assert_eq!(tier.max_retention_secs(), max, "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn each_tier_bounds_its_retention_from_below() {
+        const DAY: u64 = 86_400;
+        let cases = [
+            (Tier::Raw, 3_600),
+            (Tier::Minute, DAY),
+            (Tier::Hour, 7 * DAY),
+        ];
+        for (tier, min) in cases {
+            assert_eq!(tier.min_retention_secs(), min, "{tier:?}");
         }
     }
 

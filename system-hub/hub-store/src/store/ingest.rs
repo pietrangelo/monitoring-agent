@@ -80,6 +80,12 @@ impl<C> Core<C> {
         self.clock.now(self.system_clock.now())
     }
 
+    /// Hub time now, and the system clock it was issued from.
+    pub(super) fn clocks(&mut self) -> (u64, u64) {
+        let system_now = self.system_clock.now();
+        (self.clock.now(system_now), system_now)
+    }
+
     pub(super) fn catalog_written(&mut self) {
         self.catalog_dirty = true;
     }

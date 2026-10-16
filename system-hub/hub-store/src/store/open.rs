@@ -20,7 +20,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, WriteTransaction};
@@ -28,16 +27,18 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, WriteTransacti
 use super::blocks::{Blocks, reconcile_at_open};
 use super::handoff::Handoffs;
 use super::head::HeadEntry;
+use super::pass::{PassStats, Retention};
 use super::writer::{Core, Writer};
 use super::{Head, OpenError, Shared, StoreOptions};
 use crate::block::file::BlockDir;
 use crate::clock::{HubClock, first_retention_clock};
+use crate::retention::{Policies, Tombstones};
 use crate::series::{SeriesId, SeriesRecord};
 use crate::state::SeriesState;
 use crate::tables::{
-    BLOCKS, CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_FORMAT, META_ID_COUNTER,
-    META_RETENTION_CLOCK, PENDING_UNLINKS, POINTS_LOG, SERIES, SERIES_KEY, STORE_FORMAT, TAILS,
-    decode_log_entry,
+    BLOCK_GENERATIONS, BLOCKS, CHUNKS, META, META_CLOCK, META_COMMIT_SEQ, META_FORMAT,
+    META_ID_COUNTER, META_RETENTION_CLOCK, PENDING_UNLINKS, POINTS_LOG, SERIES, SERIES_KEY,
+    STORE_FORMAT, TAILS, decode_log_entry,
 };
 
 /// The file's name inside the data directory.
@@ -46,6 +47,7 @@ pub(crate) const STORE_FILE: &str = "hub.redb";
 /// The persisted clocks and counters.
 struct Meta {
     clock: u64,
+    retention_clock: u64,
     next_id: u32,
     commit_seq: u64,
 }
@@ -70,9 +72,12 @@ pub(super) fn open<C: Send + 'static>(
         db,
         head: Head::new(),
         blocks: Blocks::new(dir),
-        failed: AtomicBool::new(false),
+        lifecycle: super::lifecycle::Lifecycle::new(),
         fail_cause: Mutex::new(None),
         hook: Mutex::new(None),
+        policies: Policies::new(options.retention),
+        tombstones: Tombstones::default(),
+        retention: PassStats::new(meta.retention_clock),
     });
     let mut core = Core::new(
         Arc::clone(&shared),
@@ -87,10 +92,17 @@ pub(super) fn open<C: Send + 'static>(
     let now = core.hub_now();
     core.sweep(now);
     let handoffs = Handoffs::new(waiting);
-    Ok((
-        shared,
-        Writer::new(core, &options, meta.commit_seq, handoffs),
-    ))
+    let mut retention = Retention::new(
+        meta.retention_clock,
+        options.retention_interval,
+        Arc::clone(&options.monotonic),
+    );
+    // The first pass starts with the open: it moves the clock by nothing (§2), and monotonic
+    // time from here on counts toward the second.
+    let (hub_now, system_now) = core.clocks();
+    retention.begin(hub_now, system_now);
+    let writer = Writer::new(core, &options, meta.commit_seq, handoffs, retention);
+    Ok((shared, writer))
 }
 
 fn read_u64(bytes: Option<&[u8]>) -> Result<Option<u64>, OpenError> {
@@ -128,16 +140,20 @@ fn read_meta(txn: &WriteTransaction, system_now: u64) -> Result<Meta, OpenError>
                 .map(|v| v.value()),
         )
     };
-    let (format, clock, id_counter, commit_seq) = (
+    let (format, clock, id_counter, commit_seq, retention) = (
         get(META_FORMAT)?,
         get(META_CLOCK)?,
         get(META_ID_COUNTER)?,
         get(META_COMMIT_SEQ)?,
+        get(META_RETENTION_CLOCK)?,
     );
-    match format {
-        Some(STORE_FORMAT) => {}
-        Some(other) => return Err(OpenError::Format(other)),
-        None => {
+    let retention_clock = match (format, retention) {
+        (Some(STORE_FORMAT), Some(retention)) => retention,
+        (Some(STORE_FORMAT), None) => {
+            return Err(OpenError::Corrupt("no retention clock".into()));
+        }
+        (Some(other), _) => return Err(OpenError::Format(other)),
+        (None, _) => {
             let retention = first_retention_clock(system_now, system_now);
             for (key, value) in [
                 (META_FORMAT, STORE_FORMAT),
@@ -147,12 +163,14 @@ fn read_meta(txn: &WriteTransaction, system_now: u64) -> Result<Meta, OpenError>
                     .insert(key, value.to_be_bytes().as_slice())
                     .map_err(database)?;
             }
+            retention
         }
-    }
+    };
     let next_id = u32::try_from(id_counter.unwrap_or(0))
         .map_err(|_| OpenError::Corrupt("the id counter".into()))?;
     Ok(Meta {
         clock: clock.unwrap_or(0),
+        retention_clock,
         next_id,
         commit_seq: commit_seq.unwrap_or(0),
     })
@@ -166,6 +184,7 @@ fn create_store_tables(txn: &WriteTransaction) -> Result<(), OpenError> {
     txn.open_table(TAILS).map_err(database)?;
     txn.open_table(CHUNKS).map_err(database)?;
     txn.open_table(BLOCKS).map_err(database)?;
+    txn.open_table(BLOCK_GENERATIONS).map_err(database)?;
     txn.open_table(PENDING_UNLINKS).map_err(database)?;
     Ok(())
 }

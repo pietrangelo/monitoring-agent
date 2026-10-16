@@ -21,9 +21,11 @@
 
 pub mod block;
 mod bytes;
+pub mod capacity;
 pub mod clock;
 pub mod codec;
 pub mod name;
+pub mod retention;
 pub mod rollup;
 pub mod series;
 pub mod state;
